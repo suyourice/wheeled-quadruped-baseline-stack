@@ -200,16 +200,8 @@ enabled=true # Enable this for DLSS
 "isaacsim.core.utils" = {}
 "isaacsim.core.version" = {}
 
-########################
-# Isaac Lab Extensions #
-########################
-
-# Load Isaac Lab extensions last
-"isaaclab" = {order = 1000}
-"isaaclab_assets" = {order = 1000}
-"isaaclab_tasks" = {order = 1000}
-"isaaclab_mimic" = {order = 1000}
-"isaaclab_rl" = {order = 1000}
+# Isaac Lab packages are installed via pip (editable) and loaded as Python modules.
+# They are NOT registered as Kit extensions to avoid registry dependency conflicts.
 
 # Asset path
 # set the S3 directory manually to the latest published S3
