@@ -250,7 +250,7 @@ class RewardsCfg:
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_world_exp,
         weight=1.5,
-        params={"command_name": "base_velocity", "std": 0.4},
+        params={"command_name": "base_velocity", "std": 0.25},
     )
 
     # -- Stability penalties ---------------------------------------------------
@@ -276,14 +276,42 @@ class RewardsCfg:
         weight=-1.0e-5,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"])},
     )
-    # Penalise leg joints deviating from default standing pose.
+    # Penalise thigh/calf deviating from default standing pose.
     # Complements torque penalty: torques penalise dynamic effort,
     # deviation penalises static drift from nominal posture.
     #   penalty = sum(|theta_i - theta_default_i|)
-    joint_deviation_legs = RewTerm(
+    joint_deviation_stance = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.05,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"])},
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_thigh_joint", ".*_calf_joint"])},
+    )
+    # Hip allowed to deviate to steer wheel orientation for diagonal/lateral movement,
+    # but extreme abduction is still discouraged.
+    joint_deviation_hip = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.01,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint"])},
+    )
+
+    # -- Wheel contact / spin --------------------------------------------------
+    #
+    # Penalise wheels that lose ground contact (lifted leg gait should not occur).
+    #   penalty = number of wheels not touching the ground
+    wheel_contact = RewTerm(
+        func=mdp.wheel_contact_penalty,
+        weight=-0.5,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_foot"])},
+    )
+    # Penalise wheel spin only when velocity command is exactly zero.
+    # No penalty during locomotion so wheels can spin freely.
+    #   penalty = sum(w_wheel_i^2)  if cmd == 0, else 0
+    wheel_vel_zero_cmd = RewTerm(
+        func=mdp.wheel_vel_zero_cmd,
+        weight=-0.01,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_foot_joint"]),
+        },
     )
 
     # -- Action smoothness -----------------------------------------------------

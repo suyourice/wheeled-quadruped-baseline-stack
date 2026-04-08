@@ -81,9 +81,8 @@ GO2W_CFG = ArticulationCfg(
             effort_limit_sim=40.0,
             velocity_limit_sim=30.0,
         ),
-        # Wheel joints (velocity-controlled; stiffness=0 → pure torque/velocity)
-        # Strategy A (legs only): set effort_limit_sim=0 to lock wheels.
-        # Strategy B (hybrid): set stiffness=0, damping>0 for velocity drive.
+        # Wheel joints (velocity-controlled; stiffness=0 → pure torque/velocity drive).
+        # To lock wheels for legs-only locomotion, set effort_limit_sim=0.
         "wheels": ImplicitActuatorCfg(
             joint_names_expr=[".*_foot_joint"],
             stiffness=0.0,     # no position stiffness → free-spinning

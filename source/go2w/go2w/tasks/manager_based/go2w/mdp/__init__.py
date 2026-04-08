@@ -53,7 +53,7 @@ from isaaclab.envs.mdp import (
 )
 
 # -- Rewards (local custom) ----------------------------------------------------
-from .rewards import track_ang_vel_z_world_exp, track_lin_vel_xy_yaw_frame_exp
+from .rewards import track_ang_vel_z_world_exp, track_lin_vel_xy_yaw_frame_exp, wheel_contact_penalty, wheel_vel_zero_cmd
 
 # -- Terminations --------------------------------------------------------------
 from isaaclab.envs.mdp import (
