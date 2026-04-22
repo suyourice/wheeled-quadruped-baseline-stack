@@ -15,7 +15,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval     = 100          # checkpoint every N iterations
     experiment_name   = "go2w_flat_wheel"
     logger            = "wandb"
-    wandb_project     = "go2w_teacher_ppo"
+    wandb_project     = "go2w_baseline_ppo"
 
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=0.8,
