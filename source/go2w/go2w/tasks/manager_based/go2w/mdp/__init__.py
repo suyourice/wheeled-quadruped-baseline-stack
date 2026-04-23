@@ -25,6 +25,8 @@ from isaaclab.envs.mdp import (
 from isaaclab.envs.mdp import (
     base_ang_vel,
     base_lin_vel,
+    base_pos_z,
+    body_incoming_wrench,
     joint_pos_rel,
     joint_vel_rel,
     last_action,
@@ -51,6 +53,9 @@ from isaaclab.envs.mdp import (
     lin_vel_z_l2,
     undesired_contacts,
 )
+
+# -- Observations (local custom) -----------------------------------------------
+from .observations import lidar_distances, obstacle_positions_rel
 
 # -- Rewards (local custom) ----------------------------------------------------
 from .rewards import track_ang_vel_z_world_exp, track_lin_vel_xy_yaw_frame_exp, wheel_contact_penalty, wheel_vel_zero_cmd
