@@ -25,6 +25,14 @@ parser.add_argument(
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
+    "--num_obstacles",
+    "--num-obstacles",
+    dest="num_obstacles",
+    type=int,
+    default=None,
+    help="Obstacle play tasks only: force this many active boxes in the scene.",
+)
+parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
@@ -94,6 +102,37 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import go2w.tasks  # noqa: F401
 
 
+def _override_play_obstacle_count(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    num_obstacles: int | None,
+):
+    """Override active obstacle count for obstacle play configs."""
+    if num_obstacles is None:
+        return
+    if num_obstacles < 0:
+        raise ValueError("--num_obstacles must be >= 0.")
+
+    events_cfg = getattr(env_cfg, "events", None)
+    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
+    if reset_obstacles is None:
+        raise ValueError("--num_obstacles requires an obstacle play task with a reset_obstacles event.")
+
+    params = reset_obstacles.params
+    obstacle_names = params.get("obstacle_names", [])
+    max_available = len(obstacle_names)
+    if num_obstacles > max_available:
+        raise ValueError(
+            f"--num_obstacles={num_obstacles} exceeds the play scene capacity ({max_available}). "
+            "Increase PLAY_MAX_OBSTACLES in go2w_obstacle_env_cfg.py if you need more."
+        )
+
+    params["start_iteration"] = 0
+    params["warmup_iterations"] = 0
+    params["min_obstacles"] = num_obstacles
+    params["max_obstacles"] = num_obstacles
+    print(f"[INFO] Active play obstacles: {num_obstacles}/{max_available}")
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -105,6 +144,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
+    _override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
 
     # handle deprecated configurations
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)

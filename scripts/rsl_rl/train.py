@@ -36,6 +36,11 @@ parser.add_argument(
     help="Absolute path to teacher checkpoint for distillation (overrides --load_run/--checkpoint).",
 )
 parser.add_argument(
+    "--locomotion_checkpoint", type=str, default=None,
+    help="Path to a pre-trained flat locomotion checkpoint. First-layer weights are "
+         "zero-padded to match the obstacle env obs dimension (60D → 90D).",
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
 # append RSL-RL cli arguments
@@ -113,6 +118,59 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _load_locomotion_checkpoint(runner: OnPolicyRunner, ckpt_path: str, device: str) -> None:
+    """Load a flat locomotion checkpoint, zero-padding first-layer weights for obs dim expansion.
+
+    Handles the 60D→90D mismatch between flat env and obstacle env: the extra 30 dims
+    (obstacle positions) start at zero and receive gradient once obstacles appear.
+    """
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    # Resolve model handle (API varies across rsl-rl versions)
+    model = getattr(runner.alg, "actor_critic", None) or getattr(runner.alg, "policy", None)
+    if model is None:
+        raise AttributeError("Cannot find actor_critic or policy in runner.alg")
+    current_sd = model.state_dict()
+
+    # Find the state dict inside the checkpoint
+    src_sd = None
+    for key in ("actor_state_dict", "model_state_dict", "policy_state_dict"):
+        if key in ckpt and isinstance(ckpt[key], dict):
+            src_sd = {k: v.to(device) for k, v in ckpt[key].items()}
+            break
+    if src_sd is None:
+        raise ValueError(f"No recognized state dict in checkpoint. Keys found: {list(ckpt.keys())}")
+
+    # Strip PPO-specific distribution params not present in all model types
+    src_sd = {k: v for k, v in src_sd.items() if not k.startswith("distribution.")}
+
+    new_sd = {}
+    for key, tgt in current_sd.items():
+        if key not in src_sd:
+            # Keep random init for keys that don't exist in source (e.g. new output heads)
+            new_sd[key] = tgt
+            continue
+        src = src_sd[key]
+        if src.shape == tgt.shape:
+            new_sd[key] = src
+        elif (
+            len(src.shape) == 2
+            and src.shape[0] == tgt.shape[0]
+            and src.shape[1] < tgt.shape[1]
+        ):
+            # First-layer input dimension expansion: append zero columns for new obs dims
+            n_pad = tgt.shape[1] - src.shape[1]
+            pad = torch.zeros(src.shape[0], n_pad, dtype=src.dtype, device=device)
+            new_sd[key] = torch.cat([src, pad], dim=1)
+            print(f"[INFO] Zero-padded '{key}': {tuple(src.shape)} -> {tuple(new_sd[key].shape)}")
+        else:
+            print(f"[WARN] Shape mismatch '{key}': src={tuple(src.shape)}, tgt={tuple(tgt.shape)}; keeping random init")
+            new_sd[key] = tgt
+
+    model.load_state_dict(new_sd)
+    print(f"[INFO] Loaded locomotion checkpoint from: {ckpt_path}")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -212,6 +270,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
+
+    # Load flat locomotion checkpoint with obs-dim zero-padding (flat 60D → obstacle 90D)
+    if args_cli.locomotion_checkpoint is not None:
+        if not isinstance(runner, OnPolicyRunner):
+            raise ValueError("--locomotion_checkpoint requires an OnPolicyRunner task (PPO)")
+        _load_locomotion_checkpoint(runner, args_cli.locomotion_checkpoint, agent_cfg.device)
+
     # load the checkpoint
     if args_cli.teacher_checkpoint is not None or agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
