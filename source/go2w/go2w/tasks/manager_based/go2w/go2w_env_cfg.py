@@ -176,7 +176,7 @@ class EventCfg:
     )
 
     # Mass randomisation covers future D1-T arm (~2.37 kg) + margin
-    add_base_mass = EventTerm(
+    add_base_mass: EventTerm | None = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
         params={
@@ -212,7 +212,7 @@ class EventCfg:
 
     # -- Interval (periodic disturbances) --------------------------------------
 
-    push_robot = EventTerm(
+    push_robot: EventTerm | None = EventTerm(
         func=mdp.push_by_setting_velocity,
         mode="interval",
         interval_range_s=(8.0, 12.0),
@@ -374,7 +374,7 @@ class TerminationsCfg:
 class Go2wEnvCfg(ManagerBasedRLEnvCfg):
     """Go2-W flat-terrain velocity-tracking environment (wheel-primary)."""
 
-    scene:        Go2wSceneCfg    = Go2wSceneCfg(num_envs=4096, env_spacing=3.0)
+    scene:        Go2wSceneCfg    = Go2wSceneCfg(num_envs=8192, env_spacing=3.0)
     observations: ObservationsCfg = ObservationsCfg()
     actions:      ActionsCfg      = ActionsCfg()
     commands:     CommandsCfg     = CommandsCfg()
@@ -406,3 +406,187 @@ class Go2wEnvCfg_PLAY(Go2wEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.push_robot    = None
         self.events.add_base_mass = None
+
+
+# =============================================================================
+# 2 m/s flat locomotion pre-training (obstacle-env compatible architecture)
+# =============================================================================
+# Action split (wheel=24 / hip=0.5 / stance=0.3) and reward weights are
+# identical to obstacle env so the checkpoint transfers directly via
+# --locomotion_checkpoint in train.py.  First layer of the network is padded
+# 60D->90D with zeros; the extra 30D obstacle obs weights learn from scratch
+# once obstacles are introduced in obstacle env.
+
+
+@configclass
+class FastFlatActionsCfg:
+    """Action space matching obstacle env: wheel=28, hip=0.35, stance=0.5."""
+
+    wheel_vel = mdp.JointVelocityActionCfg(
+        asset_name="robot",
+        joint_names=[".*_foot_joint"],
+        scale=28.0,
+    )
+    hip_pos = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=[".*_hip_joint"],
+        scale=0.35,
+        use_default_offset=True,
+    )
+    stance_pos = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=[".*_thigh_joint", ".*_calf_joint"],
+        scale=0.35,
+        use_default_offset=True,
+    )
+
+
+@configclass
+class FastFlatRewardsCfg:
+    """Locomotion rewards matching obstacle env (minus obstacle-specific terms).
+
+    All weights are identical to ObstacleRewardsCfg so the checkpoint transfers
+    without any reward-scale mismatch affecting the value function.
+    """
+
+    track_lin_vel_xy_exp = RewTerm(
+        func=mdp.track_lin_vel_xy_yaw_frame_exp,
+        weight=4.0,
+        params={"command_name": "base_velocity", "std": 0.35},
+    )
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_world_exp,
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": 0.25},
+    )
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.5)
+    lin_vel_z_l2        = RewTerm(func=mdp.lin_vel_z_l2,        weight=-1.0)
+    ang_vel_xy_l2       = RewTerm(func=mdp.ang_vel_xy_l2,       weight=-0.05)
+
+    base_height = RewTerm(
+        func=mdp.base_height_l2,
+        weight=-3.0,
+        params={"target_height": 0.45, "robot_cfg": SceneEntityCfg("robot")},
+    )
+    dof_torques_l2 = RewTerm(
+        func=mdp.joint_torques_l2,
+        weight=-1.0e-5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"])},
+    )
+    joint_deviation_stance = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.05,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_thigh_joint", ".*_calf_joint"])},
+    )
+    joint_deviation_hip = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.05,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint"])},
+    )
+    # Stronger than obstacle env (-0.15) to eliminate straight-line drift: hip
+    # asymmetry during forward driving is the primary cause of directional deviation.
+    straight_hip_deviation = RewTerm(
+        func=mdp.joint_deviation_l1_command_gated,
+        weight=-0.30,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint"]),
+            "min_abs_lin_x": 0.2,
+            "max_abs_lin_y": 0.15,
+            "max_abs_ang_z": 0.2,
+        },
+    )
+    stand_joint_deviation = RewTerm(
+        func=mdp.joint_deviation_l1_command_gated,
+        weight=-0.35,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"]),
+            "max_abs_lin_x": 0.1,
+            "max_abs_lin_y": 0.1,
+            "max_abs_ang_z": 0.1,
+        },
+    )
+    wheel_contact = RewTerm(
+        func=mdp.wheel_contact_penalty,
+        weight=-0.5,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_foot"])},
+    )
+    wheel_vel_zero_cmd = RewTerm(
+        func=mdp.wheel_vel_zero_cmd,
+        weight=-0.01,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_foot_joint"]),
+        },
+    )
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    undesired_contacts = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_thigh", ".*_calf"]),
+            "threshold": 1.0,
+        },
+    )
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+
+
+@configclass
+class FastFlatEventsCfg(EventCfg):
+    """Events for fast flat locomotion: adds speed curriculum on top of base events."""
+
+    speed_curriculum: EventTerm | None = EventTerm(
+        func=mdp.update_locomotion_curriculum,
+        mode="reset",
+        params={
+            "start_iteration": 0,
+            "warmup_iterations": 600,
+            "steps_per_iteration": 128,
+            "command_name": "base_velocity",
+            "lin_vel_x_initial": (-1.0, 1.0),
+            "lin_vel_x_final":   (-2.0, 2.0),
+            "lin_vel_y_initial": (-0.3, 0.3),
+            "lin_vel_y_final":   (-2.0, 2.0),
+            "ang_vel_z_initial": (-0.3, 0.3),
+            "ang_vel_z_final":   (-2.0, 2.0),
+            "min_survival_steps": 800,
+        },
+    )
+
+
+@configclass
+class Go2wFastFlatEnvCfg(Go2wEnvCfg):
+    """2 m/s flat locomotion with obstacle-env-compatible action/reward structure.
+
+    Trains [512,256,128] policy at +-2.0 m/s. The resulting checkpoint transfers
+    to obstacle env via --locomotion_checkpoint (first layer padded 60D->90D).
+    """
+
+    actions: FastFlatActionsCfg = FastFlatActionsCfg()
+    rewards: FastFlatRewardsCfg = FastFlatRewardsCfg()
+    events:  FastFlatEventsCfg  = FastFlatEventsCfg()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # Initial command ranges; speed_curriculum ramps to ±2.0 m/s by iter 600.
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.3, 0.3)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.3, 0.3)
+
+
+@configclass
+class Go2wFastFlatEnvCfg_PLAY(Go2wFastFlatEnvCfg):
+    """Evaluation environment for 2 m/s flat locomotion."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs    = 16
+        self.scene.env_spacing = 3.0
+        self.observations.policy.enable_corruption = False
+        self.events.push_robot        = None
+        self.events.add_base_mass     = None
+        self.events.speed_curriculum  = None
+        self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-2.0, 2.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-2.0, 2.0)

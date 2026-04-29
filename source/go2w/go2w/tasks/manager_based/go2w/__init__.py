@@ -32,6 +32,30 @@ gym.register(
 )
 
 # =============================================================================
+# 2 m/s flat pre-training (obstacle-env compatible, for checkpoint transfer)
+# =============================================================================
+
+gym.register(
+    id="Fast-Flat-2m-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_env_cfg:Go2wFastFlatEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FastFlatRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Fast-Flat-2m-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_env_cfg:Go2wFastFlatEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FastFlatRunnerCfg",
+    },
+)
+
+# =============================================================================
 # Teacher (PPO, proprioception + privileged observations)
 # =============================================================================
 
@@ -76,6 +100,30 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.go2w_teacher_env_cfg:Go2wDistillEnvCfg_PLAY",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_distillation_cfg:DistillRunnerCfg",
+    },
+)
+
+# =============================================================================
+# Obstacle avoidance — Teacher fast (starts from pre-trained flat checkpoint)
+# =============================================================================
+
+gym.register(
+    id="Obstacle-Teacher-Fast-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wObstacleTeacherFastEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:ObstacleTeacherFastRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Obstacle-Teacher-Fast-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wObstacleTeacherFastEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:ObstacleTeacherFastRunnerCfg",
     },
 )
 
