@@ -420,7 +420,7 @@ class Go2wEnvCfg_PLAY(Go2wEnvCfg):
 
 @configclass
 class FastFlatActionsCfg:
-    """Action space matching obstacle env: wheel=28, hip=0.35, stance=0.5."""
+    """Action space matching obstacle env: wheel=28, hip=0.35, stance=0.35."""
 
     wheel_vel = mdp.JointVelocityActionCfg(
         asset_name="robot",
