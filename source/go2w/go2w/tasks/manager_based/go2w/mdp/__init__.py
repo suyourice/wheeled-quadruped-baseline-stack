@@ -57,8 +57,24 @@ from isaaclab.envs.mdp import (
 # -- Observations (local custom) -----------------------------------------------
 from .observations import lidar_distances, obstacle_positions_rel
 
+# -- Events (local custom) -----------------------------------------------------
+from .events import reset_obstacles_curriculum, update_locomotion_curriculum
+
 # -- Rewards (local custom) ----------------------------------------------------
-from .rewards import track_ang_vel_z_world_exp, track_lin_vel_xy_yaw_frame_exp, wheel_contact_penalty, wheel_vel_zero_cmd
+from .rewards import (
+    base_height_l2,
+    joint_deviation_l1_command_gated,
+    joint_deviation_l1_curriculum,
+    obstacle_contact_termination,
+    obstacle_contact_penalty,
+    obstacle_lateral_avoidance_reward,
+    obstacle_path_clearance_penalty,
+    obstacle_yaw_avoidance_reward,
+    track_ang_vel_z_world_exp,
+    track_lin_vel_xy_yaw_frame_exp,
+    wheel_contact_penalty,
+    wheel_vel_zero_cmd,
+)
 
 # -- Terminations --------------------------------------------------------------
 from isaaclab.envs.mdp import (

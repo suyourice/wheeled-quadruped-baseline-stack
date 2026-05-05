@@ -37,15 +37,44 @@ from . import mdp
 from .go2w_env_cfg import EventCfg, Go2wEnvCfg, Go2wSceneCfg, TerminationsCfg
 
 # -- Constants ----------------------------------------------------------------
+#
+# Obstacle-count terminology:
+#   physical slots   = rigid obstacle prims instantiated in the scene
+#   active obstacles = subset of slots placed near the robot at reset
+#   observed slots   = closest obstacles exposed to teacher privileged obs
+#
+# For distillation, these three counts matter separately:
+#   1. teacher observation dim must stay stable
+#   2. training physics load must stay manageable
+#   3. play/eval can have extra obstacle capacity without changing obs dim
 
-NUM_OBSTACLES = 15  # Training physical obstacle candidates. Can grow later without changing obs dim.
-PRIVILEGED_OBSTACLE_SLOTS = 15  # Teacher observes the closest K candidates: K * 2 dims.
-PLAY_MAX_OBSTACLES = 64  # Extra physical slots available only in play/eval scenes.
-PLAY_NUM_OBSTACLES = 5  # Default active boxes during play; CLI can override this.
+# Teacher/distillation observation capacity (K closest obstacles -> K * 2 dims)
+TEACHER_OBS_OBSTACLE_SLOTS = 15
+
+# Standard obstacle-train scene capacity
+TRAIN_PHYSICAL_OBSTACLE_SLOTS = 15
+
+# Fast teacher-train scene capacity and active clutter count
+FAST_TRAIN_PHYSICAL_OBSTACLE_SLOTS = 8
+FAST_TRAIN_ACTIVE_OBSTACLES = 3
+
+# Play/eval scene capacity and default active clutter count
+PLAY_PHYSICAL_OBSTACLE_SLOTS = 64
+PLAY_DEFAULT_ACTIVE_OBSTACLES = 5
+
+# Backward-compatible aliases kept to avoid broad refactors while distillation
+# is in progress. Prefer the role-based names above in new code/comments.
+NUM_OBSTACLES = TRAIN_PHYSICAL_OBSTACLE_SLOTS
+PRIVILEGED_OBSTACLE_SLOTS = TEACHER_OBS_OBSTACLE_SLOTS
+NUM_OBSTACLES_FAST = FAST_TRAIN_PHYSICAL_OBSTACLE_SLOTS
+FAST_ACTIVE_OBSTACLES = FAST_TRAIN_ACTIVE_OBSTACLES
+PLAY_MAX_OBSTACLES = PLAY_PHYSICAL_OBSTACLE_SLOTS
+PLAY_NUM_OBSTACLES = PLAY_DEFAULT_ACTIVE_OBSTACLES
+
 OBSTACLE_SIZE = (0.3, 0.3, 0.5)  # (x, y, z) meters
 OBSTACLE_SPAWN_RANGE = {"x": (-3.5, 3.5), "y": (-2.5, 2.5)}
-OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(NUM_OBSTACLES)]
-PLAY_OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(PLAY_MAX_OBSTACLES)]
+OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(TRAIN_PHYSICAL_OBSTACLE_SLOTS)]
+PLAY_OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(PLAY_PHYSICAL_OBSTACLE_SLOTS)]
 CURRICULUM_STEPS_PER_ITERATION = 128  # Must match ObstacleTeacherRunnerCfg.num_steps_per_env.
 CURRICULUM_OBSTACLE_START_ITERATION = 1700  # start obstacles after full-speed locomotion has stabilized
 CURRICULUM_OBSTACLE_WARMUP_ITERATIONS = 1000  # reach full density at iteration 2700
@@ -63,8 +92,6 @@ OBSTACLE_PATH_CLEARANCE_LENGTH = 1.6
 OBSTACLE_PATH_CLEARANCE_WIDTH = 0.55
 OBSTACLE_PATH_CLEARANCE_WEIGHT = -2.0
 OBSTACLE_COLLISION_WEIGHT = -40.0
-NUM_OBSTACLES_FAST = 8  # Fast env: fewer physics slots to reduce init time
-FAST_ACTIVE_OBSTACLES = 3  # Fixed low count; encounter frequency comes from command-path spawn.
 FAST_COMMAND_PATH_OBSTACLES = 2  # Put the first slots directly in the commanded path.
 FAST_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
 FAST_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
@@ -89,7 +116,7 @@ FAST_OBSTACLE_WARMUP_ITERATIONS = 0
 FAST_CLEARANCE_WARMUP_ITERATIONS = 0
 FAST_COLLISION_WARMUP_ITERATIONS = 0
 FAST_EMPTY_ENV_FRACTION = 0.35  # Keep no-obstacle rollouts in the PPO batch to preserve flat locomotion.
-FAST_OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(NUM_OBSTACLES_FAST)]
+FAST_OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(FAST_TRAIN_PHYSICAL_OBSTACLE_SLOTS)]
 
 LIDAR_MAX_DISTANCE = 20.0  # meters
 LIDAR_HORIZONTAL_FOV = (0.0, 360.0)  # full 360 degrees
