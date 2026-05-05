@@ -37,8 +37,9 @@ parser.add_argument(
 )
 parser.add_argument(
     "--locomotion_checkpoint", type=str, default=None,
-    help="Path to a pre-trained flat locomotion checkpoint. First-layer weights are "
-         "zero-padded to match the obstacle env obs dimension (60D → 90D).",
+    help="Path to a pre-trained flat locomotion checkpoint. For PPO obstacle training, actor/critic first-layer "
+         "weights are zero-padded to match the obstacle env obs dimension (60D -> 90D). For obstacle distillation, "
+         "this initializes the frozen LLC inside the rule-based steering teacher.",
 )
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
@@ -120,57 +121,97 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def _find_state_dict(ckpt: dict, candidates: tuple[str, ...], label: str) -> tuple[str, dict]:
+    """Return the first matching state dict from a checkpoint."""
+    for key in candidates:
+        if key in ckpt and isinstance(ckpt[key], dict):
+            return key, ckpt[key]
+    raise ValueError(f"No {label} state dict found. Keys found: {list(ckpt.keys())}")
+
+
+def _load_padded_state_dict(model, src_sd: dict, device: str, label: str, strip_distribution: bool = False) -> None:
+    """Load a state dict, zero-padding first-layer inputs when obs dims grow."""
+    src_sd = {k: v.to(device) for k, v in src_sd.items()}
+    if strip_distribution:
+        src_sd = {k: v for k, v in src_sd.items() if not k.startswith("distribution.")}
+
+    current_sd = model.state_dict()
+    new_sd = {}
+    for key, tgt in current_sd.items():
+        if key not in src_sd:
+            # Keep current init for keys that do not exist in source, such as distribution params.
+            new_sd[key] = tgt
+            continue
+
+        src = src_sd[key]
+        if src.shape == tgt.shape:
+            new_sd[key] = src
+        elif len(src.shape) == 2 and src.shape[0] == tgt.shape[0] and src.shape[1] < tgt.shape[1]:
+            # First-layer input expansion: append zero columns for new obstacle obs dims.
+            n_pad = tgt.shape[1] - src.shape[1]
+            pad = torch.zeros(src.shape[0], n_pad, dtype=src.dtype, device=device)
+            new_sd[key] = torch.cat([src, pad], dim=1)
+            print(f"[INFO] Zero-padded {label} '{key}': {tuple(src.shape)} -> {tuple(new_sd[key].shape)}")
+        else:
+            print(
+                f"[WARN] Shape mismatch in {label} '{key}': "
+                f"src={tuple(src.shape)}, tgt={tuple(tgt.shape)}; keeping current init"
+            )
+            new_sd[key] = tgt
+
+    model.load_state_dict(new_sd)
+
+
 def _load_locomotion_checkpoint(runner: OnPolicyRunner, ckpt_path: str, device: str) -> None:
-    """Load a flat locomotion checkpoint, zero-padding first-layer weights for obs dim expansion.
+    """Warm-start actor and critic from a flat checkpoint with obs-dim padding.
 
     Handles the 60D→90D mismatch between flat env and obstacle env: the extra 30 dims
     (obstacle positions) start at zero and receive gradient once obstacles appear.
     """
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    # Resolve model handle (API varies across rsl-rl versions)
-    model = getattr(runner.alg, "actor_critic", None) or getattr(runner.alg, "policy", None)
-    if model is None:
-        raise AttributeError("Cannot find actor_critic or policy in runner.alg")
-    current_sd = model.state_dict()
+    actor_key, actor_sd = _find_state_dict(
+        ckpt,
+        ("actor_state_dict", "model_state_dict", "policy_state_dict"),
+        "actor",
+    )
+    actor_target = getattr(runner.alg.actor, "frozen_actor", runner.alg.actor)
+    actor_label = "frozen actor" if actor_target is not runner.alg.actor else "actor"
+    _load_padded_state_dict(actor_target, actor_sd, device, actor_label, strip_distribution=True)
+    print(f"[INFO] Loaded actor from '{actor_key}'")
 
-    # Find the state dict inside the checkpoint
-    src_sd = None
-    for key in ("actor_state_dict", "model_state_dict", "policy_state_dict"):
-        if key in ckpt and isinstance(ckpt[key], dict):
-            src_sd = {k: v.to(device) for k, v in ckpt[key].items()}
-            break
-    if src_sd is None:
-        raise ValueError(f"No recognized state dict in checkpoint. Keys found: {list(ckpt.keys())}")
+    try:
+        critic_key, critic_sd = _find_state_dict(ckpt, ("critic_state_dict", "value_state_dict"), "critic")
+    except ValueError as exc:
+        print(f"[WARN] {exc}; critic remains randomly initialized")
+    else:
+        _load_padded_state_dict(runner.alg.critic, critic_sd, device, "critic")
+        print(f"[INFO] Loaded critic from '{critic_key}'")
 
-    # Strip PPO-specific distribution params not present in all model types
-    src_sd = {k: v for k, v in src_sd.items() if not k.startswith("distribution.")}
-
-    new_sd = {}
-    for key, tgt in current_sd.items():
-        if key not in src_sd:
-            # Keep random init for keys that don't exist in source (e.g. new output heads)
-            new_sd[key] = tgt
-            continue
-        src = src_sd[key]
-        if src.shape == tgt.shape:
-            new_sd[key] = src
-        elif (
-            len(src.shape) == 2
-            and src.shape[0] == tgt.shape[0]
-            and src.shape[1] < tgt.shape[1]
-        ):
-            # First-layer input dimension expansion: append zero columns for new obs dims
-            n_pad = tgt.shape[1] - src.shape[1]
-            pad = torch.zeros(src.shape[0], n_pad, dtype=src.dtype, device=device)
-            new_sd[key] = torch.cat([src, pad], dim=1)
-            print(f"[INFO] Zero-padded '{key}': {tuple(src.shape)} -> {tuple(new_sd[key].shape)}")
-        else:
-            print(f"[WARN] Shape mismatch '{key}': src={tuple(src.shape)}, tgt={tuple(tgt.shape)}; keeping random init")
-            new_sd[key] = tgt
-
-    model.load_state_dict(new_sd)
     print(f"[INFO] Loaded locomotion checkpoint from: {ckpt_path}")
+
+
+def _load_distillation_teacher_locomotion_checkpoint(
+    runner: DistillationRunner, ckpt_path: str, device: str
+) -> None:
+    """Initialize a rule-based distillation teacher from a flat locomotion checkpoint."""
+    teacher_target = getattr(runner.alg.teacher, "frozen_actor", None)
+    if teacher_target is None:
+        raise ValueError(
+            "--locomotion_checkpoint for DistillationRunner requires a teacher with a frozen_actor "
+            "(e.g. the geometric steering teacher)."
+        )
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    actor_key, actor_sd = _find_state_dict(
+        ckpt,
+        ("actor_state_dict", "model_state_dict", "policy_state_dict"),
+        "actor",
+    )
+    _load_padded_state_dict(teacher_target, actor_sd, device, "teacher frozen actor", strip_distribution=True)
+    runner.alg.teacher_loaded = True
+    print(f"[INFO] Loaded distillation teacher frozen actor from '{actor_key}'")
+    print(f"[INFO] Loaded locomotion checkpoint for rule-based teacher from: {ckpt_path}")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -239,9 +280,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = multi_agent_to_single_agent(env)
 
     # save resume path before creating a new log_dir
+    resume_path = None
     if args_cli.teacher_checkpoint is not None:
         resume_path = args_cli.teacher_checkpoint
-    elif agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    elif agent_cfg.resume:
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    elif agent_cfg.algorithm.class_name == "Distillation" and args_cli.locomotion_checkpoint is None:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
@@ -273,24 +317,55 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # Load flat locomotion checkpoint with obs-dim zero-padding (flat 60D → obstacle 90D)
     if args_cli.locomotion_checkpoint is not None:
-        if not isinstance(runner, OnPolicyRunner):
-            raise ValueError("--locomotion_checkpoint requires an OnPolicyRunner task (PPO)")
-        _load_locomotion_checkpoint(runner, args_cli.locomotion_checkpoint, agent_cfg.device)
+        if isinstance(runner, DistillationRunner):
+            _load_distillation_teacher_locomotion_checkpoint(runner, args_cli.locomotion_checkpoint, agent_cfg.device)
+        elif isinstance(runner, OnPolicyRunner):
+            _load_locomotion_checkpoint(runner, args_cli.locomotion_checkpoint, agent_cfg.device)
+        else:
+            raise ValueError("--locomotion_checkpoint is only supported for OnPolicyRunner/DistillationRunner tasks")
+
+    if (
+        isinstance(runner, DistillationRunner)
+        and hasattr(runner.alg.teacher, "frozen_actor")
+        and args_cli.teacher_checkpoint is None
+        and args_cli.locomotion_checkpoint is None
+        and not agent_cfg.resume
+    ):
+        raise ValueError(
+            "Rule-based obstacle distillation requires --locomotion_checkpoint to initialize the frozen LLC teacher, "
+            "or --teacher_checkpoint/--resume to load an existing distillation checkpoint."
+        )
 
     # load the checkpoint
-    if args_cli.teacher_checkpoint is not None or agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    if resume_path is not None:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # When loading a PPO checkpoint into DistillationRunner, the actor state_dict
         # contains distribution parameters (e.g. std_param) that the teacher MLPModel
         # does not have. Strip them before loading.
         if isinstance(runner, DistillationRunner):
             ckpt = torch.load(resume_path, weights_only=False)
-            if "actor_state_dict" in ckpt:
+            if "teacher_state_dict" in ckpt or "student_state_dict" in ckpt:
+                runner.alg.load(ckpt, load_cfg=None, strict=True)
+            elif "actor_state_dict" in ckpt and hasattr(runner.alg.teacher, "frozen_actor"):
                 ckpt["actor_state_dict"] = {
                     k: v for k, v in ckpt["actor_state_dict"].items()
                     if not k.startswith("distribution.")
                 }
-            runner.alg.load(ckpt, load_cfg=None, strict=True)
+                _load_padded_state_dict(
+                    runner.alg.teacher.frozen_actor,
+                    ckpt["actor_state_dict"],
+                    agent_cfg.device,
+                    "teacher frozen actor",
+                    strip_distribution=False,
+                )
+                runner.alg.teacher_loaded = True
+                print("[INFO] Loaded rule-based teacher frozen actor from actor_state_dict checkpoint")
+            elif "actor_state_dict" in ckpt:
+                ckpt["actor_state_dict"] = {
+                    k: v for k, v in ckpt["actor_state_dict"].items()
+                    if not k.startswith("distribution.")
+                }
+                runner.alg.load(ckpt, load_cfg=None, strict=True)
         else:
             runner.load(resume_path)
 
