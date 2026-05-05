@@ -8,6 +8,8 @@
 Unlike play.py (which uses random commands sampled from the training distribution),
 this script locks the velocity command to user-specified values so you can
 evaluate a specific motion (e.g. forward drive, pure yaw, lateral slide).
+Pass ``--random_commands`` to keep the environment's native random command
+sampler instead.
 
 Usage examples:
     # Forward at 0.5 m/s
@@ -32,16 +34,38 @@ Usage examples:
         --locomotion_checkpoint logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt \
         --cmd_vx 1.0 \
         --num_obstacles 2
+
+    # Evaluate the rule-based obstacle teacher on random commands
+    python scripts/rsl_rl/play_cmd.py \
+        --task Obstacle-Distill-Go2w-Play-v0 \
+        --teacher_steering \
+        --random_commands \
+        --locomotion_checkpoint logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt \
+        --num_obstacles 2
+
+    # Spawn two obstacles directly ahead of the commanded motion ray
+    python scripts/rsl_rl/play_cmd.py \
+        --task Obstacle-Distill-Go2w-Play-v0 \
+        --teacher_steering \
+        --locomotion_checkpoint logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt \
+        --cmd_vx 0.8 --cmd_vy -0.6 \
+        --num_obstacles 3 \
+        --command_path_obstacles 2
 """
 
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import random
 import sys
 
 from isaaclab.app import AppLauncher
 
 import cli_args  # isort: skip
+
+DEFAULT_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
+DEFAULT_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
+DEFAULT_COMMAND_PATH_MIN_SPEED = 0.2
 
 parser = argparse.ArgumentParser(description="Play a Go2-W policy with fixed velocity commands.")
 parser.add_argument("--num_envs", type=int, default=None)
@@ -56,8 +80,50 @@ parser.add_argument(
 parser.add_argument("--cmd_vx", type=float, default=0.0, help="Linear velocity x [m/s]  (default: 0.0)")
 parser.add_argument("--cmd_vy", type=float, default=0.0, help="Linear velocity y [m/s]  (default: 0.0)")
 parser.add_argument("--cmd_wz", "--cmd_yaw", dest="cmd_wz", type=float, default=0.0, help="Angular velocity z [rad/s] (default: 0.0)")
+parser.add_argument(
+    "--random_commands",
+    action="store_true",
+    default=False,
+    help="Keep the env's native random command sampler instead of locking to --cmd_vx/--cmd_vy/--cmd_wz.",
+)
 parser.add_argument("--num_obstacles", "--num-obstacles", dest="num_obstacles", type=int, default=None,
                     help="Override active obstacle count for obstacle play envs.")
+parser.add_argument(
+    "--command_path_obstacles",
+    "--command-path-obstacles",
+    dest="command_path_obstacles",
+    type=int,
+    default=None,
+    help="Force this many active obstacle slots to spawn in front of the current command direction.",
+)
+parser.add_argument(
+    "--command_path_forward_range",
+    "--command-path-forward-range",
+    dest="command_path_forward_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Forward spawn range [m] for command-path obstacles. Default: 1.6 2.4",
+)
+parser.add_argument(
+    "--command_path_lateral_range",
+    "--command-path-lateral-range",
+    dest="command_path_lateral_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Lateral spawn range [m] for command-path obstacles. Default: -0.35 0.35",
+)
+parser.add_argument(
+    "--command_path_min_speed",
+    "--command-path-min-speed",
+    dest="command_path_min_speed",
+    type=float,
+    default=None,
+    help="Below this command speed, command-path spawn falls back to random placement. Default: 0.2",
+)
 parser.add_argument(
     "--teacher_steering",
     action="store_true",
@@ -192,6 +258,65 @@ def _override_play_obstacle_count(env_cfg, num_obstacles):
     print(f"[INFO] Active play obstacles: {num_obstacles}/{max_available}")
 
 
+def _override_play_command_path_spawn(
+    env_cfg,
+    command_path_obstacles,
+    command_path_forward_range,
+    command_path_lateral_range,
+    command_path_min_speed,
+    command_path_reference_xy=None,
+):
+    """Override command-direction obstacle spawn for obstacle play configs."""
+    if (
+        command_path_obstacles is None
+        and command_path_forward_range is None
+        and command_path_lateral_range is None
+        and command_path_min_speed is None
+    ):
+        return
+
+    events_cfg = getattr(env_cfg, "events", None)
+    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
+    if reset_obstacles is None:
+        raise ValueError("--command_path_obstacles requires an obstacle play task with a reset_obstacles event.")
+
+    params = reset_obstacles.params
+    obstacle_names = params.get("obstacle_names", [])
+    max_available = len(obstacle_names)
+    active_obstacles = int(params.get("max_obstacles", max_available))
+
+    count = params.get("command_path_obstacles", 0) if command_path_obstacles is None else command_path_obstacles
+    if count < 0:
+        raise ValueError("--command_path_obstacles must be >= 0.")
+    if count > active_obstacles:
+        raise ValueError(
+            f"--command_path_obstacles={count} exceeds active obstacle count ({active_obstacles}). "
+            "Increase --num_obstacles or lower the command-path count."
+        )
+
+    forward_range = tuple(command_path_forward_range) if command_path_forward_range is not None else params.get(
+        "command_path_forward_range", DEFAULT_COMMAND_PATH_FORWARD_RANGE
+    )
+    lateral_range = tuple(command_path_lateral_range) if command_path_lateral_range is not None else params.get(
+        "command_path_lateral_range", DEFAULT_COMMAND_PATH_LATERAL_RANGE
+    )
+    min_speed = command_path_min_speed
+    if min_speed is None:
+        min_speed = params.get("command_path_min_speed", DEFAULT_COMMAND_PATH_MIN_SPEED)
+
+    params["command_path_obstacles"] = count
+    params["command_name"] = "base_velocity"
+    params["command_path_reference_xy"] = command_path_reference_xy
+    params["command_path_forward_range"] = forward_range
+    params["command_path_lateral_range"] = lateral_range
+    params["command_path_min_speed"] = min_speed
+    print(
+        "[INFO] Command-path obstacle spawn: "
+        f"count={count}, forward={forward_range}, lateral={lateral_range}, min_speed={min_speed:.2f}, "
+        f"reference={command_path_reference_xy}"
+    )
+
+
 def _build_teacher_policy(env, obs, agent_cfg, device: str):
     """Instantiate the rule-based steering teacher for direct play/evaluation."""
     teacher_cfg = getattr(agent_cfg, "teacher", None)
@@ -248,15 +373,29 @@ def _compute_teacher_debug_line(obs, teacher, env_index: int = 0) -> str:
     closest_lateral = lateral[batch_indices, closest_idx]
 
     base_cmd = teacher.last_base_command[env_index]
+    guide_cmd = teacher.last_guidance_command[env_index]
     delta_cmd = teacher.last_delta_command[env_index]
     adjusted_cmd = teacher.last_adjusted_command[env_index]
+    gap_width = teacher.last_gap_width[env_index]
+    gap_turn_need = teacher.last_gap_turn_need[env_index]
+    gap_blocked = teacher.last_gap_blocked[env_index]
+    turn_side = teacher.last_turn_side[env_index]
     return (
         f"[TEACHER] env={env_index} "
         f"base=({base_cmd[0]:+.2f},{base_cmd[1]:+.2f},{base_cmd[2]:+.2f}) "
-        f"delta=(vy {delta_cmd[0]:+.2f}, yaw {delta_cmd[1]:+.2f}) "
+        f"guide=({guide_cmd[0]:+.2f},{guide_cmd[1]:+.2f},{guide_cmd[2]:+.2f}) "
+        f"delta=(vx {delta_cmd[0]:+.2f}, vy {delta_cmd[1]:+.2f}, yaw {delta_cmd[2]:+.2f}) "
         f"adj=({adjusted_cmd[0]:+.2f},{adjusted_cmd[1]:+.2f},{adjusted_cmd[2]:+.2f}) "
-        f"closest=(dist {closest_dist[env_index]:.2f} m, fwd {closest_forward[env_index]:+.2f}, lat {closest_lateral[env_index]:+.2f})"
+        f"closest=(dist {closest_dist[env_index]:.2f} m, fwd {closest_forward[env_index]:+.2f}, lat {closest_lateral[env_index]:+.2f}) "
+        f"gap=(w {gap_width:.2f}, turn {gap_turn_need:.2f}, blocked {gap_blocked:.2f}, commit {turn_side:+.0f})"
     )
+
+
+def _resolve_play_seed(args_cli, default_seed: int | None) -> int:
+    if args_cli.seed is not None:
+        return args_cli.seed
+    base_seed = default_seed if default_seed is not None else 0
+    return (base_seed + random.SystemRandom().randrange(1, 2_147_483_647)) % 2_147_483_647
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -266,25 +405,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-    env_cfg.seed = agent_cfg.seed
+    env_seed = _resolve_play_seed(args_cli, agent_cfg.seed)
+    agent_cfg.seed = env_seed
+    env_cfg.seed = env_seed
+    print(f"[INFO] Play seed: {env_seed}")
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     _override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
+    _override_play_command_path_spawn(
+        env_cfg,
+        args_cli.command_path_obstacles,
+        args_cli.command_path_forward_range,
+        args_cli.command_path_lateral_range,
+        args_cli.command_path_min_speed,
+        None if args_cli.random_commands else (args_cli.cmd_vx, args_cli.cmd_vy),
+    )
 
     # ------------------------------------------------------------------
-    # Fix velocity commands to CLI values — never resampled.
+    # Either fix velocity commands to CLI values or keep native random sampling.
     # ------------------------------------------------------------------
-    vx = args_cli.cmd_vx
-    vy = args_cli.cmd_vy
-    wz = args_cli.cmd_wz
-    print(f"[INFO] Fixed command: vx={vx:.2f} m/s  vy={vy:.2f} m/s  wz={wz:.2f} rad/s")
-
     cmd = env_cfg.commands.base_velocity
-    cmd.ranges.lin_vel_x = (vx, vx)
-    cmd.ranges.lin_vel_y = (vy, vy)
-    cmd.ranges.ang_vel_z = (wz, wz)
-    cmd.ranges.heading   = (0.0, 0.0)
-    cmd.resampling_time_range = (1e9, 1e9)  # effectively never resample
-    cmd.rel_standing_envs = 0.0
+    if args_cli.random_commands:
+        print(
+            "[INFO] Random command mode: "
+            f"vx={cmd.ranges.lin_vel_x}, vy={cmd.ranges.lin_vel_y}, wz={cmd.ranges.ang_vel_z}, "
+            f"resample={cmd.resampling_time_range}, standing={cmd.rel_standing_envs:.2f}"
+        )
+    else:
+        vx = args_cli.cmd_vx
+        vy = args_cli.cmd_vy
+        wz = args_cli.cmd_wz
+        print(f"[INFO] Fixed command: vx={vx:.2f} m/s  vy={vy:.2f} m/s  wz={wz:.2f} rad/s")
+
+        cmd.ranges.lin_vel_x = (vx, vx)
+        cmd.ranges.lin_vel_y = (vy, vy)
+        cmd.ranges.ang_vel_z = (wz, wz)
+        cmd.ranges.heading = (0.0, 0.0)
+        cmd.resampling_time_range = (1e9, 1e9)  # effectively never resample
+        cmd.rel_standing_envs = 0.0
     # ------------------------------------------------------------------
 
     resume_path = None

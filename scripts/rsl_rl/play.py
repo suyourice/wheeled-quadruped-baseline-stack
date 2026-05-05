@@ -3,11 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to play a checkpoint if an RL agent from RSL-RL."""
+"""Script to play a checkpoint of an RL agent from RSL-RL."""
 
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import random
 import sys
 
 from isaaclab.app import AppLauncher
@@ -15,9 +16,13 @@ from isaaclab.app import AppLauncher
 # local imports
 import cli_args  # isort: skip
 
+DEFAULT_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
+DEFAULT_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
+DEFAULT_COMMAND_PATH_MIN_SPEED = 0.2
+
 # add argparse arguments
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+parser = argparse.ArgumentParser(description="Play an RL agent with RSL-RL.")
+parser.add_argument("--video", action="store_true", default=False, help="Record videos during play.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
@@ -31,6 +36,42 @@ parser.add_argument(
     type=int,
     default=None,
     help="Obstacle play tasks only: force this many active boxes in the scene.",
+)
+parser.add_argument(
+    "--command_path_obstacles",
+    "--command-path-obstacles",
+    dest="command_path_obstacles",
+    type=int,
+    default=None,
+    help="Obstacle play tasks only: force this many active slots to spawn in front of the current command direction.",
+)
+parser.add_argument(
+    "--command_path_forward_range",
+    "--command-path-forward-range",
+    dest="command_path_forward_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Forward spawn range [m] for command-path obstacles. Default: 1.6 2.4",
+)
+parser.add_argument(
+    "--command_path_lateral_range",
+    "--command-path-lateral-range",
+    dest="command_path_lateral_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Lateral spawn range [m] for command-path obstacles. Default: -0.35 0.35",
+)
+parser.add_argument(
+    "--command_path_min_speed",
+    "--command-path-min-speed",
+    dest="command_path_min_speed",
+    type=float,
+    default=None,
+    help="Below this command speed, command-path spawn falls back to random placement. Default: 0.2",
 )
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
@@ -133,6 +174,69 @@ def _override_play_obstacle_count(
     print(f"[INFO] Active play obstacles: {num_obstacles}/{max_available}")
 
 
+def _override_play_command_path_spawn(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    command_path_obstacles: int | None,
+    command_path_forward_range: tuple[float, float] | list[float] | None,
+    command_path_lateral_range: tuple[float, float] | list[float] | None,
+    command_path_min_speed: float | None,
+):
+    """Override command-direction obstacle spawn for obstacle play configs."""
+    if (
+        command_path_obstacles is None
+        and command_path_forward_range is None
+        and command_path_lateral_range is None
+        and command_path_min_speed is None
+    ):
+        return
+
+    events_cfg = getattr(env_cfg, "events", None)
+    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
+    if reset_obstacles is None:
+        raise ValueError("--command_path_obstacles requires an obstacle play task with a reset_obstacles event.")
+
+    params = reset_obstacles.params
+    obstacle_names = params.get("obstacle_names", [])
+    max_available = len(obstacle_names)
+    active_obstacles = int(params.get("max_obstacles", max_available))
+
+    count = params.get("command_path_obstacles", 0) if command_path_obstacles is None else command_path_obstacles
+    if count < 0:
+        raise ValueError("--command_path_obstacles must be >= 0.")
+    if count > active_obstacles:
+        raise ValueError(
+            f"--command_path_obstacles={count} exceeds active obstacle count ({active_obstacles}). "
+            "Increase --num_obstacles or lower the command-path count."
+        )
+
+    forward_range = tuple(command_path_forward_range) if command_path_forward_range is not None else params.get(
+        "command_path_forward_range", DEFAULT_COMMAND_PATH_FORWARD_RANGE
+    )
+    lateral_range = tuple(command_path_lateral_range) if command_path_lateral_range is not None else params.get(
+        "command_path_lateral_range", DEFAULT_COMMAND_PATH_LATERAL_RANGE
+    )
+    min_speed = command_path_min_speed
+    if min_speed is None:
+        min_speed = params.get("command_path_min_speed", DEFAULT_COMMAND_PATH_MIN_SPEED)
+
+    params["command_path_obstacles"] = count
+    params["command_name"] = "base_velocity"
+    params["command_path_forward_range"] = forward_range
+    params["command_path_lateral_range"] = lateral_range
+    params["command_path_min_speed"] = min_speed
+    print(
+        "[INFO] Command-path obstacle spawn: "
+        f"count={count}, forward={forward_range}, lateral={lateral_range}, min_speed={min_speed:.2f}"
+    )
+
+
+def _resolve_play_seed(args_cli, default_seed: int | None) -> int:
+    if args_cli.seed is not None:
+        return args_cli.seed
+    base_seed = default_seed if default_seed is not None else 0
+    return (base_seed + random.SystemRandom().randrange(1, 2_147_483_647)) % 2_147_483_647
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -145,13 +249,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
     _override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
+    _override_play_command_path_spawn(
+        env_cfg,
+        args_cli.command_path_obstacles,
+        args_cli.command_path_forward_range,
+        args_cli.command_path_lateral_range,
+        args_cli.command_path_min_speed,
+    )
 
     # handle deprecated configurations
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
-    env_cfg.seed = agent_cfg.seed
+    env_seed = _resolve_play_seed(args_cli, agent_cfg.seed)
+    agent_cfg.seed = env_seed
+    env_cfg.seed = env_seed
+    print(f"[INFO] Play seed: {env_seed}")
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # specify directory for logging experiments
