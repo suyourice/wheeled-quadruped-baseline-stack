@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import math
+import random
 from typing import TYPE_CHECKING
 
 import torch
@@ -79,6 +81,17 @@ def _quat_yaw_wxyz(quat: torch.Tensor) -> torch.Tensor:
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return torch.atan2(siny_cosp, cosy_cosp)
+
+
+def _ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
+    """Create persistent start/goal buffers used by the navigation-distill task."""
+    if not hasattr(env, "_go2w_goal_pos_w"):
+        env._go2w_goal_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
+        env._go2w_goal_heading_w = torch.zeros(env.num_envs, device=env.device)
+        env._go2w_start_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
+        env._go2w_start_heading_w = torch.zeros(env.num_envs, device=env.device)
+    if not hasattr(env, "_go2w_scenario_template_id"):
+        env._go2w_scenario_template_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
 
 
 def reset_obstacles_curriculum(
@@ -358,5 +371,285 @@ def reset_obstacles_curriculum(
         pose[:, :3] = world_pos
         pose[:, 3] = 1.0  # quaternion w component
 
+        obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
+        obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+
+
+def reset_navigation_goals_and_obstacles(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    obstacle_names: list[str],
+    min_obstacles: int = 5,
+    max_obstacles: int | None = None,
+    empty_env_fraction: float = 0.0,
+    spawn_range_x: tuple[float, float] = (-3.5, 3.5),
+    spawn_range_y: tuple[float, float] = (-2.5, 2.5),
+    obstacle_z: float = 0.25,
+    min_inter_obstacle_dist: float = 0.7,
+    goal_forward_range: tuple[float, float] = (2.5, 4.5),
+    goal_lateral_range: tuple[float, float] = (-1.5, 1.5),
+    goal_heading_jitter_range: tuple[float, float] = (-0.35, 0.35),
+    min_goal_distance: float = 2.0,
+    start_exclusion_radius: float = 1.0,
+    goal_exclusion_radius: float = 0.9,
+    head_on_progress_range: tuple[float, float] = (0.2, 0.85),
+    head_on_lateral_range: tuple[float, float] = (-0.25, 0.25),
+    edge_progress_range: tuple[float, float] = (0.25, 0.8),
+    edge_lateral_range: tuple[float, float] = (0.55, 1.1),
+    diagonal_progress_range: tuple[float, float] = (0.15, 0.7),
+    diagonal_lateral_range: tuple[float, float] = (0.8, 1.6),
+    offpath_progress_range: tuple[float, float] = (0.3, 0.9),
+    offpath_lateral_range: tuple[float, float] = (1.3, 2.2),
+    narrow_gap_progress_range: tuple[float, float] = (0.35, 0.75),
+    narrow_gap_center_lateral_range: tuple[float, float] = (-0.15, 0.15),
+    narrow_gap_half_width_range: tuple[float, float] = (0.38, 0.55),
+    narrow_gap_probability: float = 0.35,
+    park_distance: float = 1000.0,
+) -> None:
+    """Sample explicit start-goal local-navigation tasks and place varied obstacles.
+
+    This event is purpose-built for the active local-navigation distillation stage.
+    It samples:
+      1. an episode start pose (already set by reset_base),
+      2. a goal pose ahead/laterally offset from that start,
+      3. obstacle layouts distributed along the start-goal corridor with varied
+         encounter types (head-on, edge graze, diagonal, off-path, narrow gap).
+
+    The sampled start/goal are stored on the env so observation, reward, and
+    termination helpers can derive a local goal command every step.
+    """
+    if len(obstacle_names) == 0:
+        return
+
+    _ensure_navigation_goal_buffers(env)
+
+    if max_obstacles is None:
+        max_obstacles = len(obstacle_names)
+
+    n = len(env_ids)
+    device = env.device
+    env_origins = env.scene.env_origins[env_ids]
+
+    robot = env.scene["robot"]
+    start_pos_w = robot.data.root_pos_w[env_ids, :3].clone()
+    start_heading_w = robot.data.heading_w[env_ids].clone()
+    yaw = _quat_yaw_wxyz(robot.data.root_quat_w[env_ids])
+
+    env._go2w_start_pos_w[env_ids] = start_pos_w
+    env._go2w_start_heading_w[env_ids] = start_heading_w
+
+    robot_local_xy = (start_pos_w[:, :2] - env_origins[:, :2]).cpu().tolist()
+    env_origin_xy = env_origins[:, :2].cpu().tolist()
+    yaw_list = yaw.cpu().tolist()
+
+    goal_pos_w = start_pos_w.clone()
+    goal_heading_w = start_heading_w.clone()
+
+    for idx in range(n):
+        start_x, start_y = robot_local_xy[idx]
+        yaw_i = yaw_list[idx]
+        cos_yaw = math.cos(yaw_i)
+        sin_yaw = math.sin(yaw_i)
+
+        forward = 0.0
+        lateral = 0.0
+        goal_distance = 0.0
+        for _ in range(50):
+            forward = random.uniform(*goal_forward_range)
+            lateral = random.uniform(*goal_lateral_range)
+            goal_distance = math.hypot(forward, lateral)
+            if goal_distance >= min_goal_distance:
+                break
+
+        goal_dx_world = forward * cos_yaw - lateral * sin_yaw
+        goal_dy_world = forward * sin_yaw + lateral * cos_yaw
+        goal_pos_w[idx, 0] = start_pos_w[idx, 0] + goal_dx_world
+        goal_pos_w[idx, 1] = start_pos_w[idx, 1] + goal_dy_world
+        path_heading_w = math.atan2(goal_dy_world, goal_dx_world)
+        heading_jitter = random.uniform(*goal_heading_jitter_range)
+        goal_heading_w[idx] = math.atan2(
+            math.sin(path_heading_w + heading_jitter), math.cos(path_heading_w + heading_jitter)
+        )
+
+    env._go2w_goal_pos_w[env_ids] = goal_pos_w
+    env._go2w_goal_heading_w[env_ids] = goal_heading_w
+
+    goal_local_xy = (goal_pos_w[:, :2] - env_origins[:, :2]).cpu().tolist()
+
+    active_counts = torch.randint(
+        low=min_obstacles,
+        high=max_obstacles + 1,
+        size=(n,),
+        device=device,
+    )
+    if empty_env_fraction > 0.0:
+        empty_mask = torch.rand(n, device=device) < max(0.0, min(1.0, empty_env_fraction))
+        active_counts = torch.where(empty_mask, torch.zeros_like(active_counts), active_counts)
+    env._go2w_scenario_template_id[env_ids] = 0
+
+    parked_world = env_origins.clone()
+    parked_world[:, 0] += park_distance
+    parked_world[:, 2] = obstacle_z
+    world_positions_per_slot = [parked_world.clone() for _ in obstacle_names]
+
+    template_choices = (
+        "head_on",
+        "left_edge",
+        "right_edge",
+        "diag_left",
+        "diag_right",
+        "off_left",
+        "off_right",
+    )
+    template_codes = {
+        "empty": 0,
+        "head_on": 1,
+        "left_edge": 2,
+        "right_edge": 3,
+        "diag_left": 4,
+        "diag_right": 5,
+        "off_left": 6,
+        "off_right": 7,
+        "narrow_gap": 8,
+        "random_fallback": 9,
+    }
+
+    for env_idx in range(n):
+        active_count = int(active_counts[env_idx].item())
+        if active_count <= 0:
+            continue
+
+        start_x, start_y = robot_local_xy[env_idx]
+        goal_x, goal_y = goal_local_xy[env_idx]
+        origin_x, origin_y = env_origin_xy[env_idx]
+        path_dx = goal_x - start_x
+        path_dy = goal_y - start_y
+        path_len = math.hypot(path_dx, path_dy)
+        if path_len < 1.0e-6:
+            path_dx = 1.0
+            path_dy = 0.0
+            path_len = 1.0
+        path_dir_x = path_dx / path_len
+        path_dir_y = path_dy / path_len
+        normal_x = -path_dir_y
+        normal_y = path_dir_x
+        scenario_code = template_codes["empty"]
+
+        placed_positions: list[tuple[float, float]] = []
+
+        def _valid_position(local_x: float, local_y: float) -> bool:
+            if local_x < spawn_range_x[0] or local_x > spawn_range_x[1]:
+                return False
+            if local_y < spawn_range_y[0] or local_y > spawn_range_y[1]:
+                return False
+            if math.hypot(local_x - start_x, local_y - start_y) < start_exclusion_radius:
+                return False
+            if math.hypot(local_x - goal_x, local_y - goal_y) < goal_exclusion_radius:
+                return False
+            for prev_x, prev_y in placed_positions:
+                if math.hypot(local_x - prev_x, local_y - prev_y) < min_inter_obstacle_dist:
+                    return False
+            return True
+
+        def _place_from_path(progress: float, lateral_offset: float) -> tuple[float, float]:
+            center_x = start_x + progress * path_dx
+            center_y = start_y + progress * path_dy
+            return center_x + lateral_offset * normal_x, center_y + lateral_offset * normal_y
+
+        def _sample_template_position(template: str) -> tuple[float, float]:
+            if template == "head_on":
+                progress = random.uniform(*head_on_progress_range)
+                lateral_offset = random.uniform(*head_on_lateral_range)
+            elif template == "left_edge":
+                progress = random.uniform(*edge_progress_range)
+                lateral_offset = random.uniform(*edge_lateral_range)
+            elif template == "right_edge":
+                progress = random.uniform(*edge_progress_range)
+                lateral_offset = -random.uniform(*edge_lateral_range)
+            elif template == "diag_left":
+                progress = random.uniform(*diagonal_progress_range)
+                lateral_offset = random.uniform(*diagonal_lateral_range)
+            elif template == "diag_right":
+                progress = random.uniform(*diagonal_progress_range)
+                lateral_offset = -random.uniform(*diagonal_lateral_range)
+            elif template == "off_left":
+                progress = random.uniform(*offpath_progress_range)
+                lateral_offset = random.uniform(*offpath_lateral_range)
+            elif template == "off_right":
+                progress = random.uniform(*offpath_progress_range)
+                lateral_offset = -random.uniform(*offpath_lateral_range)
+            else:
+                progress = random.uniform(*head_on_progress_range)
+                lateral_offset = random.uniform(*head_on_lateral_range)
+            return _place_from_path(progress, lateral_offset)
+
+        next_slot = 0
+        if active_count >= 2 and random.random() < narrow_gap_probability:
+            scenario_code = template_codes["narrow_gap"]
+            progress = random.uniform(*narrow_gap_progress_range)
+            center_lateral = random.uniform(*narrow_gap_center_lateral_range)
+            gap_half_width = random.uniform(*narrow_gap_half_width_range)
+            pair_offsets = (center_lateral + gap_half_width, center_lateral - gap_half_width)
+            for pair_offset in pair_offsets:
+                placed = False
+                for _ in range(30):
+                    local_x, local_y = _place_from_path(progress, pair_offset)
+                    if _valid_position(local_x, local_y):
+                        placed_positions.append((local_x, local_y))
+                        world_positions_per_slot[next_slot][env_idx, 0] = origin_x + local_x
+                        world_positions_per_slot[next_slot][env_idx, 1] = origin_y + local_y
+                        world_positions_per_slot[next_slot][env_idx, 2] = obstacle_z
+                        placed = True
+                        break
+                if not placed:
+                    for _ in range(40):
+                        local_x = random.uniform(*spawn_range_x)
+                        local_y = random.uniform(*spawn_range_y)
+                        if _valid_position(local_x, local_y):
+                            scenario_code = template_codes["random_fallback"]
+                            placed_positions.append((local_x, local_y))
+                            world_positions_per_slot[next_slot][env_idx, 0] = origin_x + local_x
+                            world_positions_per_slot[next_slot][env_idx, 1] = origin_y + local_y
+                            world_positions_per_slot[next_slot][env_idx, 2] = obstacle_z
+                            placed = True
+                            break
+                next_slot += 1
+
+        while next_slot < active_count:
+            placed = False
+            for _ in range(40):
+                template = random.choice(template_choices)
+                local_x, local_y = _sample_template_position(template)
+                if _valid_position(local_x, local_y):
+                    if scenario_code == template_codes["empty"]:
+                        scenario_code = template_codes[template]
+                    placed_positions.append((local_x, local_y))
+                    world_positions_per_slot[next_slot][env_idx, 0] = origin_x + local_x
+                    world_positions_per_slot[next_slot][env_idx, 1] = origin_y + local_y
+                    world_positions_per_slot[next_slot][env_idx, 2] = obstacle_z
+                    placed = True
+                    break
+            if not placed:
+                for _ in range(40):
+                    local_x = random.uniform(*spawn_range_x)
+                    local_y = random.uniform(*spawn_range_y)
+                    if _valid_position(local_x, local_y):
+                        if scenario_code == template_codes["empty"]:
+                            scenario_code = template_codes["random_fallback"]
+                        placed_positions.append((local_x, local_y))
+                        world_positions_per_slot[next_slot][env_idx, 0] = origin_x + local_x
+                        world_positions_per_slot[next_slot][env_idx, 1] = origin_y + local_y
+                        world_positions_per_slot[next_slot][env_idx, 2] = obstacle_z
+                        placed = True
+                        break
+            next_slot += 1
+
+        env._go2w_scenario_template_id[env_ids[env_idx]] = scenario_code
+
+    for slot_idx, name in enumerate(obstacle_names):
+        obstacle = env.scene[name]
+        pose = torch.zeros(n, 7, device=device)
+        pose[:, :3] = world_positions_per_slot[slot_idx]
+        pose[:, 3] = 1.0
         obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
         obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)

@@ -17,10 +17,33 @@ import torch
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import yaw_quat, quat_apply_inverse
+from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+def _ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
+    """Create goal-navigation buffers on demand for reward/termination helpers."""
+    if not hasattr(env, "_go2w_goal_pos_w"):
+        env._go2w_goal_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
+        env._go2w_goal_heading_w = torch.zeros(env.num_envs, device=env.device)
+        env._go2w_start_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
+        env._go2w_start_heading_w = torch.zeros(env.num_envs, device=env.device)
+
+
+def _goal_command_from_buffers(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return goal distance and heading error from the sampled task buffers."""
+    _ensure_navigation_goal_buffers(env)
+    asset = env.scene[asset_cfg.name]
+    goal_vec_w = env._go2w_goal_pos_w - asset.data.root_pos_w[:, :3]
+    goal_vec_b = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), goal_vec_w)
+    goal_distance = torch.norm(goal_vec_b[:, :2], dim=1)
+    goal_heading_error = wrap_to_pi(env._go2w_goal_heading_w - asset.data.heading_w).abs()
+    return goal_distance, goal_heading_error
 
 
 def track_lin_vel_xy_yaw_frame_exp(
@@ -543,3 +566,45 @@ def obstacle_contact_termination(
         forces = forces[:, :, sensor_cfg.body_ids, :]
     max_forces = forces.norm(dim=-1).max(dim=1)[0]
     return torch.any(max_forces > threshold, dim=1)
+
+
+def goal_distance_tanh_reward(
+    env: ManagerBasedRLEnv,
+    std: float = 1.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward being close to the sampled local-navigation goal."""
+    goal_distance, _ = _goal_command_from_buffers(env, asset_cfg)
+    return 1.0 - torch.tanh(goal_distance / max(std, 1.0e-6))
+
+
+def goal_heading_tanh_reward(
+    env: ManagerBasedRLEnv,
+    std: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward aligning the robot heading with the sampled goal heading."""
+    _, heading_error = _goal_command_from_buffers(env, asset_cfg)
+    return 1.0 - torch.tanh(heading_error / max(std, 1.0e-6))
+
+
+def goal_reached_bonus(
+    env: ManagerBasedRLEnv,
+    position_threshold: float = 0.35,
+    heading_threshold: float = 0.6,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Binary success bonus when the robot reaches the local-navigation goal."""
+    goal_distance, heading_error = _goal_command_from_buffers(env, asset_cfg)
+    return ((goal_distance <= position_threshold) & (heading_error <= heading_threshold)).float()
+
+
+def goal_reached_termination(
+    env: ManagerBasedRLEnv,
+    position_threshold: float = 0.35,
+    heading_threshold: float = 0.6,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate successful local-navigation episodes once the goal is reached."""
+    goal_distance, heading_error = _goal_command_from_buffers(env, asset_cfg)
+    return (goal_distance <= position_threshold) & (heading_error <= heading_threshold)

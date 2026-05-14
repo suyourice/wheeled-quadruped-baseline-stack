@@ -12,12 +12,14 @@ Extends the baseline flat-terrain environment with:
   - Collision penalty reward for obstacle contact
   - Teacher/Student/Distillation observation groups
 
-Training flow:
+Active training flow:
   1. Initialize the frozen fast-flat LLC from a locomotion checkpoint.
-  2. Use a rule-based geometric steering teacher over privileged obstacle
-     positions to generate final teacher actions online.
-  3. Distill those teacher actions into a LiDAR student:
-     train.py --task Obstacle-Distill-Go2w-v0 --locomotion_checkpoint <flat_ckpt>
+  2. Sample explicit start-goal local-navigation tasks with varied obstacle
+     encounters between the start and the goal.
+  3. Use a rule-based geometric steering teacher over (goal + privileged
+     obstacle positions) to generate obstacle-aware local target poses online.
+  4. Distill those target poses into a LiDAR student:
+     train.py --task Navigation-Distill-Go2w-v0 --locomotion_checkpoint <flat_ckpt>
 """
 
 import isaaclab.sim as sim_utils
@@ -51,23 +53,16 @@ from .go2w_env_cfg import EventCfg, Go2wEnvCfg, Go2wSceneCfg, TerminationsCfg
 # Teacher/distillation observation capacity (K closest obstacles -> K * 2 dims)
 TEACHER_OBS_OBSTACLE_SLOTS = 15
 
-# Standard obstacle-train scene capacity
+# Active train scene capacity
 TRAIN_PHYSICAL_OBSTACLE_SLOTS = 15
-
-# Fast teacher-train scene capacity and active clutter count
-FAST_TRAIN_PHYSICAL_OBSTACLE_SLOTS = 8
-FAST_TRAIN_ACTIVE_OBSTACLES = 3
 
 # Play/eval scene capacity and default active clutter count
 PLAY_PHYSICAL_OBSTACLE_SLOTS = 64
 PLAY_DEFAULT_ACTIVE_OBSTACLES = 5
 
-# Backward-compatible aliases kept to avoid broad refactors while distillation
-# is in progress. Prefer the role-based names above in new code/comments.
+# Local aliases used throughout this file.
 NUM_OBSTACLES = TRAIN_PHYSICAL_OBSTACLE_SLOTS
 PRIVILEGED_OBSTACLE_SLOTS = TEACHER_OBS_OBSTACLE_SLOTS
-NUM_OBSTACLES_FAST = FAST_TRAIN_PHYSICAL_OBSTACLE_SLOTS
-FAST_ACTIVE_OBSTACLES = FAST_TRAIN_ACTIVE_OBSTACLES
 PLAY_MAX_OBSTACLES = PLAY_PHYSICAL_OBSTACLE_SLOTS
 PLAY_NUM_OBSTACLES = PLAY_DEFAULT_ACTIVE_OBSTACLES
 
@@ -92,37 +87,64 @@ OBSTACLE_PATH_CLEARANCE_LENGTH = 1.6
 OBSTACLE_PATH_CLEARANCE_WIDTH = 0.55
 OBSTACLE_PATH_CLEARANCE_WEIGHT = -2.0
 OBSTACLE_COLLISION_WEIGHT = -40.0
-FAST_COMMAND_PATH_OBSTACLES = 2  # Put the first slots directly in the commanded path.
-FAST_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
-FAST_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
-FAST_NEAR_FIELD_OBSTACLES = 0  # Avoid random near-field contacts; remaining active slots are random clutter.
-FAST_NEAR_FIELD_RADIUS_RANGE = (1.3, 1.9)
-FAST_PATH_CLEARANCE_LENGTH = 2.6
-FAST_PATH_CLEARANCE_WIDTH = 0.75
-FAST_PATH_CLEARANCE_WEIGHT = -7.0
-FAST_PATH_CLEARANCE_SCORE_POWER = 1.0
-FAST_PATH_CLEARANCE_AGGREGATION = "sum_clamped"
-FAST_PATH_CLEARANCE_SUM_CLIP = 1.5
-FAST_OBSTACLE_LATERAL_AVOIDANCE_WEIGHT = 4.5
-FAST_OBSTACLE_YAW_AVOIDANCE_WEIGHT = 1.0
-FAST_AVOIDANCE_RISK_CLIP = 1.5
-FAST_AVOID_TARGET_LATERAL_SPEED = 0.35
-FAST_AVOID_TARGET_YAW_RATE = 0.8
-FAST_AVOID_CENTER_DEADBAND = 0.05
-FAST_AVOID_MIN_PROGRESS = 0.25
-FAST_OBSTACLE_COLLISION_WEIGHT = -100.0
-FAST_OBSTACLE_TERMINATION_START_ITERATION = 300
-FAST_OBSTACLE_WARMUP_ITERATIONS = 0
-FAST_CLEARANCE_WARMUP_ITERATIONS = 0
-FAST_COLLISION_WARMUP_ITERATIONS = 0
-FAST_EMPTY_ENV_FRACTION = 0.35  # Keep no-obstacle rollouts in the PPO batch to preserve flat locomotion.
-FAST_OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(FAST_TRAIN_PHYSICAL_OBSTACLE_SLOTS)]
+DISTILL_OBSTACLE_COLLISION_WEIGHT = -15.0
+DISTILL_ACTIVE_OBSTACLES = 5
+DISTILL_EMPTY_ENV_FRACTION = 0.05
+NAV_GOAL_FORWARD_RANGE = (2.5, 4.5)
+NAV_GOAL_LATERAL_RANGE = (-1.5, 1.5)
+NAV_GOAL_HEADING_JITTER_RANGE = (-0.35, 0.35)
+NAV_MIN_GOAL_DISTANCE = 2.0
+NAV_START_EXCLUSION_RADIUS = 1.0
+NAV_GOAL_EXCLUSION_RADIUS = 0.9
+NAV_HEAD_ON_PROGRESS_RANGE = (0.2, 0.85)
+NAV_HEAD_ON_LATERAL_RANGE = (-0.25, 0.25)
+NAV_EDGE_PROGRESS_RANGE = (0.25, 0.8)
+NAV_EDGE_LATERAL_RANGE = (0.55, 1.1)
+NAV_DIAGONAL_PROGRESS_RANGE = (0.15, 0.7)
+NAV_DIAGONAL_LATERAL_RANGE = (0.8, 1.6)
+NAV_OFFPATH_PROGRESS_RANGE = (0.3, 0.9)
+NAV_OFFPATH_LATERAL_RANGE = (1.3, 2.2)
+NAV_NARROW_GAP_PROGRESS_RANGE = (0.35, 0.75)
+NAV_NARROW_GAP_CENTER_LATERAL_RANGE = (-0.15, 0.15)
+NAV_NARROW_GAP_HALF_WIDTH_RANGE = (0.45, 0.65)
+NAV_NARROW_GAP_PROBABILITY = 0.25
+NAV_GOAL_DISTANCE_STD = 1.2
+NAV_GOAL_HEADING_STD = 0.8
+NAV_GOAL_SUCCESS_POSITION_THRESHOLD = 0.35
+NAV_GOAL_SUCCESS_HEADING_THRESHOLD = 0.6
+NAV_WAYPOINT_LOOKAHEAD_DISTANCE = 1.25
+NAV_WAYPOINT_GOAL_SNAP_DISTANCE = 1.0
+NAV_WAYPOINT_USE_LIDAR_REFINEMENT = True
+NAV_WAYPOINT_REFINEMENT_OFFSETS = (0.0, 0.45, -0.45, 0.70, -0.70)
+NAV_LOCAL_PLANNER_ACTIVATION_THRESHOLD = 0.22
+NAV_LOCAL_PLANNER_LATERAL_PENALTY = 0.16
+NAV_LOCAL_PLANNER_MIN_IMPROVEMENT = 0.07
+NAV_LOCAL_PLANNER_MAX_BLEND = 0.65
 
-LIDAR_MAX_DISTANCE = 20.0  # meters
+# Unitree L2 reference spec: 360 x 96 deg FoV, 0.05 m near blind spot,
+# 30 m max range at high reflectivity, and 64k effective points/s. The
+# training ray-caster intentionally uses a lightweight subset for runtime.
+LIDAR_MAX_DISTANCE = 20.0  # meters; train below the hardware max range
 LIDAR_HORIZONTAL_FOV = (0.0, 360.0)  # full 360 degrees
 LIDAR_HORIZONTAL_RES = 2.0  # 2 deg resolution -> 180 rays
-LIDAR_CHANNELS = 1  # single horizontal ring (2D LiDAR)
-LIDAR_VERTICAL_FOV = (0.0, 0.0)  # single horizontal plane
+LIDAR_CHANNELS = 5  # lightweight subset of the 96-degree vertical FoV
+LIDAR_VERTICAL_FOV = (-30.0, 6.0)  # stays within the L2 vertical range and keeps useful box-obstacle bands
+
+
+def _local_waypoint_params() -> dict:
+    """Build local waypoint params without sharing mutable config objects."""
+    return {
+        "sensor_cfg": SceneEntityCfg("lidar"),
+        "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
+        "goal_snap_distance": NAV_WAYPOINT_GOAL_SNAP_DISTANCE,
+        "use_lidar_refinement": NAV_WAYPOINT_USE_LIDAR_REFINEMENT,
+        "lidar_max_distance": LIDAR_MAX_DISTANCE,
+        "local_planner_candidate_offsets": NAV_WAYPOINT_REFINEMENT_OFFSETS,
+        "local_planner_activation_threshold": NAV_LOCAL_PLANNER_ACTIVATION_THRESHOLD,
+        "local_planner_lateral_penalty": NAV_LOCAL_PLANNER_LATERAL_PENALTY,
+        "local_planner_min_improvement": NAV_LOCAL_PLANNER_MIN_IMPROVEMENT,
+        "local_planner_max_blend": NAV_LOCAL_PLANNER_MAX_BLEND,
+    }
 
 
 # =============================================================================
@@ -193,7 +215,7 @@ class ObstacleSceneCfg(Go2wSceneCfg):
 
     # Obstacles must exist as independent prims in each environment so their
     # transforms/collisions can diverge after reset randomization.
-    replicate_physics: bool = False
+    replicate_physics: bool = False  # randomized locations for each env
 
     # Static box obstacles
     for i in range(NUM_OBSTACLES):
@@ -210,11 +232,11 @@ class ObstacleSceneCfg(Go2wSceneCfg):
         track_air_time=False,
     )
 
-    # 2D LiDAR sensor (horizontal ray-cast from robot base)
-    # Uses MultiMeshRayCaster to ray-cast against ground + dynamic obstacle meshes.
+    # Lightweight L2-like LiDAR subset. The real L2 supports 360 x 96 degrees,
+    # but this task samples only a few vertical rings for box-obstacle navigation.
     lidar = MultiMeshRayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base",
-        offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, -0.2)),  # below base
+        offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.28945, 0.0, -0.046825)),
         ray_alignment="yaw",  # rays track yaw only, not roll/pitch
         pattern_cfg=patterns.LidarPatternCfg(
             channels=LIDAR_CHANNELS,
@@ -249,24 +271,6 @@ class ObstaclePlaySceneCfg(ObstacleSceneCfg):
     del i
 
 
-@configclass
-class ObstacleSceneFastCfg(ObstacleSceneCfg):
-    """Lightweight scene for the Fast obstacle teacher (checkpoint-transfer variant).
-
-    Drops the LiDAR sensor (teacher obs uses privileged positions, not LiDAR) and
-    nullifies obstacle slots 8-14 (only 8 physical slots are used in Fast).
-    This cuts Isaac Sim init from 8192 × (15 rigid bodies + 180 LiDAR rays) down
-    to 8192 × 8 rigid bodies, which fits within the 4-hour HPC dev allocation.
-    """
-
-    lidar = None  # teacher doesn't consume LiDAR; dropping saves 8192×180 ray init
-
-    # Nullify unused obstacle physics slots (Fast env uses 8 physical slots)
-    for i in range(NUM_OBSTACLES_FAST, NUM_OBSTACLES):
-        vars()[f"obstacle_{i}"] = None
-    del i
-
-
 # =============================================================================
 # Events (randomisation)
 # =============================================================================
@@ -274,10 +278,11 @@ class ObstacleSceneFastCfg(ObstacleSceneCfg):
 
 @configclass
 class ObstacleEventCfg(EventCfg):
-    """Events for the obstacle environment.
+    """Shared obstacle-environment events.
 
-    reset_obstacles: curriculum that grows active obstacle count from 5 to NUM_OBSTACLES.
-    speed_curriculum: resets command range to ±1.0 m/s at obstacle start, ramps to ±2.0 m/s.
+    These are the legacy obstacle randomizers and command curricula. The active
+    local-navigation distillation task overrides the obstacle reset event and
+    disables the speed curriculum in its `__post_init__`.
     """
 
     speed_curriculum: EventTerm | None = EventTerm(
@@ -325,9 +330,11 @@ class ObstacleEventCfg(EventCfg):
 
 @configclass
 class ObstacleRewardsCfg:
-    """Rewards for obstacle avoidance.
+    """Shared obstacle-task rewards.
 
-    Matches the fast-flat locomotion objective, plus obstacle clearance/collision.
+    The active local-navigation task keeps the base stability penalties and
+    sparse obstacle-collision penalty, then overrides command-tracking and
+    goal-related terms in its `__post_init__`.
     """
 
     # -- Velocity tracking -----------------------------------------------------
@@ -485,64 +492,29 @@ class ObstacleRewardsCfg:
 
 
 @configclass
-class ObstacleTeacherObsCfg:
-    """Teacher observations: proprioception + privileged obstacle positions."""
-
-    @configclass
-    class PolicyCfg(ObsGroup):
-        """Teacher policy obs = proprioception + obstacle positions (privileged)."""
-
-        # -- Proprioception (same as baseline) --
-        base_lin_vel      = ObsTerm(func=mdp.base_lin_vel,      noise=Unoise(n_min=-0.1,  n_max=0.1))
-        base_ang_vel      = ObsTerm(func=mdp.base_ang_vel,      noise=Unoise(n_min=-0.2,  n_max=0.2))
-        projected_gravity = ObsTerm(func=mdp.projected_gravity,  noise=Unoise(n_min=-0.05, n_max=0.05))
-
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5,  n_max=1.5))
-
-        actions = ObsTerm(func=mdp.last_action)
-
-        # -- Privileged: obstacle positions relative to robot --
-        obstacle_positions = ObsTerm(
-            func=mdp.obstacle_positions_rel,
-            params={
-                "obstacle_names": OBSTACLE_NAMES,
-                "max_distance": 8.0,
-                "normalize": True,
-                "num_closest": PRIVILEGED_OBSTACLE_SLOTS,
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    policy: PolicyCfg = PolicyCfg()
-
-
-@configclass
 class ObstacleDistillObsCfg:
     """Distillation observations: student (LiDAR) and teacher (privileged) groups."""
 
     @configclass
     class StudentCfg(ObsGroup):
-        """Student obs = proprioception + LiDAR distances."""
+        """Student obs = proprioception + rolling local waypoint + raw LiDAR + steering summaries."""
 
         # -- Proprioception --
         base_lin_vel      = ObsTerm(func=mdp.base_lin_vel,      noise=Unoise(n_min=-0.1,  n_max=0.1))
         base_ang_vel      = ObsTerm(func=mdp.base_ang_vel,      noise=Unoise(n_min=-0.2,  n_max=0.2))
         projected_gravity = ObsTerm(func=mdp.projected_gravity,  noise=Unoise(n_min=-0.05, n_max=0.05))
 
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+        goal_command = ObsTerm(
+            func=mdp.local_goal_command_b,
+            params=_local_waypoint_params(),
+        )
 
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5,  n_max=1.5))
 
         actions = ObsTerm(func=mdp.last_action)
 
-        # -- LiDAR scan (180 rays at 2° resolution) --
+        # -- LiDAR scan (5 rings x 180 rays at 2° resolution = 900 distances) --
         lidar_scan = ObsTerm(
             func=mdp.lidar_distances,
             params={
@@ -552,20 +524,43 @@ class ObstacleDistillObsCfg:
             noise=Unoise(n_min=-0.2, n_max=0.2),
         )
 
+        # Compact LiDAR-derived geometry cues for steering relative to the
+        # current local-goal direction.
+        # Output dims:
+        #   5 sector closeness scores  = [front-left, front-center, front-right, left, right]
+        #   3 front-sector close ratios = [front-left, front-center, front-right]
+        #   3 command-aligned corridor blockage scores = [center, left, right]
+        #   2 command-aligned detour openness scores = [left, right]
+        #   1 command-aligned weighted lateral bias
+        lidar_steering = ObsTerm(
+            func=mdp.lidar_steering_features,
+            params={
+                "sensor_cfg": SceneEntityCfg("lidar"),
+                "command_name": "local_goal",
+                "max_distance": LIDAR_MAX_DISTANCE,
+                "close_distance": 2.5,
+                "min_hit_height": -0.15,
+            },
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
 
     @configclass
     class TeacherCfg(ObsGroup):
-        """Teacher obs = proprioception + privileged obstacle positions."""
+        """Teacher obs = proprioception + rolling local waypoint + privileged obstacle positions."""
 
         # -- Proprioception --
         base_lin_vel      = ObsTerm(func=mdp.base_lin_vel,      noise=Unoise(n_min=-0.1,  n_max=0.1))
         base_ang_vel      = ObsTerm(func=mdp.base_ang_vel,      noise=Unoise(n_min=-0.2,  n_max=0.2))
         projected_gravity = ObsTerm(func=mdp.projected_gravity,  noise=Unoise(n_min=-0.05, n_max=0.05))
 
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+        goal_command = ObsTerm(
+            func=mdp.local_goal_command_b,
+            params=_local_waypoint_params(),
+        )
 
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5,  n_max=1.5))
@@ -590,6 +585,43 @@ class ObstacleDistillObsCfg:
     student: StudentCfg = StudentCfg()
     teacher: TeacherCfg = TeacherCfg()
 
+    @configclass
+    class DebugCfg(ObsGroup):
+        """Debug-only observations kept out of the student/teacher policy inputs."""
+
+        root_position_w = ObsTerm(func=mdp.root_position_w)
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        goal_command = ObsTerm(
+            func=mdp.local_goal_command_b,
+            params=_local_waypoint_params(),
+        )
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        actions = ObsTerm(func=mdp.last_action)
+        start_position_w = ObsTerm(func=mdp.start_position_w)
+        waypoint_position_w = ObsTerm(
+            func=mdp.waypoint_position_w,
+            params=_local_waypoint_params(),
+        )
+        goal_position_w = ObsTerm(func=mdp.goal_position_w)
+        scenario_template_code = ObsTerm(func=mdp.navigation_scenario_code)
+        obstacle_positions = ObsTerm(
+            func=mdp.obstacle_positions_rel,
+            params={
+                "obstacle_names": OBSTACLE_NAMES,
+                "max_distance": 8.0,
+                "normalize": False,
+                "num_closest": PRIVILEGED_OBSTACLE_SLOTS,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    debug: DebugCfg = DebugCfg()
+
 
 # =============================================================================
 # Terminations
@@ -598,7 +630,11 @@ class ObstacleDistillObsCfg:
 
 @configclass
 class ObstacleTerminationsCfg(TerminationsCfg):
-    """Terminate on falls and on any robot-obstacle contact."""
+    """Shared obstacle-task terminations.
+
+    The active local-navigation task disables `obstacle_contact` and adds
+    `goal_reached` termination in its `__post_init__`.
+    """
 
     obstacle_contact = DoneTerm(
         func=mdp.obstacle_contact_termination,
@@ -612,219 +648,213 @@ class ObstacleTerminationsCfg(TerminationsCfg):
 
 
 # =============================================================================
-# Top-level environment configs
+# Active local-navigation environment configs
 # =============================================================================
 
 
 @configclass
-class Go2wObstacleTeacherEnvCfg(Go2wEnvCfg):
-    """Obstacle environment for Teacher PPO training with privileged obs."""
+class Go2wNavigationDistillEnvCfg(Go2wEnvCfg):
+    """Static-box local-navigation distillation env.
 
-    scene:        ObstacleSceneCfg       = ObstacleSceneCfg(num_envs=8192, env_spacing=8.0)
-    actions:      ObstacleActionsCfg     = ObstacleActionsCfg()
-    observations: ObstacleTeacherObsCfg  = ObstacleTeacherObsCfg()
-    rewards:      ObstacleRewardsCfg     = ObstacleRewardsCfg()
-    events:       ObstacleEventCfg       = ObstacleEventCfg()
+    This stage no longer treats obstacle avoidance as "follow a velocity command
+    while avoiding boxes". Instead, every episode samples:
+
+      start pose -> explicit local goal pose -> varied obstacle field
+
+    The active student predicts a short-horizon local target pose from
+    (LiDAR + proprio + goal), converts that target into `(vx, vy, yaw)`, and
+    sends the result to the frozen LLC. Distillation remains online:
+
+      teacher(goal + privileged obstacles) -> target pose
+      student(goal + LiDAR)                -> target pose
+    """
+
+    scene: ObstacleSceneCfg = ObstacleSceneCfg(num_envs=8192, env_spacing=8.0)
+    actions: ObstacleActionsCfg = ObstacleActionsCfg()
+    observations: ObstacleDistillObsCfg = ObstacleDistillObsCfg()
+    rewards: ObstacleRewardsCfg = ObstacleRewardsCfg()
+    events: ObstacleEventCfg = ObstacleEventCfg()
     terminations: ObstacleTerminationsCfg = ObstacleTerminationsCfg()
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         super().__post_init__()
         if self.scene.lidar is not None:
             self.scene.lidar.update_period = self.decimation * self.sim.dt
-        self.commands.base_velocity.ranges.lin_vel_x = OBSTACLE_LIN_VEL_X
-        self.commands.base_velocity.ranges.lin_vel_y = OBSTACLE_LIN_VEL_Y
-        self.commands.base_velocity.ranges.ang_vel_z = OBSTACLE_ANG_VEL_Z
-        self.commands.base_velocity.rel_standing_envs = 0.2
 
-
-@configclass
-class Go2wObstacleTeacherEnvCfg_PLAY(Go2wObstacleTeacherEnvCfg):
-    """Teacher evaluation environment."""
-
-    scene: ObstaclePlaySceneCfg = ObstaclePlaySceneCfg(num_envs=16, env_spacing=5.0)
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        self.scene.num_envs    = 16
-        self.scene.env_spacing = 5.0
-        self.observations.policy.enable_corruption = False
-        self.commands.base_velocity.ranges.lin_vel_x = OBSTACLE_LIN_VEL_X
-        self.commands.base_velocity.ranges.lin_vel_y = OBSTACLE_LIN_VEL_Y
-        self.commands.base_velocity.ranges.ang_vel_z = OBSTACLE_ANG_VEL_Z
-        self.observations.policy.obstacle_positions.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.observations.policy.obstacle_positions.params["num_closest"] = PRIVILEGED_OBSTACLE_SLOTS
-        self.rewards.obstacle_path_clearance.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.rewards.obstacle_lateral_avoidance.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.rewards.obstacle_yaw_avoidance.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.events.reset_obstacles.params["start_iteration"] = 0
-        self.events.reset_obstacles.params["warmup_iterations"] = 0
-        self.events.reset_obstacles.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.events.reset_obstacles.params["min_obstacles"] = PLAY_NUM_OBSTACLES
-        self.events.reset_obstacles.params["max_obstacles"] = PLAY_NUM_OBSTACLES
-        self.events.reset_obstacles.params["min_inter_obstacle_dist"] = 0.45
-        self.events.reset_obstacles.params["empty_env_fraction"] = 0.0
-        self.events.push_robot        = None
-        self.events.add_base_mass     = None
-        self.events.speed_curriculum  = None  # use fixed ±2.0 m/s during play
-
-
-# =============================================================================
-# Fast obstacle teacher (uses a pre-trained ±2.0 m/s flat locomotion checkpoint)
-# =============================================================================
-
-
-@configclass
-class Go2wObstacleTeacherFastEnvCfg(Go2wObstacleTeacherEnvCfg):
-    """Obstacle teacher env for use with a pre-trained ±2.0 m/s flat checkpoint.
-
-    Uses the full fast-flat command range from the start. The obstacle setup is
-    intentionally simple: 35% no-obstacle rollouts, otherwise three active boxes.
-    Two boxes are sampled in the commanded path so the policy sees a consistent
-    "continue command but avoid this box" problem; the remaining box is random clutter.
-    Uses ObstacleSceneFastCfg (no LiDAR, 8 obstacle slots) to cut init time.
-    """
-
-    scene: ObstacleSceneFastCfg = ObstacleSceneFastCfg(num_envs=8192, env_spacing=8.0)
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        # Disable push: fast-flat checkpoint has no push-recovery training.
-        self.events.push_robot = None
-        # The transferred checkpoint already learned the full ±2 m/s random command range.
         self.events.speed_curriculum = None
-        # Start obstacle density, path-clearance, and collision at iteration 0 with no adaptive gate.
-        self.events.reset_obstacles.params["start_iteration"] = 0
-        self.events.reset_obstacles.params["warmup_iterations"] = FAST_OBSTACLE_WARMUP_ITERATIONS
-        self.events.reset_obstacles.params["min_obstacles"] = FAST_ACTIVE_OBSTACLES
-        self.events.reset_obstacles.params["max_obstacles"] = FAST_ACTIVE_OBSTACLES
-        self.events.reset_obstacles.params["min_survival_steps"] = 0
-        self.events.reset_obstacles.params["empty_env_fraction"] = FAST_EMPTY_ENV_FRACTION
-        self.events.reset_obstacles.params["command_path_obstacles"] = FAST_COMMAND_PATH_OBSTACLES
-        self.events.reset_obstacles.params["command_name"] = "base_velocity"
-        self.events.reset_obstacles.params["command_path_forward_range"] = FAST_COMMAND_PATH_FORWARD_RANGE
-        self.events.reset_obstacles.params["command_path_lateral_range"] = FAST_COMMAND_PATH_LATERAL_RANGE
-        self.events.reset_obstacles.params["near_field_obstacles"] = FAST_NEAR_FIELD_OBSTACLES
-        self.events.reset_obstacles.params["near_field_radius_range"] = FAST_NEAR_FIELD_RADIUS_RANGE
-        self.events.reset_obstacles.params["obstacle_names"] = FAST_OBSTACLE_NAMES
-        # Keep exact fast-flat locomotion tracking intact; avoidance is a separate risk-gated bonus.
-        self.rewards.track_lin_vel_xy_exp.func = mdp.track_lin_vel_xy_yaw_frame_exp
-        self.rewards.track_lin_vel_xy_exp.params = {"command_name": "base_velocity", "std": 0.35}
-        self.rewards.track_ang_vel_z_exp.func = mdp.track_ang_vel_z_world_exp
-        self.rewards.track_ang_vel_z_exp.params = {"command_name": "base_velocity", "std": 0.25}
-        fast_path_reward_params = {
-            "start_iteration": 0,
-            "warmup_iterations": FAST_CLEARANCE_WARMUP_ITERATIONS,
-            "obstacle_names": FAST_OBSTACLE_NAMES,
-            "path_length": FAST_PATH_CLEARANCE_LENGTH,
-            "path_width": FAST_PATH_CLEARANCE_WIDTH,
-            "score_power": FAST_PATH_CLEARANCE_SCORE_POWER,
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.rel_standing_envs = 1.0   # 100%
+        self.commands.base_velocity.debug_vis = False
+
+        self.events.reset_obstacles.func = mdp.reset_navigation_goals_and_obstacles
+        self.events.reset_obstacles.params = {
+            "obstacle_names": OBSTACLE_NAMES,
+            "min_obstacles": DISTILL_ACTIVE_OBSTACLES,
+            "max_obstacles": DISTILL_ACTIVE_OBSTACLES,
+            "empty_env_fraction": DISTILL_EMPTY_ENV_FRACTION,
+            "spawn_range_x": OBSTACLE_SPAWN_RANGE["x"],
+            "spawn_range_y": OBSTACLE_SPAWN_RANGE["y"],
+            "obstacle_z": OBSTACLE_SIZE[2] / 2,
+            "min_inter_obstacle_dist": 0.7,
+            "goal_forward_range": NAV_GOAL_FORWARD_RANGE,
+            "goal_lateral_range": NAV_GOAL_LATERAL_RANGE,
+            "goal_heading_jitter_range": NAV_GOAL_HEADING_JITTER_RANGE,
+            "min_goal_distance": NAV_MIN_GOAL_DISTANCE,
+            "start_exclusion_radius": NAV_START_EXCLUSION_RADIUS,
+            "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+            "head_on_progress_range": NAV_HEAD_ON_PROGRESS_RANGE,
+            "head_on_lateral_range": NAV_HEAD_ON_LATERAL_RANGE,
+            "edge_progress_range": NAV_EDGE_PROGRESS_RANGE,
+            "edge_lateral_range": NAV_EDGE_LATERAL_RANGE,
+            "diagonal_progress_range": NAV_DIAGONAL_PROGRESS_RANGE,
+            "diagonal_lateral_range": NAV_DIAGONAL_LATERAL_RANGE,
+            "offpath_progress_range": NAV_OFFPATH_PROGRESS_RANGE,
+            "offpath_lateral_range": NAV_OFFPATH_LATERAL_RANGE,
+            "narrow_gap_progress_range": NAV_NARROW_GAP_PROGRESS_RANGE,
+            "narrow_gap_center_lateral_range": NAV_NARROW_GAP_CENTER_LATERAL_RANGE,
+            "narrow_gap_half_width_range": NAV_NARROW_GAP_HALF_WIDTH_RANGE,
+            "narrow_gap_probability": NAV_NARROW_GAP_PROBABILITY,
         }
-        self.rewards.obstacle_path_clearance.params.update(
-            {
-                **fast_path_reward_params,
-                "aggregation": FAST_PATH_CLEARANCE_AGGREGATION,
-                "sum_clip": FAST_PATH_CLEARANCE_SUM_CLIP,
-            }
-        )
-        self.rewards.obstacle_path_clearance.weight = FAST_PATH_CLEARANCE_WEIGHT
-        self.rewards.obstacle_lateral_avoidance.params.update(
-            {
-                **fast_path_reward_params,
-                "risk_clip": FAST_AVOIDANCE_RISK_CLIP,
-                "target_lateral_speed": FAST_AVOID_TARGET_LATERAL_SPEED,
-                "center_deadband": FAST_AVOID_CENTER_DEADBAND,
-                "min_progress": FAST_AVOID_MIN_PROGRESS,
-            }
-        )
-        self.rewards.obstacle_lateral_avoidance.weight = FAST_OBSTACLE_LATERAL_AVOIDANCE_WEIGHT
-        self.rewards.obstacle_yaw_avoidance.params.update(
-            {
-                **fast_path_reward_params,
-                "risk_clip": FAST_AVOIDANCE_RISK_CLIP,
-                "target_yaw_rate": FAST_AVOID_TARGET_YAW_RATE,
-                "center_deadband": FAST_AVOID_CENTER_DEADBAND,
-                "min_progress": FAST_AVOID_MIN_PROGRESS,
-            }
-        )
-        self.rewards.obstacle_yaw_avoidance.weight = FAST_OBSTACLE_YAW_AVOIDANCE_WEIGHT
+
+        self.rewards.track_lin_vel_xy_exp = None
+        self.rewards.track_ang_vel_z_exp = None
+        self.rewards.straight_hip_deviation = None
+        self.rewards.stand_joint_deviation = None
+        self.rewards.wheel_vel_zero_cmd = None
+        self.rewards.termination_penalty = None
+        self.rewards.obstacle_path_clearance = None
+        self.rewards.obstacle_lateral_avoidance = None
+        self.rewards.obstacle_yaw_avoidance = None
+        self.rewards.obstacle_collision.weight = DISTILL_OBSTACLE_COLLISION_WEIGHT
         self.rewards.obstacle_collision.params["start_iteration"] = 0
-        self.rewards.obstacle_collision.params["warmup_iterations"] = FAST_COLLISION_WARMUP_ITERATIONS
-        self.rewards.obstacle_collision.weight = FAST_OBSTACLE_COLLISION_WEIGHT
-        self.terminations.obstacle_contact.params["start_iteration"] = FAST_OBSTACLE_TERMINATION_START_ITERATION
-        self.terminations.obstacle_contact.params["steps_per_iteration"] = CURRICULUM_STEPS_PER_ITERATION
-        self.observations.policy.obstacle_positions.params["obstacle_names"] = FAST_OBSTACLE_NAMES
+        self.rewards.obstacle_collision.params["warmup_iterations"] = 0
+        self.rewards.goal_distance = RewTerm(
+            func=mdp.goal_distance_tanh_reward,
+            weight=6.0,
+            params={"std": NAV_GOAL_DISTANCE_STD},
+        )
+        self.rewards.goal_heading = RewTerm(
+            func=mdp.goal_heading_tanh_reward,
+            weight=1.0,
+            params={"std": NAV_GOAL_HEADING_STD},
+        )
+        self.rewards.goal_reached = RewTerm(
+            func=mdp.goal_reached_bonus,
+            weight=15.0,
+            params={
+                "position_threshold": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
+                "heading_threshold": NAV_GOAL_SUCCESS_HEADING_THRESHOLD,
+            },
+        )
+        self.terminations.obstacle_contact = None
+        self.terminations.goal_reached = DoneTerm(
+            func=mdp.goal_reached_termination,
+            params={
+                "position_threshold": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
+                "heading_threshold": NAV_GOAL_SUCCESS_HEADING_THRESHOLD,
+            },
+        )
 
 
 @configclass
-class Go2wObstacleTeacherFastEnvCfg_PLAY(Go2wObstacleTeacherFastEnvCfg):
-    """Play variant of the fast obstacle teacher environment."""
+class Go2wNavigationDistillEnvCfg_PLAY(Go2wNavigationDistillEnvCfg):
+    """Play/eval env for the local-navigation distillation stage."""
 
     scene: ObstaclePlaySceneCfg = ObstaclePlaySceneCfg(num_envs=16, env_spacing=5.0)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         super().__post_init__()
-        self.scene.num_envs    = 16
+        self.scene.num_envs = 16
         self.scene.env_spacing = 5.0
-        self.observations.policy.enable_corruption = False
-        self.commands.base_velocity.ranges.lin_vel_x = OBSTACLE_LIN_VEL_X
-        self.commands.base_velocity.ranges.lin_vel_y = OBSTACLE_LIN_VEL_Y
-        self.commands.base_velocity.ranges.ang_vel_z = OBSTACLE_ANG_VEL_Z
-        self.observations.policy.obstacle_positions.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.observations.policy.obstacle_positions.params["num_closest"] = PRIVILEGED_OBSTACLE_SLOTS
-        self.rewards.obstacle_path_clearance.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.rewards.obstacle_lateral_avoidance.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.rewards.obstacle_yaw_avoidance.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.events.reset_obstacles.params["start_iteration"] = 0
-        self.events.reset_obstacles.params["warmup_iterations"] = 0
-        self.events.reset_obstacles.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.events.reset_obstacles.params["min_obstacles"] = PLAY_NUM_OBSTACLES
-        self.events.reset_obstacles.params["max_obstacles"] = PLAY_NUM_OBSTACLES
-        self.events.reset_obstacles.params["min_inter_obstacle_dist"] = 0.45
-        self.events.reset_obstacles.params["empty_env_fraction"] = 0.0
-        self.terminations.obstacle_contact.params["start_iteration"] = 0
-        self.events.push_robot        = None
-        self.events.add_base_mass     = None
-        self.events.speed_curriculum  = None  # use fixed ±2.0 m/s during play
-
-
-@configclass
-class Go2wObstacleDistillEnvCfg(Go2wObstacleTeacherEnvCfg):
-    """Obstacle distillation environment: inherits scene/rewards/events from Teacher.
-
-    Only observations differ: two groups (student LiDAR + teacher privileged)
-    instead of the single teacher policy group. The teacher actions are now
-    produced by a geometric steering module plus the frozen fast-flat LLC.
-    """
-
-    observations: ObstacleDistillObsCfg = ObstacleDistillObsCfg()
-
-
-@configclass
-class Go2wObstacleDistillEnvCfg_PLAY(Go2wObstacleDistillEnvCfg):
-    """Distillation evaluation environment (uses student obs only)."""
-
-    scene: ObstaclePlaySceneCfg = ObstaclePlaySceneCfg(num_envs=16, env_spacing=5.0)
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        self.scene.num_envs    = 16
-        self.scene.env_spacing = 5.0
+        self.events.push_robot = None
+        self.events.add_base_mass = None
         self.observations.student.enable_corruption = False
-        self.commands.base_velocity.ranges.lin_vel_x = OBSTACLE_LIN_VEL_X
-        self.commands.base_velocity.ranges.lin_vel_y = OBSTACLE_LIN_VEL_Y
-        self.commands.base_velocity.ranges.ang_vel_z = OBSTACLE_ANG_VEL_Z
         self.observations.teacher.obstacle_positions.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
         self.observations.teacher.obstacle_positions.params["num_closest"] = PRIVILEGED_OBSTACLE_SLOTS
-        self.rewards.obstacle_path_clearance.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.rewards.obstacle_lateral_avoidance.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.rewards.obstacle_yaw_avoidance.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.events.reset_obstacles.params["start_iteration"] = 0
-        self.events.reset_obstacles.params["warmup_iterations"] = 0
-        self.events.reset_obstacles.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.events.reset_obstacles.params["min_obstacles"] = PLAY_NUM_OBSTACLES
-        self.events.reset_obstacles.params["max_obstacles"] = PLAY_NUM_OBSTACLES
-        self.events.reset_obstacles.params["min_inter_obstacle_dist"] = 0.45
-        self.events.reset_obstacles.params["empty_env_fraction"] = 0.0
-        self.events.push_robot    = None
-        self.events.add_base_mass = None
-        self.events.speed_curriculum = None  # use fixed ±2.0 m/s during play
+        self.observations.debug.obstacle_positions.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        self.observations.debug.obstacle_positions.params["num_closest"] = PRIVILEGED_OBSTACLE_SLOTS
+
+        # The original velocity command is disabled for the navigation-distillation task.
+        # The active command sent to the frozen LLC is generated online from the local
+        # goal by the teacher/student navigation policy, not sampled by the command manager.
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.rel_standing_envs = 1.0
+        self.commands.base_velocity.debug_vis = False
+
+        self.events.reset_obstacles.func = mdp.reset_navigation_goals_and_obstacles
+        self.events.reset_obstacles.params = {
+            "obstacle_names": PLAY_OBSTACLE_NAMES,
+            "min_obstacles": PLAY_NUM_OBSTACLES,
+            "max_obstacles": PLAY_NUM_OBSTACLES,
+            "empty_env_fraction": 0.0,
+            "spawn_range_x": OBSTACLE_SPAWN_RANGE["x"],
+            "spawn_range_y": OBSTACLE_SPAWN_RANGE["y"],
+            "obstacle_z": OBSTACLE_SIZE[2] / 2,
+            "min_inter_obstacle_dist": 0.45,
+            "goal_forward_range": NAV_GOAL_FORWARD_RANGE,
+            "goal_lateral_range": NAV_GOAL_LATERAL_RANGE,
+            "goal_heading_jitter_range": NAV_GOAL_HEADING_JITTER_RANGE,
+            "min_goal_distance": NAV_MIN_GOAL_DISTANCE,
+            "start_exclusion_radius": NAV_START_EXCLUSION_RADIUS,
+            "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+            "head_on_progress_range": NAV_HEAD_ON_PROGRESS_RANGE,
+            "head_on_lateral_range": NAV_HEAD_ON_LATERAL_RANGE,
+            "edge_progress_range": NAV_EDGE_PROGRESS_RANGE,
+            "edge_lateral_range": NAV_EDGE_LATERAL_RANGE,
+            "diagonal_progress_range": NAV_DIAGONAL_PROGRESS_RANGE,
+            "diagonal_lateral_range": NAV_DIAGONAL_LATERAL_RANGE,
+            "offpath_progress_range": NAV_OFFPATH_PROGRESS_RANGE,
+            "offpath_lateral_range": NAV_OFFPATH_LATERAL_RANGE,
+            "narrow_gap_progress_range": NAV_NARROW_GAP_PROGRESS_RANGE,
+            "narrow_gap_center_lateral_range": NAV_NARROW_GAP_CENTER_LATERAL_RANGE,
+            "narrow_gap_half_width_range": NAV_NARROW_GAP_HALF_WIDTH_RANGE,
+            "narrow_gap_probability": NAV_NARROW_GAP_PROBABILITY,
+        }
+
+        self.rewards.track_lin_vel_xy_exp = None
+        self.rewards.track_ang_vel_z_exp = None
+        self.rewards.straight_hip_deviation = None
+        self.rewards.stand_joint_deviation = None
+        self.rewards.wheel_vel_zero_cmd = None
+        self.rewards.termination_penalty = None
+        self.rewards.obstacle_path_clearance = None
+        self.rewards.obstacle_lateral_avoidance = None
+        self.rewards.obstacle_yaw_avoidance = None
+        self.rewards.obstacle_collision.weight = DISTILL_OBSTACLE_COLLISION_WEIGHT
+        self.rewards.obstacle_collision.params["start_iteration"] = 0
+        self.rewards.obstacle_collision.params["warmup_iterations"] = 0
+        self.rewards.goal_distance = RewTerm(
+            func=mdp.goal_distance_tanh_reward,
+            weight=6.0,
+            params={"std": NAV_GOAL_DISTANCE_STD},
+        )
+        self.rewards.goal_heading = RewTerm(
+            func=mdp.goal_heading_tanh_reward,
+            weight=1.0,
+            params={"std": NAV_GOAL_HEADING_STD},
+        )
+        self.rewards.goal_reached = RewTerm(
+            func=mdp.goal_reached_bonus,
+            weight=15.0,
+            params={
+                "position_threshold": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
+                "heading_threshold": NAV_GOAL_SUCCESS_HEADING_THRESHOLD,
+            },
+        )
+
+        # Keep obstacle contact as a penalty instead of an episode termination.
+        # This allows the policy to experience and recover from minor contacts, while
+        # collision frequency can still be monitored through rewards/eval metrics.
+        self.terminations.obstacle_contact = None
+
+        self.terminations.goal_reached = DoneTerm(
+            func=mdp.goal_reached_termination,
+            params={
+                "position_threshold": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
+                "heading_threshold": NAV_GOAL_SUCCESS_HEADING_THRESHOLD,
+            },
+        )

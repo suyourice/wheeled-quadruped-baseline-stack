@@ -55,14 +55,28 @@ from isaaclab.envs.mdp import (
 )
 
 # -- Observations (local custom) -----------------------------------------------
-from .observations import lidar_distances, obstacle_positions_rel
+from .observations import (
+    goal_position_w,
+    lidar_distances,
+    lidar_steering_features,
+    local_goal_command_b,
+    navigation_scenario_code,
+    obstacle_positions_rel,
+    root_position_w,
+    start_position_w,
+    waypoint_position_w,
+)
 
 # -- Events (local custom) -----------------------------------------------------
-from .events import reset_obstacles_curriculum, update_locomotion_curriculum
+from .events import reset_navigation_goals_and_obstacles, reset_obstacles_curriculum, update_locomotion_curriculum
 
 # -- Rewards (local custom) ----------------------------------------------------
 from .rewards import (
     base_height_l2,
+    goal_distance_tanh_reward,
+    goal_heading_tanh_reward,
+    goal_reached_bonus,
+    goal_reached_termination,
     joint_deviation_l1_command_gated,
     joint_deviation_l1_curriculum,
     obstacle_contact_termination,
