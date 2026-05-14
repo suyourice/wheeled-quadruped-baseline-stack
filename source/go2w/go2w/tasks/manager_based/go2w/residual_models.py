@@ -3,267 +3,27 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Custom teacher models for frozen-locomotion obstacle avoidance."""
+"""Active goal-conditioned teacher models for frozen-locomotion local navigation."""
 
 from __future__ import annotations
-
-import copy
 
 import torch
 import torch.nn as nn
 from rsl_rl.models import MLPModel
-from rsl_rl.modules import EmpiricalNormalization, HiddenState, MLP
-from rsl_rl.modules.distribution import Distribution
-from rsl_rl.utils import resolve_callable
+from rsl_rl.modules import HiddenState
 
-
-class FrozenCommandResidualActor(nn.Module):
-    """Frozen fast-flat actor with a trainable obstacle-aware command residual.
-
-    The frozen actor keeps the fast-flat locomotion manifold intact. A small residual
-    head observes the current command and privileged obstacle positions, then adds a
-    bounded correction to only `cmd_y` and `cmd_yaw` before the frozen actor consumes
-    the modified observation. The residual head is zero-initialized so iteration 0
-    exactly matches the fast-flat policy.
-    """
-
-    is_recurrent: bool = False
-
-    def __init__(
-        self,
-        obs,
-        obs_groups: dict[str, list[str]],
-        obs_set: str,
-        output_dim: int,
-        hidden_dims: tuple[int, ...] | list[int] = (128, 128),
-        activation: str = "elu",
-        obs_normalization: bool = False,
-        distribution_cfg: dict | None = None,
-        *,
-        frozen_hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
-        frozen_activation: str = "elu",
-        frozen_obs_normalization: bool = False,
-        command_obs_start: int = 9,
-        command_obs_dim: int = 3,
-        obstacle_obs_start: int = 60,
-        obstacle_obs_dim: int = 30,
-        state_obs_dim: int = 12,
-        obstacle_max_distance: float = 8.0,
-        residual_vy_scale: float = 0.9,
-        residual_yaw_scale: float = 1.1,
-        lateral_command_clip: float = 2.0,
-        yaw_command_clip: float = 2.0,
-        gate_forward_distance: float = 3.5,
-        gate_min_forward_distance: float = 0.2,
-        gate_path_width: float = 1.2,
-    ) -> None:
-        super().__init__()
-
-        self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
-        if len(self.obs_groups) != 1:
-            raise ValueError(
-                "FrozenCommandResidualActor expects one 1D observation group. "
-                f"Got groups: {self.obs_groups}"
-            )
-        self.obs_group_name = self.obs_groups[0]
-
-        self.command_obs_start = command_obs_start
-        self.command_obs_dim = command_obs_dim
-        self.obstacle_obs_start = obstacle_obs_start
-        self.obstacle_obs_dim = obstacle_obs_dim
-        self.state_obs_dim = state_obs_dim
-        self.obstacle_max_distance = obstacle_max_distance
-        self.residual_vy_scale = residual_vy_scale
-        self.residual_yaw_scale = residual_yaw_scale
-        self.lateral_command_clip = lateral_command_clip
-        self.yaw_command_clip = yaw_command_clip
-        self.gate_forward_distance = gate_forward_distance
-        self.gate_min_forward_distance = gate_min_forward_distance
-        self.gate_path_width = gate_path_width
-
-        residual_input_dim = self.state_obs_dim + self.obstacle_obs_dim
-        if obs_normalization:
-            self.obs_normalizer = EmpiricalNormalization(residual_input_dim)
-        else:
-            self.obs_normalizer = nn.Identity()
-
-        self.residual_mlp = MLP(residual_input_dim, 2, hidden_dims, activation)
-        self._zero_init_last_linear(self.residual_mlp)
-
-        self.frozen_actor = MLPModel(
-            obs,
-            obs_groups,
-            obs_set,
-            output_dim,
-            hidden_dims=frozen_hidden_dims,
-            activation=frozen_activation,
-            obs_normalization=frozen_obs_normalization,
-            distribution_cfg=None,
-        )
-        for param in self.frozen_actor.parameters():
-            param.requires_grad = False
-
-        if distribution_cfg is not None:
-            dist_cfg = copy.deepcopy(distribution_cfg)
-            dist_class: type[Distribution] = resolve_callable(dist_cfg.pop("class_name"))  # type: ignore[arg-type]
-            self.distribution: Distribution | None = dist_class(output_dim, **dist_cfg)
-        else:
-            self.distribution = None
-
-    def forward(
-        self,
-        obs,
-        masks: torch.Tensor | None = None,
-        hidden_state: HiddenState = None,
-        stochastic_output: bool = False,
-    ) -> torch.Tensor:
-        del masks, hidden_state
-
-        policy_obs = obs[self.obs_group_name]
-        residual_features = self._build_residual_features(policy_obs)
-        residual_features = self.obs_normalizer(residual_features)
-        residual_delta = self.residual_mlp(residual_features)
-        residual_gate = self._compute_residual_gate(policy_obs).unsqueeze(-1)
-
-        scaled_delta = residual_gate * torch.tanh(residual_delta)
-
-        modified_policy_obs = policy_obs.clone()
-        commands = modified_policy_obs[
-            :, self.command_obs_start : self.command_obs_start + self.command_obs_dim
-        ].clone()
-        commands[:, 1] = torch.clamp(
-            commands[:, 1] + self.residual_vy_scale * scaled_delta[:, 0],
-            min=-self.lateral_command_clip,
-            max=self.lateral_command_clip,
-        )
-        commands[:, 2] = torch.clamp(
-            commands[:, 2] + self.residual_yaw_scale * scaled_delta[:, 1],
-            min=-self.yaw_command_clip,
-            max=self.yaw_command_clip,
-        )
-        modified_policy_obs[
-            :, self.command_obs_start : self.command_obs_start + self.command_obs_dim
-        ] = commands
-
-        modified_obs = {key: obs[key] for key in obs.keys()}
-        modified_obs[self.obs_group_name] = modified_policy_obs
-
-        # Keep the frozen actor parameters fixed via requires_grad=False, but still
-        # allow gradients to flow from the action mean back into the residual head.
-        action_mean = self.frozen_actor(modified_obs)
-
-        if self.distribution is not None:
-            self.distribution.update(action_mean)
-            if stochastic_output:
-                return self.distribution.sample()
-            return self.distribution.deterministic_output(action_mean)
-
-        return action_mean
-
-    def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
-        del dones, hidden_state
-
-    def get_hidden_state(self) -> HiddenState:
-        return None
-
-    def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
-        del dones
-
-    @property
-    def output_mean(self) -> torch.Tensor:
-        if self.distribution is None:
-            raise RuntimeError("This actor has no output distribution.")
-        return self.distribution.mean
-
-    @property
-    def output_std(self) -> torch.Tensor:
-        if self.distribution is None:
-            raise RuntimeError("This actor has no output distribution.")
-        return self.distribution.std
-
-    @property
-    def output_entropy(self) -> torch.Tensor:
-        if self.distribution is None:
-            raise RuntimeError("This actor has no output distribution.")
-        return self.distribution.entropy
-
-    @property
-    def output_distribution_params(self) -> tuple[torch.Tensor, ...]:
-        if self.distribution is None:
-            return ()
-        return self.distribution.params
-
-    def get_output_log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
-        if self.distribution is None:
-            raise RuntimeError("This actor has no output distribution.")
-        return self.distribution.log_prob(outputs)
-
-    def get_kl_divergence(
-        self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]
-    ) -> torch.Tensor:
-        if self.distribution is None:
-            raise RuntimeError("This actor has no output distribution.")
-        return self.distribution.kl_divergence(old_params, new_params)
-
-    def as_jit(self) -> nn.Module:
-        return self
-
-    def update_normalization(self, obs) -> None:
-        if isinstance(self.obs_normalizer, EmpiricalNormalization):
-            self.obs_normalizer.update(self._build_residual_features(obs[self.obs_group_name]))
-
-    def _build_residual_features(self, policy_obs: torch.Tensor) -> torch.Tensor:
-        state_features = policy_obs[:, : self.state_obs_dim]
-        obstacle_features = policy_obs[:, self.obstacle_obs_start : self.obstacle_obs_start + self.obstacle_obs_dim]
-        return torch.cat((state_features, obstacle_features), dim=-1)
-
-    def _compute_residual_gate(self, policy_obs: torch.Tensor) -> torch.Tensor:
-        obstacle_positions = policy_obs[
-            :, self.obstacle_obs_start : self.obstacle_obs_start + self.obstacle_obs_dim
-        ].view(policy_obs.shape[0], -1, 2)
-        obstacle_positions_m = obstacle_positions * self.obstacle_max_distance
-
-        obs_x = obstacle_positions_m[..., 0]
-        obs_y = obstacle_positions_m[..., 1].abs()
-        valid = (obstacle_positions.abs().sum(dim=-1) > 1.0e-6).float()
-
-        forward_span = max(self.gate_forward_distance - self.gate_min_forward_distance, 1.0e-6)
-        forward_gate = ((self.gate_forward_distance - obs_x) / forward_span).clamp(0.0, 1.0)
-        forward_gate = forward_gate * (obs_x > self.gate_min_forward_distance).float()
-        lateral_gate = (1.0 - obs_y / self.gate_path_width).clamp(0.0, 1.0)
-
-        return (valid * forward_gate * lateral_gate).amax(dim=1)
-
-    @staticmethod
-    def _get_obs_dim(obs, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
-        active_obs_groups = obs_groups[obs_set]
-        obs_dim = 0
-        for obs_group in active_obs_groups:
-            if len(obs[obs_group].shape) != 2:
-                raise ValueError(
-                    f"FrozenCommandResidualActor only supports 1D observations, got {obs[obs_group].shape}"
-                )
-            obs_dim += obs[obs_group].shape[-1]
-        return active_obs_groups, obs_dim
-
-    @staticmethod
-    def _zero_init_last_linear(module: nn.Module) -> None:
-        for layer in reversed(list(module.children())):
-            if isinstance(layer, nn.Linear):
-                nn.init.zeros_(layer.weight)
-                nn.init.zeros_(layer.bias)
-                return
-        raise ValueError("Residual MLP has no final Linear layer to zero-initialize.")
+from .observation_layout import GOAL_COMMAND_DIM, GOAL_COMMAND_START, PRIVILEGED_OBSTACLE_START
 
 
 class GeometricSteeringTeacher(nn.Module):
     """Rule-based steering teacher on top of a frozen fast-flat LLC.
 
-    The steering layer rewrites the incoming planar command using privileged
-    obstacle positions. It can push the command sideways relative to the
-    commanded motion, slow progress along the current command ray, and add yaw
-    away from the obstacle side. The frozen LLC remains the sole module that
-    maps `(vx, vy, yaw)` commands to the final 16D robot action.
+    The steering layer first turns the current local goal pose into a nominal
+    planar command, then rewrites that command using privileged obstacle
+    positions. It can push the command sideways relative to the intended goal
+    direction, slow progress along the current path ray, and add yaw away from
+    the obstacle side. The frozen LLC remains the sole module that maps
+    `(vx, vy, yaw)` commands to the final 16D robot action.
     """
 
     is_recurrent: bool = False
@@ -282,9 +42,9 @@ class GeometricSteeringTeacher(nn.Module):
         frozen_hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
         frozen_activation: str = "elu",
         frozen_obs_normalization: bool = False,
-        command_obs_start: int = 9,
-        command_obs_dim: int = 3,
-        obstacle_obs_start: int = 60,
+        command_obs_start: int = GOAL_COMMAND_START,
+        command_obs_dim: int = GOAL_COMMAND_DIM,
+        obstacle_obs_start: int = PRIVILEGED_OBSTACLE_START,
         obstacle_obs_dim: int = 30,
         obstacle_max_distance: float = 8.0,
         min_command_speed: float = 0.15,
@@ -332,6 +92,12 @@ class GeometricSteeringTeacher(nn.Module):
         smoothing_alpha: float = 0.55,
         lateral_command_clip: float = 2.0,
         yaw_command_clip: float = 2.0,
+        obstacle_present_risk_floor: float = 0.30,
+        target_pose_horizon: float = 0.75,
+        target_pose_yaw_horizon: float = 0.6,
+        target_pose_x_clip: float = 1.5,
+        target_pose_y_clip: float = 1.5,
+        target_pose_yaw_clip: float = 1.2,
     ) -> None:
         del hidden_dims, activation, obs_normalization, distribution_cfg
         super().__init__()
@@ -394,6 +160,12 @@ class GeometricSteeringTeacher(nn.Module):
         self.smoothing_alpha = smoothing_alpha
         self.lateral_command_clip = lateral_command_clip
         self.yaw_command_clip = yaw_command_clip
+        self.obstacle_present_risk_floor = obstacle_present_risk_floor
+        self.target_pose_horizon = target_pose_horizon
+        self.target_pose_yaw_horizon = target_pose_yaw_horizon
+        self.target_pose_x_clip = target_pose_x_clip
+        self.target_pose_y_clip = target_pose_y_clip
+        self.target_pose_yaw_clip = target_pose_yaw_clip
 
         self.frozen_actor = MLPModel(
             obs,
@@ -426,42 +198,8 @@ class GeometricSteeringTeacher(nn.Module):
         stochastic_output: bool = False,
     ) -> torch.Tensor:
         del masks, hidden_state, stochastic_output
-
-        policy_obs = obs[self.obs_group_name]
-        command = policy_obs[:, self.command_obs_start : self.command_obs_start + self.command_obs_dim]
-        obstacle_positions = policy_obs[
-            :, self.obstacle_obs_start : self.obstacle_obs_start + self.obstacle_obs_dim
-        ].view(policy_obs.shape[0], -1, 2) * self.obstacle_max_distance
-
-        guidance_command = self._build_guidance_command(command)
-        delta_cmd, gap_width, gap_turn_need, gap_blocked = self._compute_steering_delta(guidance_command, obstacle_positions)
-        delta_cmd = self._smooth_delta(delta_cmd, guidance_command[:, :2].norm(dim=1))
-
-        modified_policy_obs = policy_obs.clone()
-        adjusted_command = guidance_command.clone()
-        adjusted_command[:, 0] = torch.clamp(
-            adjusted_command[:, 0] + delta_cmd[:, 0],
-            min=-self.lateral_command_clip,
-            max=self.lateral_command_clip,
-        )
-        adjusted_command[:, 1] = torch.clamp(
-            adjusted_command[:, 1] + delta_cmd[:, 1],
-            min=-self.lateral_command_clip,
-            max=self.lateral_command_clip,
-        )
-        adjusted_command[:, 2] = torch.clamp(
-            adjusted_command[:, 2] + delta_cmd[:, 2],
-            min=-self.yaw_command_clip,
-            max=self.yaw_command_clip,
-        )
-        modified_policy_obs[:, self.command_obs_start : self.command_obs_start + self.command_obs_dim] = adjusted_command
-        self._update_debug_buffers(
-            command, guidance_command, delta_cmd, adjusted_command, gap_width, gap_turn_need, gap_blocked
-        )
-
-        modified_obs = {key: obs[key] for key in obs.keys()}
-        modified_obs[self.obs_group_name] = modified_policy_obs
-        return self.frozen_actor(modified_obs)
+        adjusted_command = self.compute_navigation_command(obs)
+        return self._run_frozen_actor_with_command(obs, adjusted_command)
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         del hidden_state
@@ -480,6 +218,150 @@ class GeometricSteeringTeacher(nn.Module):
     def update_normalization(self, obs) -> None:
         del obs
 
+    def compute_flat_action(self, obs) -> torch.Tensor:
+        """Return the frozen-LLC action for the nominal goal-following command."""
+        policy_obs = obs[self.obs_group_name]
+        goal_command = policy_obs[:, self.command_obs_start : self.command_obs_start + self.command_obs_dim]
+        nominal_command = self._goal_command_to_nominal_command(goal_command)
+        return self._run_frozen_actor_with_command(obs, nominal_command)
+
+    def compute_navigation_command(self, obs) -> torch.Tensor:
+        """Compute the teacher's obstacle-aware `(vx, vy, yaw)` command before LLC execution."""
+        policy_obs = obs[self.obs_group_name]
+        goal_command = policy_obs[:, self.command_obs_start : self.command_obs_start + self.command_obs_dim]
+        nominal_command = self._goal_command_to_nominal_command(goal_command)
+        obstacle_positions = policy_obs[
+            :, self.obstacle_obs_start : self.obstacle_obs_start + self.obstacle_obs_dim
+        ].view(policy_obs.shape[0], -1, 2) * self.obstacle_max_distance
+
+        guidance_command = self._build_guidance_command(nominal_command)
+        delta_cmd, gap_width, gap_turn_need, gap_blocked = self._compute_steering_delta(
+            guidance_command, obstacle_positions
+        )
+        delta_cmd = self._smooth_delta(delta_cmd, guidance_command[:, :2].norm(dim=1))
+
+        adjusted_command = guidance_command.clone()
+        adjusted_command[:, 0] = torch.clamp(
+            adjusted_command[:, 0] + delta_cmd[:, 0],
+            min=-self.lateral_command_clip,
+            max=self.lateral_command_clip,
+        )
+        adjusted_command[:, 1] = torch.clamp(
+            adjusted_command[:, 1] + delta_cmd[:, 1],
+            min=-self.lateral_command_clip,
+            max=self.lateral_command_clip,
+        )
+        adjusted_command[:, 2] = torch.clamp(
+            adjusted_command[:, 2] + delta_cmd[:, 2],
+            min=-self.yaw_command_clip,
+            max=self.yaw_command_clip,
+        )
+        self._update_debug_buffers(
+            nominal_command, guidance_command, delta_cmd, adjusted_command, gap_width, gap_turn_need, gap_blocked
+        )
+        return adjusted_command
+
+    def compute_distillation_risk(self, obs) -> torch.Tensor:
+        """Estimate when the student should prioritize teacher avoidance over flat locomotion."""
+        policy_obs = obs[self.obs_group_name]
+        goal_command = policy_obs[:, self.command_obs_start : self.command_obs_start + self.command_obs_dim]
+        nominal_command = self._goal_command_to_nominal_command(goal_command)
+        obstacle_positions = policy_obs[
+            :, self.obstacle_obs_start : self.obstacle_obs_start + self.obstacle_obs_dim
+        ].view(policy_obs.shape[0], -1, 2) * self.obstacle_max_distance
+        return self._compute_distillation_risk_from_tensors(nominal_command, obstacle_positions)
+
+    def compute_obstacle_representation(self, obs) -> torch.Tensor:
+        """Return a compact teacher geometry representation for student alignment.
+
+        The representation intentionally mirrors the quantities the steering logic
+        actually reasons about:
+          0. nearest threat forward position
+          1. nearest threat lateral position
+          2. center corridor blockage
+          3. left corridor blockage
+          4. right corridor blockage
+          5. left lane openness
+          6. right lane openness
+          7. preferred avoidance side
+        """
+        policy_obs = obs[self.obs_group_name]
+        goal_command = policy_obs[:, self.command_obs_start : self.command_obs_start + self.command_obs_dim]
+        nominal_command = self._goal_command_to_nominal_command(goal_command)
+        obstacle_positions = policy_obs[
+            :, self.obstacle_obs_start : self.obstacle_obs_start + self.obstacle_obs_dim
+        ].view(policy_obs.shape[0], -1, 2) * self.obstacle_max_distance
+        return self._compute_obstacle_representation_from_tensors(nominal_command, obstacle_positions)
+
+    def compute_target_pose(self, obs) -> torch.Tensor:
+        """Return a short-horizon local target pose derived from the teacher command."""
+        adjusted_command = self.compute_navigation_command(obs)
+        return self.navigation_command_to_target_pose(adjusted_command)
+
+    def navigation_command_to_target_pose(self, navigation_command: torch.Tensor) -> torch.Tensor:
+        """Convert a local velocity command into a short-horizon local target pose."""
+        target_pose = torch.zeros_like(navigation_command)
+        target_pose[:, 0] = torch.clamp(
+            navigation_command[:, 0] * self.target_pose_horizon,
+            min=-self.target_pose_x_clip,
+            max=self.target_pose_x_clip,
+        )
+        target_pose[:, 1] = torch.clamp(
+            navigation_command[:, 1] * self.target_pose_horizon,
+            min=-self.target_pose_y_clip,
+            max=self.target_pose_y_clip,
+        )
+        target_pose[:, 2] = torch.clamp(
+            navigation_command[:, 2] * self.target_pose_yaw_horizon,
+            min=-self.target_pose_yaw_clip,
+            max=self.target_pose_yaw_clip,
+        )
+        return target_pose
+
+    def _goal_command_to_target_pose(self, goal_command: torch.Tensor) -> torch.Tensor:
+        """Clip the remaining goal to the nominal short-horizon target pose."""
+        target_pose = torch.zeros_like(goal_command)
+        target_pose[:, 0] = torch.clamp(
+            goal_command[:, 0],
+            min=-self.target_pose_x_clip,
+            max=self.target_pose_x_clip,
+        )
+        target_pose[:, 1] = torch.clamp(
+            goal_command[:, 1],
+            min=-self.target_pose_y_clip,
+            max=self.target_pose_y_clip,
+        )
+        target_pose[:, 2] = torch.clamp(
+            goal_command[:, 2],
+            min=-self.target_pose_yaw_clip,
+            max=self.target_pose_yaw_clip,
+        )
+        return target_pose
+
+    def _goal_command_to_nominal_command(self, goal_command: torch.Tensor) -> torch.Tensor:
+        """Map the remaining local goal to the nominal LLC command before obstacle steering."""
+        return self._target_pose_to_navigation_command(self._goal_command_to_target_pose(goal_command))
+
+    def _target_pose_to_navigation_command(self, target_pose: torch.Tensor) -> torch.Tensor:
+        """Invert the teacher target-pose convention back to `(vx, vy, yaw)`."""
+        command = torch.zeros_like(target_pose)
+        command[:, 0] = torch.clamp(
+            target_pose[:, 0] / max(self.target_pose_horizon, 1.0e-6),
+            min=-self.lateral_command_clip,
+            max=self.lateral_command_clip,
+        )
+        command[:, 1] = torch.clamp(
+            target_pose[:, 1] / max(self.target_pose_horizon, 1.0e-6),
+            min=-self.lateral_command_clip,
+            max=self.lateral_command_clip,
+        )
+        command[:, 2] = torch.clamp(
+            target_pose[:, 2] / max(self.target_pose_yaw_horizon, 1.0e-6),
+            min=-self.yaw_command_clip,
+            max=self.yaw_command_clip,
+        )
+        return command
+
     @property
     def last_base_command(self) -> torch.Tensor:
         return self._last_base_command
@@ -494,6 +376,11 @@ class GeometricSteeringTeacher(nn.Module):
 
     @property
     def last_adjusted_command(self) -> torch.Tensor:
+        return self._last_adjusted_command
+
+    @property
+    def last_navigation_command(self) -> torch.Tensor:
+        """Alias for the final local navigation command sent into the LLC."""
         return self._last_adjusted_command
 
     @property
@@ -528,24 +415,29 @@ class GeometricSteeringTeacher(nn.Module):
         return guidance
 
     def _reset_state(self, dones: torch.Tensor | None = None) -> None:
-        state_buffers = (
-            self._smoothed_delta,
-            self._last_base_command,
-            self._last_guidance_command,
-            self._last_delta_command,
-            self._last_adjusted_command,
-            self._last_gap_width,
-            self._last_gap_turn_need,
-            self._last_gap_blocked,
-            self._last_turn_side,
+        state_buffer_names = (
+            "_smoothed_delta",
+            "_last_base_command",
+            "_last_guidance_command",
+            "_last_delta_command",
+            "_last_adjusted_command",
+            "_last_gap_width",
+            "_last_gap_turn_need",
+            "_last_gap_blocked",
+            "_last_turn_side",
         )
         if dones is None:
-            for buffer in state_buffers:
-                buffer.zero_()
+            for name in state_buffer_names:
+                buffer = getattr(self, name)
+                setattr(self, name, torch.zeros_like(buffer))
             return
-        for buffer in state_buffers:
+
+        dones = dones.to(dtype=torch.bool)
+        for name in state_buffer_names:
+            buffer = getattr(self, name)
             if buffer.shape[0] == dones.shape[0]:
-                buffer[dones] = 0.0
+                reset_mask = dones.view(-1, *([1] * (buffer.dim() - 1)))
+                setattr(self, name, torch.where(reset_mask, torch.zeros_like(buffer), buffer))
 
     def _compute_steering_delta(
         self, command: torch.Tensor, obstacle_positions: torch.Tensor
@@ -771,6 +663,182 @@ class GeometricSteeringTeacher(nn.Module):
         delta[:, 1] = delta[:, 1].clamp(-self.max_delta_vy, self.max_delta_vy)
         delta[:, 2] = delta[:, 2].clamp(-self.max_delta_yaw, self.max_delta_yaw)
         return speed_gate.unsqueeze(1) * delta, gap_width, gap_turn_need, gap_blocked
+
+    def _compute_distillation_risk_from_tensors(
+        self, command: torch.Tensor, obstacle_positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Blend teacher imitation only where obstacle avoidance should matter."""
+        cmd_xy = command[:, :2]
+        cmd_speed = cmd_xy.norm(dim=1)
+        speed_gate = (cmd_speed / self.min_command_speed).clamp(0.0, 1.0)
+        speed_ratio = (cmd_speed / max(self.speed_reference, 1.0e-6)).clamp(0.0, 1.0)
+        effective_safe_distance = self.safe_distance * (1.0 + self.high_speed_safe_distance_gain * speed_ratio)
+        effective_local_avoid_distance = self.local_avoid_distance * (
+            1.0 + self.high_speed_local_distance_gain * speed_ratio
+        )
+
+        cmd_dir = torch.zeros_like(cmd_xy)
+        moving = cmd_speed > self.min_command_speed
+        cmd_dir[moving] = cmd_xy[moving] / cmd_speed[moving].unsqueeze(1)
+        cmd_dir[~moving, 0] = 1.0
+        side_dir = torch.stack((-cmd_dir[:, 1], cmd_dir[:, 0]), dim=1)
+
+        valid = obstacle_positions.abs().sum(dim=-1) > 1.0e-6
+        distance_body = torch.sqrt(torch.clamp(obstacle_positions.square().sum(dim=-1), min=1.0e-6))
+        local_risk = (
+            valid
+            * (distance_body < effective_local_avoid_distance.unsqueeze(1))
+            * (1.0 - distance_body / effective_local_avoid_distance.unsqueeze(1)).clamp(0.0, 1.0)
+        ).amax(dim=1)
+
+        forward = (obstacle_positions * cmd_dir.unsqueeze(1)).sum(dim=-1)
+        signed_lateral = (obstacle_positions * side_dir.unsqueeze(1)).sum(dim=-1)
+        corridor_risk = (
+            valid
+            * (forward > self.min_forward_distance)
+            * (forward < effective_safe_distance.unsqueeze(1))
+            * (signed_lateral.abs() < self.corridor_half_width)
+            * (1.0 - forward / effective_safe_distance.unsqueeze(1)).clamp(0.0, 1.0)
+            * (1.0 - signed_lateral.abs() / self.corridor_half_width).clamp(0.0, 1.0)
+        ).amax(dim=1)
+
+        raw_risk = speed_gate * torch.maximum(local_risk, corridor_risk).clamp(0.0, 1.0)
+        obstacle_present = torch.logical_or(local_risk > 1.0e-6, corridor_risk > 1.0e-6).float()
+        floor_risk = speed_gate * self.obstacle_present_risk_floor * obstacle_present
+        return torch.maximum(raw_risk, floor_risk).clamp(0.0, 1.0)
+
+    def _compute_obstacle_representation_from_tensors(
+        self, command: torch.Tensor, obstacle_positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Project privileged obstacle positions into the geometry teacher actually uses."""
+        batch_size = command.shape[0]
+        device = command.device
+
+        cmd_xy = command[:, :2]
+        cmd_speed = cmd_xy.norm(dim=1)
+        speed_ratio = (cmd_speed / max(self.speed_reference, 1.0e-6)).clamp(0.0, 1.0)
+        effective_safe_distance = self.safe_distance * (1.0 + self.high_speed_safe_distance_gain * speed_ratio)
+
+        cmd_dir = torch.zeros_like(cmd_xy)
+        moving = cmd_speed > self.min_command_speed
+        cmd_dir[moving] = cmd_xy[moving] / cmd_speed[moving].unsqueeze(1)
+        cmd_dir[~moving, 0] = 1.0
+        side_dir = torch.stack((-cmd_dir[:, 1], cmd_dir[:, 0]), dim=1)
+
+        valid = obstacle_positions.abs().sum(dim=-1) > 1.0e-6
+        forward = (obstacle_positions * cmd_dir.unsqueeze(1)).sum(dim=-1)
+        signed_lateral = (obstacle_positions * side_dir.unsqueeze(1)).sum(dim=-1)
+
+        forward_score = (
+            (effective_safe_distance.unsqueeze(1) - forward)
+            / effective_safe_distance.unsqueeze(1).clamp_min(1.0e-6)
+        ).clamp(0.0, 1.0)
+
+        center_score = (
+            valid
+            & (forward > self.min_forward_distance)
+            & (forward < effective_safe_distance.unsqueeze(1))
+            & (signed_lateral.abs() <= self.corridor_half_width)
+        ).float() * forward_score * (
+            1.0 - signed_lateral.abs() / self.corridor_half_width
+        ).clamp(0.0, 1.0)
+
+        half_lane_width = max(0.5 * self.robot_side_clearance, 1.0e-3)
+        left_score = (
+            valid
+            & (forward > self.min_forward_distance)
+            & (forward < effective_safe_distance.unsqueeze(1))
+            & (signed_lateral >= 0.0)
+            & (signed_lateral <= half_lane_width)
+        ).float() * forward_score * (
+            1.0 - signed_lateral / half_lane_width
+        ).clamp(0.0, 1.0)
+        right_score = (
+            valid
+            & (forward > self.min_forward_distance)
+            & (forward < effective_safe_distance.unsqueeze(1))
+            & (signed_lateral <= 0.0)
+            & (-signed_lateral <= half_lane_width)
+        ).float() * forward_score * (
+            1.0 + signed_lateral / half_lane_width
+        ).clamp(0.0, 1.0)
+
+        center_blockage = center_score.amax(dim=1)
+        left_blockage = left_score.amax(dim=1)
+        right_blockage = right_score.amax(dim=1)
+
+        side_lane_inner = self.corridor_half_width
+        side_lane_outer = max(self.robot_side_clearance, self.corridor_half_width + self.obstacle_width + 0.1)
+
+        def _masked_min(mask: torch.Tensor) -> torch.Tensor:
+            masked_forward = torch.where(mask, forward, torch.full_like(forward, float("inf")))
+            return masked_forward.amin(dim=1)
+
+        left_lane_mask = (
+            valid
+            & (forward > self.min_forward_distance)
+            & (forward < effective_safe_distance.unsqueeze(1))
+            & (signed_lateral >= side_lane_inner)
+            & (signed_lateral <= side_lane_outer)
+        )
+        right_lane_mask = (
+            valid
+            & (forward > self.min_forward_distance)
+            & (forward < effective_safe_distance.unsqueeze(1))
+            & (signed_lateral <= -side_lane_inner)
+            & (signed_lateral >= -side_lane_outer)
+        )
+
+        left_open = (_masked_min(left_lane_mask) / effective_safe_distance).clamp(0.0, 1.0)
+        right_open = (_masked_min(right_lane_mask) / effective_safe_distance).clamp(0.0, 1.0)
+        left_open = torch.where(torch.isfinite(left_open), left_open, torch.ones_like(left_open))
+        right_open = torch.where(torch.isfinite(right_open), right_open, torch.ones_like(right_open))
+
+        threat_mask = center_score > 1.0e-6
+        threat_score = torch.where(threat_mask, center_score, torch.full_like(center_score, -1.0))
+        threat_idx = torch.argmax(threat_score, dim=1)
+        has_threat = threat_mask.any(dim=1)
+        batch_idx = torch.arange(batch_size, device=device)
+
+        nearest_forward = torch.where(
+            has_threat,
+            forward[batch_idx, threat_idx] / effective_safe_distance.clamp_min(1.0e-6),
+            torch.ones(batch_size, device=device),
+        ).clamp(0.0, 1.0)
+        nearest_lateral = torch.where(
+            has_threat,
+            signed_lateral[batch_idx, threat_idx] / self.corridor_half_width,
+            torch.zeros(batch_size, device=device),
+        ).clamp(-1.0, 1.0)
+
+        weighted_lateral = (center_score * signed_lateral).sum(dim=1) / (center_score.sum(dim=1) + 1.0e-6)
+        preferred_side = -torch.sign(weighted_lateral)
+        preferred_side = torch.where(preferred_side == 0.0, torch.sign(right_open - left_open), preferred_side)
+        preferred_side = torch.where(preferred_side == 0.0, torch.ones_like(preferred_side), preferred_side)
+
+        return torch.stack(
+            (
+                nearest_forward,
+                nearest_lateral,
+                center_blockage,
+                left_blockage,
+                right_blockage,
+                left_open,
+                right_open,
+                preferred_side,
+            ),
+            dim=-1,
+        )
+
+    def _run_frozen_actor_with_command(self, obs, adjusted_command: torch.Tensor) -> torch.Tensor:
+        """Run the frozen LLC on a provided local navigation command."""
+        policy_obs = obs[self.obs_group_name]
+        modified_policy_obs = policy_obs.clone()
+        modified_policy_obs[:, self.command_obs_start : self.command_obs_start + self.command_obs_dim] = adjusted_command
+
+        modified_obs = {key: obs[key] for key in obs.keys()}
+        modified_obs[self.obs_group_name] = modified_policy_obs
+        return self.frozen_actor(modified_obs)
 
     def _smooth_delta(self, delta: torch.Tensor, cmd_speed: torch.Tensor | None = None) -> torch.Tensor:
         if self._smoothed_delta.shape != delta.shape:
