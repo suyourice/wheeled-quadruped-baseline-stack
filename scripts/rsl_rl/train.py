@@ -8,7 +8,9 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import copy
 import sys
+from collections import defaultdict
 
 from isaaclab.app import AppLauncher
 
@@ -43,6 +45,24 @@ parser.add_argument(
 )
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
+)
+parser.add_argument(
+    "--teacher_only_eval",
+    action="store_true",
+    default=False,
+    help="Run the active distillation teacher directly for episode-metric evaluation instead of training.",
+)
+parser.add_argument(
+    "--eval_num_episodes",
+    type=int,
+    default=256,
+    help="Number of completed episodes to aggregate in --teacher_only_eval mode.",
+)
+parser.add_argument(
+    "--eval_print_interval",
+    type=int,
+    default=64,
+    help="How often to print progress in --teacher_only_eval mode, measured in completed episodes.",
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -89,10 +109,12 @@ import logging
 import os
 import time
 from datetime import datetime
+from types import MethodType
 
 import gymnasium as gym
 import torch
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from rsl_rl.utils import resolve_callable
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -119,6 +141,60 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _install_resilient_runner_save(runner, retry_count: int = 3, retry_delay_s: float = 2.0) -> None:
+    """Protect long runs from transient filesystem failures during checkpoint saves.
+
+    Some HPC filesystem backends occasionally fail to open the final checkpoint path
+    even though the directory is valid and earlier checkpoints were written. We do not
+    want a multi-hour training run to die on a periodic save, so save atomically via a
+    temporary file, retry a few times, and finally fall back to `/tmp` with a warning.
+    """
+
+    def _resilient_save(self, path: str, infos: dict | None = None) -> None:
+        saved_dict = self.alg.save()
+        saved_dict["iter"] = self.current_learning_iteration
+        saved_dict["infos"] = infos
+
+        target_dir = os.path.dirname(path)
+        os.makedirs(target_dir, exist_ok=True)
+        base_name = os.path.basename(path)
+        last_exc: Exception | None = None
+
+        for attempt in range(1, retry_count + 1):
+            tmp_path = os.path.join(target_dir, f".{base_name}.tmp.{os.getpid()}.{attempt}")
+            try:
+                torch.save(saved_dict, tmp_path)
+                os.replace(tmp_path, path)
+                self.logger.save_model(path, self.current_learning_iteration)
+                return
+            except Exception as exc:  # noqa: BLE001 - keep long training alive on FS hiccups
+                last_exc = exc
+                print(
+                    f"[WARN] Checkpoint save attempt {attempt}/{retry_count} failed for '{path}': {exc}"
+                )
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
+                if attempt < retry_count:
+                    time.sleep(retry_delay_s)
+
+        fallback_dir = os.path.join("/tmp", "go2w_checkpoint_fallback")
+        os.makedirs(fallback_dir, exist_ok=True)
+        fallback_path = os.path.join(
+            fallback_dir,
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{base_name}",
+        )
+        torch.save(saved_dict, fallback_path)
+        print(
+            f"[WARN] Failed to save checkpoint to '{path}' after {retry_count} attempts. "
+            f"Wrote fallback checkpoint to '{fallback_path}' instead. Last error: {last_exc}"
+        )
+
+    runner.save = MethodType(_resilient_save, runner)
 
 
 def _find_state_dict(ckpt: dict, candidates: tuple[str, ...], label: str) -> tuple[str, dict]:
@@ -194,7 +270,7 @@ def _load_locomotion_checkpoint(runner: OnPolicyRunner, ckpt_path: str, device: 
 def _load_distillation_teacher_locomotion_checkpoint(
     runner: DistillationRunner, ckpt_path: str, device: str
 ) -> None:
-    """Initialize a rule-based distillation teacher from a flat locomotion checkpoint."""
+    """Initialize distillation teacher/student frozen LLCs from a flat locomotion checkpoint."""
     teacher_target = getattr(runner.alg.teacher, "frozen_actor", None)
     if teacher_target is None:
         raise ValueError(
@@ -211,7 +287,132 @@ def _load_distillation_teacher_locomotion_checkpoint(
     _load_padded_state_dict(teacher_target, actor_sd, device, "teacher frozen actor", strip_distribution=True)
     runner.alg.teacher_loaded = True
     print(f"[INFO] Loaded distillation teacher frozen actor from '{actor_key}'")
+
+    student_target = getattr(runner.alg.student, "frozen_actor", None)
+    if student_target is not None:
+        _load_padded_state_dict(student_target, actor_sd, device, "student frozen actor", strip_distribution=True)
+        print(f"[INFO] Loaded distillation student frozen actor from '{actor_key}'")
+
     print(f"[INFO] Loaded locomotion checkpoint for rule-based teacher from: {ckpt_path}")
+
+
+def _load_teacher_locomotion_checkpoint(teacher, ckpt_path: str, device: str) -> None:
+    """Initialize a standalone teacher's frozen LLC from a flat locomotion checkpoint."""
+    teacher_target = getattr(teacher, "frozen_actor", None)
+    if teacher_target is None:
+        raise ValueError("Teacher-only eval requires a teacher with a frozen_actor LLC.")
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    actor_key, actor_sd = _find_state_dict(
+        ckpt,
+        ("actor_state_dict", "model_state_dict", "policy_state_dict"),
+        "actor",
+    )
+    _load_padded_state_dict(teacher_target, actor_sd, device, "teacher frozen actor", strip_distribution=True)
+    print(f"[INFO] Loaded standalone teacher frozen actor from '{actor_key}'")
+
+
+def _build_teacher_for_eval(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
+    """Instantiate the active distillation teacher for direct evaluation."""
+    teacher_cfg = getattr(agent_cfg, "teacher", None)
+    if teacher_cfg is None:
+        raise ValueError("--teacher_only_eval requires a distillation runner config with a 'teacher' model config.")
+
+    teacher_cfg_dict = copy.deepcopy(teacher_cfg.to_dict())
+    teacher_class = resolve_callable(teacher_cfg_dict.pop("class_name"))
+    teacher = teacher_class(obs, {"teacher": ["teacher"]}, "teacher", env.num_actions, **teacher_cfg_dict)
+    teacher = teacher.to(device)
+    teacher.eval()
+    return teacher
+
+
+def _format_eval_metrics(metrics: dict[str, float], completed_episodes: int, avg_episode_length: float) -> str:
+    """Format the most useful teacher-eval summary metrics for quick reading."""
+    preferred_keys = [
+        "goal_reached_rate",
+        "time_out_rate",
+        "base_contact_rate",
+        "root_height_below_minimum_rate",
+        "multi_term_fraction",
+    ]
+    parts = [f"episodes={completed_episodes}", f"avg_episode_len={avg_episode_length:.2f}"]
+    for key in preferred_keys:
+        if key in metrics:
+            parts.append(f"{key}={metrics[key]:.4f}")
+    return " ".join(parts)
+
+
+def _run_teacher_only_eval(env, agent_cfg: RslRlBaseRunnerCfg) -> None:
+    """Run pure teacher rollouts and aggregate current task metrics."""
+    if args_cli.locomotion_checkpoint is None:
+        raise ValueError("--teacher_only_eval requires --locomotion_checkpoint for the teacher LLC.")
+    if agent_cfg.class_name != "DistillationRunner":
+        raise ValueError("--teacher_only_eval is only supported for distillation tasks.")
+
+    # Use the same RSL-RL wrapper path as play/train so observation and step APIs stay consistent.
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    obs = env.get_observations()
+    teacher = _build_teacher_for_eval(env, obs, agent_cfg, env.unwrapped.device)
+    _load_teacher_locomotion_checkpoint(teacher, args_cli.locomotion_checkpoint, env.unwrapped.device)
+
+    num_envs = env.unwrapped.num_envs
+    episode_lengths = torch.zeros(num_envs, device=env.unwrapped.device, dtype=torch.long)
+    completed_episodes = 0
+    total_episode_length = 0.0
+    termination_names = list(env.unwrapped.termination_manager.active_terms)
+    termination_counts: dict[str, int] = defaultdict(int)
+    multi_term_episodes = 0
+
+    print(
+        "[INFO] Running teacher-only evaluation on the active goal-conditioned local-navigation task: "
+        f"target episodes={args_cli.eval_num_episodes}"
+    )
+
+    while simulation_app.is_running() and completed_episodes < args_cli.eval_num_episodes:
+        with torch.inference_mode():
+            actions = teacher(obs)
+            obs, _, dones, extras = env.step(actions)
+            teacher.reset(dones.bool())
+
+        episode_lengths += 1
+        done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
+        num_done = int(done_ids.numel())
+        if num_done == 0:
+            continue
+
+        total_episode_length += float(episode_lengths[done_ids].sum().item())
+        episode_lengths[done_ids] = 0
+        completed_episodes += num_done
+
+        done_terms = env.unwrapped.termination_manager._last_episode_dones[done_ids]
+        if done_terms.numel() > 0:
+            multi_term_episodes += int((done_terms.sum(dim=1) > 1).sum().item())
+            for idx, term_name in enumerate(termination_names):
+                termination_counts[term_name] += int(done_terms[:, idx].sum().item())
+
+        if (
+            completed_episodes >= args_cli.eval_num_episodes
+            or (
+                args_cli.eval_print_interval > 0
+                and completed_episodes % args_cli.eval_print_interval < num_done
+            )
+        ):
+            averaged = {
+                f"{term_name}_rate": termination_counts[term_name] / max(completed_episodes, 1)
+                for term_name in termination_names
+            }
+            averaged["multi_term_fraction"] = multi_term_episodes / max(completed_episodes, 1)
+            avg_episode_length = total_episode_length / max(completed_episodes, 1)
+            print("[TEACHER-EVAL] " + _format_eval_metrics(averaged, completed_episodes, avg_episode_length))
+
+    averaged = {
+        f"{term_name}_rate": termination_counts[term_name] / max(completed_episodes, 1)
+        for term_name in termination_names
+    }
+    averaged["multi_term_fraction"] = multi_term_episodes / max(completed_episodes, 1)
+    avg_episode_length = total_episode_length / max(completed_episodes, 1)
+    print("[INFO] Teacher-only evaluation complete.")
+    print("[TEACHER-EVAL][FINAL] " + _format_eval_metrics(averaged, completed_episodes, avg_episode_length))
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -279,13 +480,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
+    if args_cli.teacher_only_eval:
+        _run_teacher_only_eval(env, agent_cfg)
+        env.close()
+        return
+
     # save resume path before creating a new log_dir
     resume_path = None
     if args_cli.teacher_checkpoint is not None:
         resume_path = args_cli.teacher_checkpoint
     elif agent_cfg.resume:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-    elif agent_cfg.algorithm.class_name == "Distillation" and args_cli.locomotion_checkpoint is None:
+    elif agent_cfg.class_name == "DistillationRunner" and args_cli.locomotion_checkpoint is None:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
@@ -312,6 +518,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    _install_resilient_runner_save(runner)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
 
@@ -368,6 +575,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 runner.alg.load(ckpt, load_cfg=None, strict=True)
         else:
             runner.load(resume_path)
+    elif isinstance(runner, DistillationRunner):
+        print(
+            "[INFO] No distillation checkpoint was loaded for the student/teacher heads. "
+            "Starting distillation from fresh navigation weights; only the frozen LLC(s) were initialized "
+            "from --locomotion_checkpoint if provided."
+        )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

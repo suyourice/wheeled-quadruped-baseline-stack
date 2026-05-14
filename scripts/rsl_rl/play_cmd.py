@@ -27,17 +27,17 @@ Usage examples:
     # Stand still
     python scripts/rsl_rl/play_cmd.py --task Flat-Go2w-Play-v0
 
-    # Evaluate the rule-based obstacle teacher directly
+    # Evaluate the rule-based navigation-distillation teacher directly
     python scripts/rsl_rl/play_cmd.py \
-        --task Obstacle-Distill-Go2w-Play-v0 \
+        --task Navigation-Distill-Go2w-Play-v0 \
         --teacher_steering \
         --locomotion_checkpoint logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt \
         --cmd_vx 1.0 \
         --num_obstacles 2
 
-    # Evaluate the rule-based obstacle teacher on random commands
+    # Evaluate the rule-based navigation-distillation teacher on random commands
     python scripts/rsl_rl/play_cmd.py \
-        --task Obstacle-Distill-Go2w-Play-v0 \
+        --task Navigation-Distill-Go2w-Play-v0 \
         --teacher_steering \
         --random_commands \
         --locomotion_checkpoint logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt \
@@ -45,7 +45,7 @@ Usage examples:
 
     # Spawn two obstacles directly ahead of the commanded motion ray
     python scripts/rsl_rl/play_cmd.py \
-        --task Obstacle-Distill-Go2w-Play-v0 \
+        --task Navigation-Distill-Go2w-Play-v0 \
         --teacher_steering \
         --locomotion_checkpoint logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt \
         --cmd_vx 0.8 --cmd_vy -0.6 \
@@ -327,7 +327,7 @@ def _build_teacher_policy(env, obs, agent_cfg, device: str):
     if "teacher" not in obs.keys():
         raise ValueError(
             "--teacher_steering requires an environment exposing a 'teacher' observation group. "
-            "Use a distillation play task such as Obstacle-Distill-Go2w-Play-v0."
+            "Use a distillation play task such as Navigation-Distill-Go2w-Play-v0."
         )
     if args_cli.locomotion_checkpoint is None:
         raise ValueError("--teacher_steering requires --locomotion_checkpoint for the frozen LLC.")
