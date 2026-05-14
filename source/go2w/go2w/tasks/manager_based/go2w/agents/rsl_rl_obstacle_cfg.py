@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""RSL-RL agent configs for obstacle avoidance Teacher and Student training."""
+"""Active RSL-RL configs for the current local-navigation distillation path."""
 
 from dataclasses import MISSING
 
@@ -13,42 +13,18 @@ from isaaclab_rl.rsl_rl import (
     RslRlDistillationAlgorithmCfg,
     RslRlDistillationRunnerCfg,
     RslRlMLPModelCfg,
-    RslRlOnPolicyRunnerCfg,
-    RslRlPpoActorCriticCfg,
-    RslRlPpoAlgorithmCfg,
+)
+
+from go2w.tasks.manager_based.go2w.observation_layout import (
+    GOAL_COMMAND_DIM,
+    GOAL_COMMAND_START,
+    PRIVILEGED_OBSTACLE_START,
 )
 
 
 @configclass
-class FrozenCommandResidualActorCfg(RslRlMLPModelCfg):
-    """Frozen fast-flat actor with trainable obstacle-aware command residual."""
-
-    class_name: str = "go2w.tasks.manager_based.go2w.residual_models:FrozenCommandResidualActor"
-
-    frozen_hidden_dims: list[int] = MISSING
-    frozen_activation: str = MISSING
-    frozen_obs_normalization: bool = False
-
-    command_obs_start: int = 9
-    command_obs_dim: int = 3
-    obstacle_obs_start: int = 60
-    obstacle_obs_dim: int = 30
-    state_obs_dim: int = 12
-    obstacle_max_distance: float = 8.0
-
-    residual_vy_scale: float = 0.9
-    residual_yaw_scale: float = 1.1
-    lateral_command_clip: float = 2.0
-    yaw_command_clip: float = 2.0
-
-    gate_forward_distance: float = 3.5
-    gate_min_forward_distance: float = 0.2
-    gate_path_width: float = 1.2
-
-
-@configclass
 class GeometricSteeringTeacherCfg(RslRlMLPModelCfg):
-    """Rule-based steering teacher on top of a frozen fast-flat LLC."""
+    """Rule-based privileged teacher that outputs obstacle-aware short-horizon targets."""
 
     class_name: str = "go2w.tasks.manager_based.go2w.residual_models:GeometricSteeringTeacher"
 
@@ -56,9 +32,9 @@ class GeometricSteeringTeacherCfg(RslRlMLPModelCfg):
     frozen_activation: str = MISSING
     frozen_obs_normalization: bool = False
 
-    command_obs_start: int = 9
-    command_obs_dim: int = 3
-    obstacle_obs_start: int = 60
+    command_obs_start: int = GOAL_COMMAND_START
+    command_obs_dim: int = GOAL_COMMAND_DIM
+    obstacle_obs_start: int = PRIVILEGED_OBSTACLE_START
     obstacle_obs_dim: int = 30
     obstacle_max_distance: float = 8.0
 
@@ -107,146 +83,121 @@ class GeometricSteeringTeacherCfg(RslRlMLPModelCfg):
     smoothing_alpha: float = 0.55
     lateral_command_clip: float = 2.0
     yaw_command_clip: float = 2.0
+    obstacle_present_risk_floor: float = 0.30
+    target_pose_horizon: float = 0.75
+    target_pose_yaw_horizon: float = 0.6
+    target_pose_x_clip: float = 1.5
+    target_pose_y_clip: float = 1.5
+    target_pose_yaw_clip: float = 1.2
 
 
 @configclass
-class ObstacleTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
-    """PPO config for training the obstacle-avoidance teacher.
+class NavigationCommandStudentCfg(RslRlMLPModelCfg):
+    """Student that predicts a local target pose and executes it through the LLC."""
 
-    Uses privileged observations (obstacle positions relative to robot).
-    """
+    class_name: str = "go2w.tasks.manager_based.go2w.navigation_models:NavigationCommandStudent"
+
+    frozen_hidden_dims: list[int] = MISSING
+    frozen_activation: str = MISSING
+    frozen_obs_normalization: bool = False
+
+    command_obs_start: int = GOAL_COMMAND_START
+    command_obs_dim: int = GOAL_COMMAND_DIM
+    representation_dim: int = 8
+    target_pose_horizon: float = 0.75
+    target_pose_yaw_horizon: float = 0.6
+    target_pose_x_clip: float = 1.5
+    target_pose_y_clip: float = 1.5
+    target_pose_yaw_clip: float = 1.2
+    target_pose_to_vx_gain: float = 1.0
+    target_pose_to_vy_gain: float = 1.0
+    target_pose_to_yaw_gain: float = 1.0
+    side_guidance_lateral_gain: float = 0.5
+    side_guidance_yaw_gain: float = 0.9
+    command_clip_xy: float = 2.0
+    command_clip_yaw: float = 2.0
+
+
+@configclass
+class NavigationCommandDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
+    """Distill short-horizon local target poses instead of low-level actions."""
+
+    class_name: str = "go2w.tasks.manager_based.go2w.distillation_algorithms:NavigationCommandDistillation"
+
+    command_loss_weight: float = 1.0
+    target_pose_loss_weight: float = 1.0
+    representation_loss_weight: float = 0.5
+    base_anchor_weight: float = 0.1
+    yaw_loss_weight: float = 0.1
+    delta_norm_loss_weight: float = 0.05
+    delta_norm_margin: float = 0.15
+    near_waypoint_command_discount: float = 0.5
+    near_waypoint_anchor_bonus: float = 0.25
+    blocked_lateral_yaw_weight: float = 1.0
+    blocked_vx_weight: float = 1.0
+    hard_case_delta_norm_threshold: float = 0.25
+    blocked_risk_threshold: float = 0.06
+    near_waypoint_distance_threshold: float = 0.9
+    near_waypoint_heading_threshold: float = 0.7
+    near_goal_distance_threshold: float = 0.9
+    side_target_vy_scale: float = 0.8
+    side_target_yaw_scale: float = 1.5
+    side_target_deadband: float = 0.05
+    debug_obstacle_print_interval: int = 10
+    debug_obstacle_print_count: int = 6
+    debug_rollout_print_interval: int = 128
+
+
+@configclass
+class NavigationDistillRunnerCfg(RslRlDistillationRunnerCfg):
+    """Current active local-navigation distillation runner."""
 
     num_steps_per_env = 128
-    max_iterations    = 3000
-    save_interval     = 100
-    experiment_name   = "go2w_obstacle_teacher"
-    logger            = "wandb"
-    wandb_project     = "go2w_obstacle_teacher"
+    max_iterations = 400
+    save_interval = 50
+    experiment_name = "go2w_navigation_distill"
+    logger = "wandb"
+    wandb_project = "go2w_navigation_distill"
 
-    policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.30,  # scale=28: 0.30×28×0.086≈0.72 m/s
-        actor_obs_normalization=False,
-        critic_obs_normalization=False,
-        actor_hidden_dims=[512, 256, 128],
-        critic_hidden_dims=[512, 256, 128],
-        activation="elu",
-    )
-    algorithm = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.005,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-    )
+    load_run = ".*"
+    load_checkpoint = "model_.*.pt"
 
-
-@configclass
-class ObstacleTeacherFastRunnerCfg(ObstacleTeacherRunnerCfg):
-    """PPO config for obstacle teacher training from a pre-trained flat locomotion checkpoint.
-
-    Shorter training budget (1500 vs 3000 iter) — no locomotion warmup phase needed.
-    Network architecture [512,256,128] matches the flat fast checkpoint exactly.
-    Uses bounded exploration: the simplified transfer run kept locomotion stable
-    but collapsed action std to 0.10 and did not reduce obstacle contacts.
-    """
-
-    max_iterations  = 1500
-    experiment_name = "go2w_obstacle_teacher_fast"
-    wandb_project   = "go2w_obstacle_teacher_fast"
-
-    policy = MISSING
-    actor = FrozenCommandResidualActorCfg(
-        hidden_dims=[128, 128],
+    student = NavigationCommandStudentCfg(
+        hidden_dims=[512, 256, 128],
         activation="elu",
         obs_normalization=False,
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(
-            init_std=0.25,
-        ),
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.35),
         frozen_hidden_dims=[512, 256, 128],
         frozen_activation="elu",
         frozen_obs_normalization=False,
-        command_obs_start=9,
-        command_obs_dim=3,
-        obstacle_obs_start=60,
-        obstacle_obs_dim=30,
-        state_obs_dim=12,
-        obstacle_max_distance=8.0,
-        residual_vy_scale=0.9,
-        residual_yaw_scale=1.1,
-        lateral_command_clip=2.0,
-        yaw_command_clip=2.0,
-        gate_forward_distance=3.5,
-        gate_min_forward_distance=0.2,
-        gate_path_width=1.2,
-    )
-    critic = RslRlMLPModelCfg(
-        hidden_dims=[512, 256, 128],
-        activation="elu",
-        obs_normalization=False,
-    )
-    algorithm = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.002,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=5.0e-4,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.008,
-        max_grad_norm=1.0,
-    )
-
-
-@configclass
-class ObstacleDistillRunnerCfg(RslRlDistillationRunnerCfg):
-    """Distillation config for a LiDAR student with a rule-based privileged teacher.
-
-    The teacher is no longer learned with PPO. It is a deterministic geometric
-    steering layer that rewrites `(vx, vy, yaw)` using privileged obstacle
-    positions and then delegates final action generation to the frozen fast-flat
-    LLC. Student distillation still uses the same action-cloning pipeline.
-    """
-
-    num_steps_per_env = 128
-    max_iterations    = 1000
-    save_interval     = 100
-    experiment_name   = "go2w_obstacle_distill"
-    logger            = "wandb"
-    wandb_project     = "go2w_obstacle_distill"
-
-    load_run        = ".*"
-    load_checkpoint = "model_.*.pt"
-
-    student = RslRlMLPModelCfg(
-        hidden_dims=[512, 256, 128],
-        activation="elu",
-        obs_normalization=False,
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(
-            init_std=0.8,
-        ),
+        command_obs_start=GOAL_COMMAND_START,
+        command_obs_dim=GOAL_COMMAND_DIM,
+        representation_dim=8,
+        target_pose_horizon=0.75,
+        target_pose_yaw_horizon=0.6,
+        target_pose_x_clip=1.5,
+        target_pose_y_clip=1.5,
+        target_pose_yaw_clip=1.2,
+        target_pose_to_vx_gain=1.0,
+        target_pose_to_vy_gain=1.0,
+        target_pose_to_yaw_gain=1.0,
+        side_guidance_lateral_gain=0.5,
+        side_guidance_yaw_gain=0.9,
+        command_clip_xy=2.0,
+        command_clip_yaw=2.0,
     )
 
     teacher = GeometricSteeringTeacherCfg(
-        hidden_dims=[1],  # unused; config kept only for RSL-RL model-schema compatibility
-        activation="identity",  # unused
-        obs_normalization=False,  # unused
-        distribution_cfg=None,  # deterministic teacher
+        hidden_dims=[1],
+        activation="identity",
+        obs_normalization=False,
+        distribution_cfg=None,
         frozen_hidden_dims=[512, 256, 128],
         frozen_activation="elu",
         frozen_obs_normalization=False,
-        command_obs_start=9,
-        command_obs_dim=3,
-        obstacle_obs_start=60,
+        command_obs_start=GOAL_COMMAND_START,
+        command_obs_dim=GOAL_COMMAND_DIM,
+        obstacle_obs_start=PRIVILEGED_OBSTACLE_START,
         obstacle_obs_dim=30,
         obstacle_max_distance=8.0,
         min_command_speed=0.15,
@@ -294,12 +245,40 @@ class ObstacleDistillRunnerCfg(RslRlDistillationRunnerCfg):
         smoothing_alpha=0.55,
         lateral_command_clip=2.0,
         yaw_command_clip=2.0,
+        obstacle_present_risk_floor=0.30,
+        target_pose_horizon=0.75,
+        target_pose_yaw_horizon=0.6,
+        target_pose_x_clip=1.5,
+        target_pose_y_clip=1.5,
+        target_pose_yaw_clip=1.2,
     )
 
-    algorithm = RslRlDistillationAlgorithmCfg(
-        num_learning_epochs=5,
-        learning_rate=1.0e-3,
-        gradient_length=15,
+    algorithm = NavigationCommandDistillationAlgorithmCfg(
+        num_learning_epochs=4,
+        learning_rate=5.0e-4,
+        gradient_length=8,
         max_grad_norm=1.0,
         loss_type="mse",
+        command_loss_weight=1.0,
+        target_pose_loss_weight=1.0,
+        representation_loss_weight=0.5,
+        base_anchor_weight=0.1,
+        yaw_loss_weight=0.1,
+        delta_norm_loss_weight=0.05,
+        delta_norm_margin=0.15,
+        near_waypoint_command_discount=0.5,
+        near_waypoint_anchor_bonus=0.25,
+        blocked_lateral_yaw_weight=1.0,
+        blocked_vx_weight=1.0,
+        hard_case_delta_norm_threshold=0.25,
+        blocked_risk_threshold=0.06,
+        near_waypoint_distance_threshold=0.9,
+        near_waypoint_heading_threshold=0.7,
+        near_goal_distance_threshold=0.9,
+        side_target_vy_scale=0.8,
+        side_target_yaw_scale=1.5,
+        side_target_deadband=0.05,
+        debug_obstacle_print_interval=10,
+        debug_obstacle_print_count=6,
+        debug_rollout_print_interval=128,
     )
