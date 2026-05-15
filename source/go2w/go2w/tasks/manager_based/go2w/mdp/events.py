@@ -404,6 +404,10 @@ def reset_navigation_goals_and_obstacles(
     narrow_gap_center_lateral_range: tuple[float, float] = (-0.15, 0.15),
     narrow_gap_half_width_range: tuple[float, float] = (0.38, 0.55),
     narrow_gap_probability: float = 0.35,
+    fixed_goal_forward: float | None = None,
+    fixed_goal_lateral: float | None = None,
+    fixed_goal_heading_jitter: float | None = None,
+    fixed_scenario_template: str | None = None,
     park_distance: float = 1000.0,
 ) -> None:
     """Sample explicit start-goal local-navigation tasks and place varied obstacles.
@@ -425,6 +429,9 @@ def reset_navigation_goals_and_obstacles(
 
     if max_obstacles is None:
         max_obstacles = len(obstacle_names)
+    fixed_template = None if fixed_scenario_template is None else fixed_scenario_template.lower()
+    if fixed_template == "random":
+        fixed_template = None
 
     n = len(env_ids)
     device = env.device
@@ -451,22 +458,29 @@ def reset_navigation_goals_and_obstacles(
         cos_yaw = math.cos(yaw_i)
         sin_yaw = math.sin(yaw_i)
 
-        forward = 0.0
-        lateral = 0.0
-        goal_distance = 0.0
-        for _ in range(50):
-            forward = random.uniform(*goal_forward_range)
-            lateral = random.uniform(*goal_lateral_range)
-            goal_distance = math.hypot(forward, lateral)
-            if goal_distance >= min_goal_distance:
-                break
+        if fixed_goal_forward is not None or fixed_goal_lateral is not None:
+            forward = fixed_goal_forward if fixed_goal_forward is not None else sum(goal_forward_range) * 0.5
+            lateral = fixed_goal_lateral if fixed_goal_lateral is not None else sum(goal_lateral_range) * 0.5
+        else:
+            forward = 0.0
+            lateral = 0.0
+            for _ in range(50):
+                forward = random.uniform(*goal_forward_range)
+                lateral = random.uniform(*goal_lateral_range)
+                goal_distance = math.hypot(forward, lateral)
+                if goal_distance >= min_goal_distance:
+                    break
 
         goal_dx_world = forward * cos_yaw - lateral * sin_yaw
         goal_dy_world = forward * sin_yaw + lateral * cos_yaw
         goal_pos_w[idx, 0] = start_pos_w[idx, 0] + goal_dx_world
         goal_pos_w[idx, 1] = start_pos_w[idx, 1] + goal_dy_world
         path_heading_w = math.atan2(goal_dy_world, goal_dx_world)
-        heading_jitter = random.uniform(*goal_heading_jitter_range)
+        heading_jitter = (
+            fixed_goal_heading_jitter
+            if fixed_goal_heading_jitter is not None
+            else random.uniform(*goal_heading_jitter_range)
+        )
         goal_heading_w[idx] = math.atan2(
             math.sin(path_heading_w + heading_jitter), math.cos(path_heading_w + heading_jitter)
         )
@@ -485,6 +499,12 @@ def reset_navigation_goals_and_obstacles(
     if empty_env_fraction > 0.0:
         empty_mask = torch.rand(n, device=device) < max(0.0, min(1.0, empty_env_fraction))
         active_counts = torch.where(empty_mask, torch.zeros_like(active_counts), active_counts)
+    if fixed_template == "empty":
+        active_counts = torch.zeros_like(active_counts)
+    elif fixed_template == "narrow_gap":
+        active_counts = torch.clamp(active_counts, min=min(2, len(obstacle_names)))
+    elif fixed_template is not None:
+        active_counts = torch.clamp(active_counts, min=1)
     env._go2w_scenario_template_id[env_ids] = 0
 
     parked_world = env_origins.clone()
@@ -513,6 +533,12 @@ def reset_navigation_goals_and_obstacles(
         "narrow_gap": 8,
         "random_fallback": 9,
     }
+    valid_fixed_templates = set(template_choices) | {"empty", "narrow_gap", None}
+    if fixed_template not in valid_fixed_templates:
+        raise ValueError(
+            f"Unsupported fixed_scenario_template={fixed_scenario_template!r}. "
+            f"Expected one of: random, empty, narrow_gap, {', '.join(template_choices)}."
+        )
 
     for env_idx in range(n):
         active_count = int(active_counts[env_idx].item())
@@ -584,7 +610,10 @@ def reset_navigation_goals_and_obstacles(
             return _place_from_path(progress, lateral_offset)
 
         next_slot = 0
-        if active_count >= 2 and random.random() < narrow_gap_probability:
+        use_narrow_gap = fixed_template == "narrow_gap" or (
+            fixed_template is None and active_count >= 2 and random.random() < narrow_gap_probability
+        )
+        if active_count >= 2 and use_narrow_gap:
             scenario_code = template_codes["narrow_gap"]
             progress = random.uniform(*narrow_gap_progress_range)
             center_lateral = random.uniform(*narrow_gap_center_lateral_range)
@@ -614,6 +643,32 @@ def reset_navigation_goals_and_obstacles(
                             placed = True
                             break
                 next_slot += 1
+
+        if fixed_template in template_choices and next_slot < active_count:
+            scenario_code = template_codes[fixed_template]
+            placed = False
+            for _ in range(40):
+                local_x, local_y = _sample_template_position(fixed_template)
+                if _valid_position(local_x, local_y):
+                    placed_positions.append((local_x, local_y))
+                    world_positions_per_slot[next_slot][env_idx, 0] = origin_x + local_x
+                    world_positions_per_slot[next_slot][env_idx, 1] = origin_y + local_y
+                    world_positions_per_slot[next_slot][env_idx, 2] = obstacle_z
+                    placed = True
+                    break
+            if not placed:
+                for _ in range(40):
+                    local_x = random.uniform(*spawn_range_x)
+                    local_y = random.uniform(*spawn_range_y)
+                    if _valid_position(local_x, local_y):
+                        scenario_code = template_codes["random_fallback"]
+                        placed_positions.append((local_x, local_y))
+                        world_positions_per_slot[next_slot][env_idx, 0] = origin_x + local_x
+                        world_positions_per_slot[next_slot][env_idx, 1] = origin_y + local_y
+                        world_positions_per_slot[next_slot][env_idx, 2] = obstacle_z
+                        placed = True
+                        break
+            next_slot += 1
 
         while next_slot < active_count:
             placed = False

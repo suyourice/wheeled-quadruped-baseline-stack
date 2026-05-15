@@ -728,6 +728,10 @@ class Go2wNavigationDistillEnvCfg(Go2wEnvCfg):
             "narrow_gap_center_lateral_range": NAV_NARROW_GAP_CENTER_LATERAL_RANGE,
             "narrow_gap_half_width_range": NAV_NARROW_GAP_HALF_WIDTH_RANGE,
             "narrow_gap_probability": NAV_NARROW_GAP_PROBABILITY,
+            "fixed_goal_forward": None,
+            "fixed_goal_lateral": None,
+            "fixed_goal_heading_jitter": None,
+            "fixed_scenario_template": None,
         }
 
         self.rewards.track_lin_vel_xy_exp = None
@@ -825,6 +829,10 @@ class Go2wNavigationDistillEnvCfg_PLAY(Go2wNavigationDistillEnvCfg):
             "narrow_gap_center_lateral_range": NAV_NARROW_GAP_CENTER_LATERAL_RANGE,
             "narrow_gap_half_width_range": NAV_NARROW_GAP_HALF_WIDTH_RANGE,
             "narrow_gap_probability": NAV_NARROW_GAP_PROBABILITY,
+            "fixed_goal_forward": None,
+            "fixed_goal_lateral": None,
+            "fixed_goal_heading_jitter": None,
+            "fixed_scenario_template": None,
         }
 
         self.rewards.track_lin_vel_xy_exp = None
