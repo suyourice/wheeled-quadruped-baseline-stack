@@ -120,6 +120,9 @@ NAV_LOCAL_PLANNER_ACTIVATION_THRESHOLD = 0.22
 NAV_LOCAL_PLANNER_LATERAL_PENALTY = 0.16
 NAV_LOCAL_PLANNER_MIN_IMPROVEMENT = 0.07
 NAV_LOCAL_PLANNER_MAX_BLEND = 0.65
+NAV_WAYPOINT_COMMAND_MIN_FORWARD = 0.45
+NAV_WAYPOINT_COMMAND_MAX_LATERAL = 0.85
+NAV_WAYPOINT_COMMAND_MAX_HEADING = 0.90
 
 # Unitree L2 reference spec: 360 x 96 deg FoV, 0.05 m near blind spot,
 # 30 m max range at high reflectivity, and 64k effective points/s. The
@@ -131,9 +134,9 @@ LIDAR_CHANNELS = 5  # lightweight subset of the 96-degree vertical FoV
 LIDAR_VERTICAL_FOV = (-30.0, 6.0)  # stays within the L2 vertical range and keeps useful box-obstacle bands
 
 
-def _local_waypoint_params() -> dict:
+def _local_waypoint_params(*, include_command_shape: bool = True) -> dict:
     """Build local waypoint params without sharing mutable config objects."""
-    return {
+    params = {
         "sensor_cfg": SceneEntityCfg("lidar"),
         "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
         "goal_snap_distance": NAV_WAYPOINT_GOAL_SNAP_DISTANCE,
@@ -145,6 +148,15 @@ def _local_waypoint_params() -> dict:
         "local_planner_min_improvement": NAV_LOCAL_PLANNER_MIN_IMPROVEMENT,
         "local_planner_max_blend": NAV_LOCAL_PLANNER_MAX_BLEND,
     }
+    if include_command_shape:
+        params.update(
+            {
+                "command_min_forward": NAV_WAYPOINT_COMMAND_MIN_FORWARD,
+                "command_max_lateral": NAV_WAYPOINT_COMMAND_MAX_LATERAL,
+                "command_max_heading": NAV_WAYPOINT_COMMAND_MAX_HEADING,
+            }
+        )
+    return params
 
 
 # =============================================================================
@@ -602,7 +614,7 @@ class ObstacleDistillObsCfg:
         start_position_w = ObsTerm(func=mdp.start_position_w)
         waypoint_position_w = ObsTerm(
             func=mdp.waypoint_position_w,
-            params=_local_waypoint_params(),
+            params=_local_waypoint_params(include_command_shape=False),
         )
         goal_position_w = ObsTerm(func=mdp.goal_position_w)
         scenario_template_code = ObsTerm(func=mdp.navigation_scenario_code)

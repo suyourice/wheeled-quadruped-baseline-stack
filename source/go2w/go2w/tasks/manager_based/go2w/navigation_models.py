@@ -55,8 +55,8 @@ class NavigationCommandPolicy(nn.Module):
         target_pose_to_vx_gain: float = 1.0,
         target_pose_to_vy_gain: float = 1.0,
         target_pose_to_yaw_gain: float = 1.0,
-        side_guidance_lateral_gain: float = 0.5,
-        side_guidance_yaw_gain: float = 0.9,
+        side_guidance_lateral_gain: float = 0.25,
+        side_guidance_yaw_gain: float = 0.45,
         command_clip_xy: float = 2.0,
         command_clip_yaw: float = 2.0,
     ) -> None:
@@ -361,8 +361,8 @@ class NavigationCommandStudent(nn.Module):
         target_pose_to_vx_gain: float = 1.0,
         target_pose_to_vy_gain: float = 1.0,
         target_pose_to_yaw_gain: float = 1.0,
-        side_guidance_lateral_gain: float = 0.5,
-        side_guidance_yaw_gain: float = 0.9,
+        side_guidance_lateral_gain: float = 0.25,
+        side_guidance_yaw_gain: float = 0.45,
         command_clip_xy: float = 2.0,
         command_clip_yaw: float = 2.0,
     ) -> None:

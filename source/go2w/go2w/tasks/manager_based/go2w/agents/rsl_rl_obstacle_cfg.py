@@ -112,8 +112,8 @@ class NavigationCommandStudentCfg(RslRlMLPModelCfg):
     target_pose_to_vx_gain: float = 1.0
     target_pose_to_vy_gain: float = 1.0
     target_pose_to_yaw_gain: float = 1.0
-    side_guidance_lateral_gain: float = 0.5
-    side_guidance_yaw_gain: float = 0.9
+    side_guidance_lateral_gain: float = 0.25
+    side_guidance_yaw_gain: float = 0.45
     command_clip_xy: float = 2.0
     command_clip_yaw: float = 2.0
 
@@ -129,8 +129,8 @@ class NavigationCommandDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     representation_loss_weight: float = 0.5
     base_anchor_weight: float = 0.1
     yaw_loss_weight: float = 0.1
-    delta_norm_loss_weight: float = 0.05
-    delta_norm_margin: float = 0.15
+    delta_norm_loss_weight: float = 0.15
+    delta_norm_margin: float = 0.10
     near_waypoint_command_discount: float = 0.5
     near_waypoint_anchor_bonus: float = 0.25
     blocked_lateral_yaw_weight: float = 1.0
@@ -181,8 +181,8 @@ class NavigationDistillRunnerCfg(RslRlDistillationRunnerCfg):
         target_pose_to_vx_gain=1.0,
         target_pose_to_vy_gain=1.0,
         target_pose_to_yaw_gain=1.0,
-        side_guidance_lateral_gain=0.5,
-        side_guidance_yaw_gain=0.9,
+        side_guidance_lateral_gain=0.25,
+        side_guidance_yaw_gain=0.45,
         command_clip_xy=2.0,
         command_clip_yaw=2.0,
     )
@@ -264,8 +264,8 @@ class NavigationDistillRunnerCfg(RslRlDistillationRunnerCfg):
         representation_loss_weight=0.5,
         base_anchor_weight=0.1,
         yaw_loss_weight=0.1,
-        delta_norm_loss_weight=0.05,
-        delta_norm_margin=0.15,
+        delta_norm_loss_weight=0.15,
+        delta_norm_margin=0.10,
         near_waypoint_command_discount=0.5,
         near_waypoint_anchor_bonus=0.25,
         blocked_lateral_yaw_weight=1.0,

@@ -363,15 +363,20 @@ def local_goal_command_b(
     local_planner_lateral_penalty: float = 0.08,
     local_planner_min_improvement: float = 0.03,
     local_planner_max_blend: float = 1.0,
+    command_min_forward: float = 0.45,
+    command_max_lateral: float = 0.85,
+    command_max_heading: float = 0.9,
 ) -> torch.Tensor:
     """Return the current rolling local-waypoint command in the robot yaw frame.
 
     The command is a compact 3-vector:
-      [waypoint_x_b, waypoint_y_b, waypoint_heading_b]
+      [command_x_b, command_y_b, command_heading_b]
 
     It starts from the sampled world-frame start/goal task buffers, then the
     lightweight local planner can move the waypoint sideways when the straight
-    LiDAR corridor is blocked.
+    LiDAR corridor is blocked. The final observation is shaped to stay
+    forward-biased so the frozen locomotion controller is not driven by mostly
+    lateral or backward local subgoals.
     """
     robot = env.scene[robot_cfg.name]
     waypoint_pos_w, waypoint_heading_w = _compute_navigation_waypoint_world(
@@ -396,7 +401,23 @@ def local_goal_command_b(
     target_vec_w = waypoint_pos_w - robot.data.root_pos_w[:, :3]
     target_vec_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), target_vec_w)
     heading_b = wrap_to_pi(waypoint_heading_w - robot.data.heading_w)
-    return torch.cat((target_vec_b[:, :2], heading_b.unsqueeze(1)), dim=-1)
+
+    _ensure_navigation_goal_buffers(env)
+    remaining_goal_distance = torch.norm(env._go2w_goal_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=1)
+    near_goal = remaining_goal_distance <= goal_snap_distance
+
+    raw_xy_b = target_vec_b[:, :2]
+    command_x = torch.where(
+        near_goal,
+        raw_xy_b[:, 0],
+        raw_xy_b[:, 0].clamp(min=command_min_forward, max=lookahead_distance),
+    )
+    command_y = raw_xy_b[:, 1].clamp(min=-command_max_lateral, max=command_max_lateral)
+    shaped_heading = torch.atan2(raw_xy_b[:, 1], raw_xy_b[:, 0])
+    command_heading = torch.where(near_goal, heading_b, shaped_heading)
+    command_heading = command_heading.clamp(min=-command_max_heading, max=command_max_heading)
+
+    return torch.stack((command_x, command_y, command_heading), dim=-1)
 
 
 def goal_position_w(env: ManagerBasedRLEnv) -> torch.Tensor:
