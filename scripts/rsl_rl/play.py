@@ -146,6 +146,20 @@ parser.add_argument(
     default=False,
     help="Skip JIT/ONNX policy export before play/eval.",
 )
+parser.add_argument(
+    "--teacher_steering",
+    "--teacher-steering",
+    dest="teacher_steering",
+    action="store_true",
+    default=False,
+    help="Run the rule-based navigation teacher directly instead of loading a student checkpoint.",
+)
+parser.add_argument(
+    "--locomotion_checkpoint",
+    type=str,
+    default=None,
+    help="Flat locomotion checkpoint used to initialize the teacher frozen LLC in --teacher_steering mode.",
+)
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -175,6 +189,7 @@ installed_version = metadata.version("rsl-rl-lib")
 """Rest everything follows."""
 
 from collections import defaultdict
+import copy
 import os
 import time
 
@@ -191,6 +206,7 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
+from rsl_rl.utils import resolve_callable
 
 from isaaclab_rl.rsl_rl import (
     RslRlBaseRunnerCfg,
@@ -221,6 +237,79 @@ SCENARIO_TEMPLATE_NAMES = {
     8: "narrow_gap",
     9: "random_fallback",
 }
+
+
+def _find_state_dict(ckpt: dict, candidates: tuple[str, ...], label: str) -> tuple[str, dict]:
+    """Return the first matching state dict from a checkpoint."""
+    for key in candidates:
+        if key in ckpt and isinstance(ckpt[key], dict):
+            return key, ckpt[key]
+    raise ValueError(f"No {label} state dict found. Keys found: {list(ckpt.keys())}")
+
+
+def _load_padded_state_dict(model, src_sd: dict, device: str, label: str, strip_distribution: bool = False) -> None:
+    """Load a state dict, zero-padding first-layer inputs when obs dims grow."""
+    src_sd = {key: value.to(device) for key, value in src_sd.items()}
+    if strip_distribution:
+        src_sd = {key: value for key, value in src_sd.items() if not key.startswith("distribution.")}
+
+    current_sd = model.state_dict()
+    new_sd = {}
+    for key, target in current_sd.items():
+        if key not in src_sd:
+            new_sd[key] = target
+            continue
+
+        source = src_sd[key]
+        if source.shape == target.shape:
+            new_sd[key] = source
+        elif len(source.shape) == 2 and source.shape[0] == target.shape[0] and source.shape[1] < target.shape[1]:
+            pad = torch.zeros(source.shape[0], target.shape[1] - source.shape[1], dtype=source.dtype, device=device)
+            new_sd[key] = torch.cat([source, pad], dim=1)
+            print(f"[INFO] Zero-padded {label} '{key}': {tuple(source.shape)} -> {tuple(new_sd[key].shape)}")
+        else:
+            print(
+                f"[WARN] Shape mismatch in {label} '{key}': "
+                f"src={tuple(source.shape)}, tgt={tuple(target.shape)}; keeping current init"
+            )
+            new_sd[key] = target
+
+    model.load_state_dict(new_sd)
+
+
+def _load_teacher_locomotion_checkpoint(teacher, ckpt_path: str, device: str) -> None:
+    """Initialize the teacher frozen LLC from a flat locomotion checkpoint."""
+    frozen_actor = getattr(teacher, "frozen_actor", None)
+    if frozen_actor is None:
+        raise ValueError("--teacher_steering requires a teacher with a frozen_actor.")
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    actor_key, actor_sd = _find_state_dict(
+        ckpt,
+        ("actor_state_dict", "model_state_dict", "policy_state_dict"),
+        "actor",
+    )
+    _load_padded_state_dict(frozen_actor, actor_sd, device, "teacher frozen actor", strip_distribution=True)
+    print(f"[INFO] Loaded teacher frozen LLC from '{actor_key}' in: {ckpt_path}")
+
+
+def _build_teacher_policy(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
+    """Instantiate the rule-based navigation teacher for direct play/evaluation."""
+    teacher_cfg = getattr(agent_cfg, "teacher", None)
+    if teacher_cfg is None:
+        raise ValueError("--teacher_steering requires a distillation runner config with a teacher model.")
+    if "teacher" not in obs:
+        raise ValueError("--teacher_steering requires an env exposing the 'teacher' observation group.")
+    if args_cli.locomotion_checkpoint is None:
+        raise ValueError("--teacher_steering requires --locomotion_checkpoint for the frozen LLC.")
+
+    teacher_cfg_dict = copy.deepcopy(teacher_cfg.to_dict())
+    teacher_class = resolve_callable(teacher_cfg_dict.pop("class_name"))
+    teacher = teacher_class(obs, {"teacher": ["teacher"]}, "teacher", env.num_actions, **teacher_cfg_dict)
+    teacher = teacher.to(device)
+    teacher.eval()
+    _load_teacher_locomotion_checkpoint(teacher, args_cli.locomotion_checkpoint, device)
+    return teacher
 
 
 def _override_play_obstacle_count(
@@ -481,17 +570,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.use_pretrained_checkpoint:
+    resume_path = None
+    if args_cli.teacher_steering:
+        log_dir = os.path.join(log_root_path, "teacher_play")
+    elif args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
         if not resume_path:
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
             return
+        log_dir = os.path.dirname(resume_path)
     elif args_cli.checkpoint:
         resume_path = retrieve_file_path(args_cli.checkpoint)
+        log_dir = os.path.dirname(resume_path)
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-
-    log_dir = os.path.dirname(resume_path)
+        log_dir = os.path.dirname(resume_path)
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
@@ -518,52 +611,58 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # load previously trained model
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
-
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-
-    # export the trained policy to JIT and ONNX formats
-    if args_cli.disable_export or agent_cfg.class_name == "DistillationRunner":
-        print("[INFO] Skipping policy export before play/eval.")
-    else:
-        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-
-        if version.parse(installed_version) >= version.parse("4.0.0"):
-            # use the new export functions for rsl-rl >= 4.0.0
-            runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
-            runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
-        else:
-            # extract the neural network for rsl-rl < 4.0.0
-            if version.parse(installed_version) >= version.parse("2.3.0"):
-                policy_nn = runner.alg.policy
-            else:
-                policy_nn = runner.alg.actor_critic
-
-            # extract the normalizer
-            if hasattr(policy_nn, "actor_obs_normalizer"):
-                normalizer = policy_nn.actor_obs_normalizer
-            elif hasattr(policy_nn, "student_obs_normalizer"):
-                normalizer = policy_nn.student_obs_normalizer
-            else:
-                normalizer = None
-
-            # export to JIT and ONNX
-            export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-            export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
-
     dt = env.unwrapped.step_dt
 
     # reset environment
     obs = env.get_observations()
+    teacher = None
+    policy_nn = None
+    if args_cli.teacher_steering:
+        teacher = _build_teacher_policy(env, obs, agent_cfg, env.unwrapped.device)
+        print("[INFO] Running direct teacher steering: geometric navigation teacher + frozen LLC")
+    else:
+        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+        # load previously trained model
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        runner.load(resume_path)
+
+        # obtain the trained policy for inference
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
+
+        # export the trained policy to JIT and ONNX formats
+        if args_cli.disable_export or agent_cfg.class_name == "DistillationRunner":
+            print("[INFO] Skipping policy export before play/eval.")
+        else:
+            export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+
+            if version.parse(installed_version) >= version.parse("4.0.0"):
+                # use the new export functions for rsl-rl >= 4.0.0
+                runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
+                runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
+            else:
+                # extract the neural network for rsl-rl < 4.0.0
+                if version.parse(installed_version) >= version.parse("2.3.0"):
+                    policy_nn = runner.alg.policy
+                else:
+                    policy_nn = runner.alg.actor_critic
+
+                # extract the normalizer
+                if hasattr(policy_nn, "actor_obs_normalizer"):
+                    normalizer = policy_nn.actor_obs_normalizer
+                elif hasattr(policy_nn, "student_obs_normalizer"):
+                    normalizer = policy_nn.student_obs_normalizer
+                else:
+                    normalizer = None
+
+                # export to JIT and ONNX
+                export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+                export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+
     timestep = 0
     step_count = 0
     episode_lengths = torch.zeros(env.unwrapped.num_envs, device=env.unwrapped.device, dtype=torch.long)
@@ -579,11 +678,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            actions = policy(obs)
+            actions = teacher(obs) if teacher is not None else policy(obs)
             # env stepping
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
-            if version.parse(installed_version) >= version.parse("4.0.0"):
+            if teacher is not None:
+                teacher.reset(dones.bool())
+            elif version.parse(installed_version) >= version.parse("4.0.0"):
                 policy.reset(dones)
             else:
                 policy_nn.reset(dones)
