@@ -56,25 +56,49 @@ gym.register(
 )
 
 # =============================================================================
-# Local navigation command distillation (teacher privileged, student LiDAR)
+# RL navigation teacher (PPO, proprio + obstacle positions)
 # =============================================================================
 
 gym.register(
-    id="Navigation-Distill-Go2w-v0",
+    id="Nav-Teacher-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavigationDistillEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavigationDistillRunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavTeacherEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
     },
 )
 
 gym.register(
-    id="Navigation-Distill-Go2w-Play-v0",
+    id="Nav-Teacher-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavigationDistillEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavigationDistillRunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavTeacherEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
+    },
+)
+
+# =============================================================================
+# RL navigation distillation (teacher privileged + obstacle, student LiDAR)
+# =============================================================================
+
+gym.register(
+    id="Navigation-RL-Distill-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavRLDistillEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-RL-Distill-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavRLDistillEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavRLDistillRunnerCfg",
     },
 )

@@ -40,18 +40,3 @@ GOAL_COMMAND_START = GOAL_COMMAND.start
 GOAL_COMMAND_DIM = GOAL_COMMAND.dim
 PRIVILEGED_OBSTACLE_START = POLICY_OBS["actions"].stop
 
-DEBUG_OBS = {
-    "root_position_w": ObsSlice(0, 3),
-    "base_lin_vel": ObsSlice(3, 6),
-    "base_ang_vel": ObsSlice(6, 9),
-    "goal_command": ObsSlice(9, 12),
-    "joint_pos": ObsSlice(12, 28),
-    "joint_vel": ObsSlice(28, 44),
-    "actions": ObsSlice(44, 60),
-    "start_position_w": ObsSlice(60, 63),
-    "waypoint_position_w": ObsSlice(63, 66),
-    "goal_position_w": ObsSlice(66, 69),
-    "scenario_template_code": ObsSlice(69, 70),
-}
-
-DEBUG_OBSTACLE_START = DEBUG_OBS["scenario_template_code"].stop

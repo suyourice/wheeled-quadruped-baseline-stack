@@ -122,6 +122,64 @@ def obstacle_positions_rel(
     return rel_positions.flatten(start_dim=1)  # (N, num_obstacles * 2)
 
 
+def obstacle_polar_depth(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    num_bins: int = 180,
+    max_distance: float = 20.0,
+) -> torch.Tensor:
+    """Convert privileged obstacle positions to a 180-bin polar closeness map.
+
+    Encodes the same format as :func:`lidar_distances` (close=1, far/empty=0)
+    so teacher (uses this) and student (uses lidar_distances) can be trained
+    with direct MSE loss without any bridging transform.
+
+    Each bin covers 360°/num_bins (default 2°). For each bin, the minimum
+    distance among obstacles whose yaw-frame bearing falls in that bin is used.
+    Inactive obstacles parked at ≫max_distance contribute 0 closeness via
+    the clamp and do not pollute occupied bins.
+
+    Args:
+        obstacle_names: List of scene entity names for the obstacle rigid bodies.
+        robot_cfg: SceneEntityCfg identifying the robot.
+        num_bins: Angular resolution (default 180 → 2° per bin).
+        max_distance: Normalization distance; obstacles beyond this map to 0.
+
+    Returns:
+        Tensor of shape (num_envs, num_bins) with values in [0, 1].
+    """
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, num_bins, device=env.device)
+
+    robot = env.scene[robot_cfg.name]
+    robot_pos_w = robot.data.root_pos_w[:, :3]  # (N, 3)
+    robot_yaw_quat_w = yaw_quat(robot.data.root_quat_w)  # (N, 4)
+
+    rel_positions = []
+    for name in obstacle_names:
+        obstacle: RigidObject = env.scene[name]
+        obs_pos_w = obstacle.data.root_pos_w[:, :3]  # (N, 3)
+        rel_pos_w = obs_pos_w - robot_pos_w  # (N, 3)
+        rel_pos_b = quat_apply_inverse(robot_yaw_quat_w, rel_pos_w)  # (N, 3)
+        rel_positions.append(rel_pos_b[:, :2])  # (N, 2) x, y only
+
+    rel_xy = torch.stack(rel_positions, dim=1)  # (N, K, 2)
+    dists = torch.norm(rel_xy, dim=-1)  # (N, K)
+
+    # Map bearing angle → bin index [0, num_bins)
+    angles = torch.atan2(rel_xy[..., 1], rel_xy[..., 0])  # (N, K), range [-π, π]
+    bin_idx = ((angles + torch.pi) / (2.0 * torch.pi) * num_bins).long().clamp(0, num_bins - 1)
+
+    # Start with max_distance in every bin (= no obstacle = closeness 0)
+    dist_map = torch.full((env.num_envs, num_bins), max_distance, device=env.device)
+
+    # Scatter minimum distance per bin; inactive obstacles at 1000m stay ≫max_distance
+    dist_map.scatter_reduce_(1, bin_idx, dists, reduce="amin", include_self=True)
+
+    return (1.0 - dist_map / max_distance).clamp(0.0, 1.0)
+
+
 def root_position_w(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -470,198 +528,3 @@ def start_position_w(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return the sampled episode start pose origin in world coordinates."""
     _ensure_navigation_goal_buffers(env)
     return env._go2w_start_pos_w
-
-
-def navigation_scenario_code(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the current scenario template code for debugging.
-
-    Codes are assigned during obstacle reset and identify the dominant encounter
-    family for an episode:
-      0 empty, 1 head_on, 2 left_edge, 3 right_edge, 4 diag_left,
-      5 diag_right, 6 off_left, 7 off_right, 8 narrow_gap, 9 random_fallback.
-    """
-    _ensure_navigation_goal_buffers(env)
-    return env._go2w_scenario_template_id.to(dtype=torch.float32).unsqueeze(-1)
-
-
-def lidar_steering_features(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg,
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    command_name: str = "base_velocity",
-    max_distance: float = 20.0,
-    close_distance: float = 2.5,
-    min_hit_height: float = -0.15,
-    min_forward_distance: float = 0.1,
-    min_command_speed: float = 0.15,
-    front_center_half_angle_deg: float = 20.0,
-    front_side_inner_angle_deg: float = 10.0,
-    front_side_outer_angle_deg: float = 60.0,
-    side_inner_angle_deg: float = 60.0,
-    side_outer_angle_deg: float = 120.0,
-    corridor_forward_distance: float = 2.8,
-    corridor_half_width: float = 0.75,
-    detour_lane_outer_width: float = 1.6,
-) -> torch.Tensor:
-    """Summarize LiDAR geometry into compact steering-friendly sector features.
-
-    The student already receives the full raw scan. This term adds a compact set of
-    local geometry summaries that are easier to map to avoidance decisions:
-      - closeness in front-left / front-center / front-right / left / right sectors
-      - close-hit ratios in the three front sectors
-      - command-aligned corridor blockage and side-lane openness summaries
-
-    Features are derived from LiDAR hit geometry in the robot yaw frame rather
-    than from privileged obstacle positions, so the representation stays
-    perception-based and sim2real-friendly.
-    """
-    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
-    robot = env.scene[robot_cfg.name]
-
-    hit_positions = sensor.data.ray_hits_w
-    sensor_pos = sensor.data.pos_w
-    rel_hit_w = hit_positions - sensor_pos.unsqueeze(1)
-    finite_hits = torch.isfinite(rel_hit_w).all(dim=-1)
-    safe_rel_hit_w = torch.where(finite_hits.unsqueeze(-1), rel_hit_w, torch.zeros_like(rel_hit_w))
-
-    num_envs, num_rays, _ = safe_rel_hit_w.shape
-    rel_hit_yaw = quat_apply_inverse(
-        yaw_quat(robot.data.root_quat_w).unsqueeze(1).expand(-1, num_rays, -1).reshape(-1, 4),
-        safe_rel_hit_w.reshape(-1, 3),
-    ).view(num_envs, num_rays, 3)
-
-    planar_xy = rel_hit_yaw[..., :2]
-    planar_dist = torch.norm(planar_xy, dim=-1)
-    bearing = torch.atan2(planar_xy[..., 1], planar_xy[..., 0])
-
-    if command_name == "local_goal":
-        command_xy = local_goal_command_b(env, robot_cfg=robot_cfg, use_lidar_refinement=False)[:, :2]
-    else:
-        command_xy = env.command_manager.get_command(command_name)[:, :2]
-    command_speed = torch.norm(command_xy, dim=-1, keepdim=True)
-    default_dir = torch.zeros_like(command_xy)
-    default_dir[:, 0] = 1.0
-    cmd_dir = torch.where(
-        command_speed > min_command_speed,
-        command_xy / command_speed.clamp(min=1.0e-6),
-        default_dir,
-    )
-    left_dir = torch.stack((-cmd_dir[:, 1], cmd_dir[:, 0]), dim=-1)
-    cmd_forward = (planar_xy * cmd_dir.unsqueeze(1)).sum(dim=-1)
-    cmd_lateral = (planar_xy * left_dir.unsqueeze(1)).sum(dim=-1)
-
-    # Ignore rays that effectively report "no obstacle nearby" and suppress
-    # obvious ground returns from the lower ring by requiring a minimum hit height.
-    valid = (
-        finite_hits
-        & (planar_dist > 1.0e-4)
-        & (planar_dist < (max_distance - 1.0e-4))
-        & (rel_hit_yaw[..., 2] > min_hit_height)
-    )
-
-    deg = torch.pi / 180.0
-    front_center_half_angle = front_center_half_angle_deg * deg
-    front_side_inner_angle = front_side_inner_angle_deg * deg
-    front_side_outer_angle = front_side_outer_angle_deg * deg
-    side_inner_angle = side_inner_angle_deg * deg
-    side_outer_angle = side_outer_angle_deg * deg
-
-    is_forward = planar_xy[..., 0] > min_forward_distance
-    abs_bearing = bearing.abs()
-
-    sector_masks = (
-        valid & is_forward & (bearing >= front_side_inner_angle) & (bearing <= front_side_outer_angle),   # front-left
-        valid & is_forward & (abs_bearing <= front_center_half_angle),                                     # front-center
-        valid & is_forward & (bearing <= -front_side_inner_angle) & (bearing >= -front_side_outer_angle), # front-right
-        valid & (bearing >= side_inner_angle) & (bearing <= side_outer_angle),                             # left
-        valid & (bearing <= -side_inner_angle) & (bearing >= -side_outer_angle),                           # right
-    )
-
-    def _masked_min_distance(mask: torch.Tensor) -> torch.Tensor:
-        masked_dist = torch.where(mask, planar_dist, torch.full_like(planar_dist, max_distance))
-        return masked_dist.amin(dim=1)
-
-    def _close_ratio(mask: torch.Tensor) -> torch.Tensor:
-        count = mask.sum(dim=1).float()
-        close_hits = (mask & (planar_dist <= close_distance)).sum(dim=1).float()
-        return torch.where(count > 0.0, close_hits / count.clamp(min=1.0), torch.zeros_like(count))
-
-    sector_min_dist = [_masked_min_distance(mask) for mask in sector_masks]
-    sector_closeness = [1.0 - (dist / max_distance).clamp(0.0, 1.0) for dist in sector_min_dist]
-
-    front_close_ratios = [_close_ratio(mask) for mask in sector_masks[:3]]
-
-    corridor_forward_score = ((corridor_forward_distance - cmd_forward) / corridor_forward_distance).clamp(0.0, 1.0)
-
-    center_lateral_score = ((corridor_half_width - cmd_lateral.abs()) / corridor_half_width).clamp(0.0, 1.0)
-    left_lateral_score = ((corridor_half_width - cmd_lateral) / corridor_half_width).clamp(0.0, 1.0)
-    right_lateral_score = ((corridor_half_width + cmd_lateral) / corridor_half_width).clamp(0.0, 1.0)
-
-    center_corridor_score = (
-        valid
-        & (cmd_forward > min_forward_distance)
-        & (cmd_forward < corridor_forward_distance)
-        & (cmd_lateral.abs() <= corridor_half_width)
-    ).float() * corridor_forward_score * center_lateral_score
-    left_corridor_score = (
-        valid
-        & (cmd_forward > min_forward_distance)
-        & (cmd_forward < corridor_forward_distance)
-        & (cmd_lateral >= 0.0)
-        & (cmd_lateral <= corridor_half_width)
-    ).float() * corridor_forward_score * left_lateral_score
-    right_corridor_score = (
-        valid
-        & (cmd_forward > min_forward_distance)
-        & (cmd_forward < corridor_forward_distance)
-        & (cmd_lateral <= 0.0)
-        & (-cmd_lateral <= corridor_half_width)
-    ).float() * corridor_forward_score * right_lateral_score
-
-    center_corridor_blockage = center_corridor_score.amax(dim=1)
-    left_corridor_blockage = left_corridor_score.amax(dim=1)
-    right_corridor_blockage = right_corridor_score.amax(dim=1)
-
-    side_lane_inner = corridor_half_width
-    side_lane_outer = detour_lane_outer_width
-
-    def _lane_openness(mask: torch.Tensor) -> torch.Tensor:
-        lane_min_dist = _masked_min_distance(mask)
-        return (lane_min_dist / max_distance).clamp(0.0, 1.0)
-
-    left_lane_mask = (
-        valid
-        & (cmd_forward > min_forward_distance)
-        & (cmd_forward < corridor_forward_distance)
-        & (cmd_lateral >= side_lane_inner)
-        & (cmd_lateral <= side_lane_outer)
-    )
-    right_lane_mask = (
-        valid
-        & (cmd_forward > min_forward_distance)
-        & (cmd_forward < corridor_forward_distance)
-        & (cmd_lateral <= -side_lane_inner)
-        & (cmd_lateral >= -side_lane_outer)
-    )
-
-    left_lane_open = _lane_openness(left_lane_mask)
-    right_lane_open = _lane_openness(right_lane_mask)
-
-    weighted_side = (center_corridor_score * cmd_lateral).sum(dim=1) / (
-        center_corridor_score.sum(dim=1) + 1.0e-6
-    )
-    weighted_side = (weighted_side / corridor_half_width).clamp(-1.0, 1.0)
-
-    return torch.stack(
-        (
-            *sector_closeness,
-            *front_close_ratios,
-            center_corridor_blockage,
-            left_corridor_blockage,
-            right_corridor_blockage,
-            left_lane_open,
-            right_lane_open,
-            weighted_side,
-        ),
-        dim=-1,
-    )
