@@ -27,30 +27,18 @@ Usage examples:
     # Stand still
     python scripts/rsl_rl/play_cmd.py --task Flat-Go2w-Play-v0
 
-    # Evaluate the rule-based navigation-distillation teacher directly
+    # Evaluate the RL navigation teacher
     python scripts/rsl_rl/play_cmd.py \
-        --task Navigation-Distill-Go2w-Play-v0 \
-        --teacher_steering \
-        --locomotion_checkpoint logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt \
+        --task Nav-Teacher-Go2w-Play-v0 \
+        --checkpoint <path> \
         --cmd_vx 1.0 \
-        --num_obstacles 2
+        --num_obstacles 5
 
-    # Evaluate the rule-based navigation-distillation teacher on random commands
+    # Evaluate the LiDAR distillation student
     python scripts/rsl_rl/play_cmd.py \
-        --task Navigation-Distill-Go2w-Play-v0 \
-        --teacher_steering \
-        --random_commands \
-        --locomotion_checkpoint logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt \
-        --num_obstacles 2
-
-    # Spawn two obstacles directly ahead of the commanded motion ray
-    python scripts/rsl_rl/play_cmd.py \
-        --task Navigation-Distill-Go2w-Play-v0 \
-        --teacher_steering \
-        --locomotion_checkpoint logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt \
-        --cmd_vx 0.8 --cmd_vy -0.6 \
-        --num_obstacles 3 \
-        --command_path_obstacles 2
+        --task Navigation-RL-Distill-Go2w-Play-v0 \
+        --checkpoint <path> \
+        --num_obstacles 5
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -235,6 +223,22 @@ def _load_teacher_locomotion_checkpoint(teacher, ckpt_path: str, device: str) ->
     print(f"[INFO] Loaded teacher frozen LLC from '{actor_key}' in: {ckpt_path}")
 
 
+def _configure_frozen_llc_action(env_cfg, ckpt_path: str | None) -> bool:
+    """Inject the fast-flat LLC checkpoint into HLC action configs before env creation."""
+    actions_cfg = getattr(env_cfg, "actions", None)
+    llc_cmd_cfg = getattr(actions_cfg, "llc_cmd", None)
+    if llc_cmd_cfg is None:
+        return False
+    if not ckpt_path:
+        raise ValueError(
+            f"Task '{args_cli.task}' uses FrozenLLCActionTerm and requires --locomotion_checkpoint "
+            "before gym.make() so the frozen fast-flat LLC can be loaded."
+        )
+    llc_cmd_cfg.llc_checkpoint_path = ckpt_path
+    print(f"[INFO] Frozen LLC checkpoint injected into action term: {ckpt_path}")
+    return True
+
+
 def _override_play_obstacle_count(env_cfg, num_obstacles):
     """Override active obstacle count for obstacle play configs."""
     if num_obstacles is None:
@@ -327,7 +331,7 @@ def _build_teacher_policy(env, obs, agent_cfg, device: str):
     if "teacher" not in obs.keys():
         raise ValueError(
             "--teacher_steering requires an environment exposing a 'teacher' observation group. "
-            "Use a distillation play task such as Navigation-Distill-Go2w-Play-v0."
+            "Use a distillation play task such as Navigation-RL-Distill-Go2w-Play-v0."
         )
     if args_cli.locomotion_checkpoint is None:
         raise ValueError("--teacher_steering requires --locomotion_checkpoint for the frozen LLC.")
@@ -455,6 +459,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         print(f"[INFO] Loading checkpoint: {resume_path}")
         log_dir = os.path.dirname(resume_path)
         env_cfg.log_dir = log_dir
+
+    _configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint)
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)

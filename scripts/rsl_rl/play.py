@@ -222,21 +222,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import go2w.tasks  # noqa: F401
-from go2w.tasks.manager_based.go2w.observation_layout import DEBUG_OBS, DEBUG_OBSTACLE_START
-
-
-SCENARIO_TEMPLATE_NAMES = {
-    0: "empty",
-    1: "head_on",
-    2: "left_edge",
-    3: "right_edge",
-    4: "diag_left",
-    5: "diag_right",
-    6: "off_left",
-    7: "off_right",
-    8: "narrow_gap",
-    9: "random_fallback",
-}
+from go2w.tasks.manager_based.go2w.observation_layout import POLICY_OBS
 
 
 def _find_state_dict(ckpt: dict, candidates: tuple[str, ...], label: str) -> tuple[str, dict]:
@@ -291,6 +277,22 @@ def _load_teacher_locomotion_checkpoint(teacher, ckpt_path: str, device: str) ->
     )
     _load_padded_state_dict(frozen_actor, actor_sd, device, "teacher frozen actor", strip_distribution=True)
     print(f"[INFO] Loaded teacher frozen LLC from '{actor_key}' in: {ckpt_path}")
+
+
+def _configure_frozen_llc_action(env_cfg, ckpt_path: str | None) -> bool:
+    """Inject the fast-flat LLC checkpoint into HLC action configs before env creation."""
+    actions_cfg = getattr(env_cfg, "actions", None)
+    llc_cmd_cfg = getattr(actions_cfg, "llc_cmd", None)
+    if llc_cmd_cfg is None:
+        return False
+    if not ckpt_path:
+        raise ValueError(
+            f"Task '{args_cli.task}' uses FrozenLLCActionTerm and requires --locomotion_checkpoint "
+            "before gym.make() so the frozen fast-flat LLC can be loaded."
+        )
+    llc_cmd_cfg.llc_checkpoint_path = ckpt_path
+    print(f"[INFO] Frozen LLC checkpoint injected into action term: {ckpt_path}")
+    return True
 
 
 def _build_teacher_policy(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
@@ -491,46 +493,37 @@ def _format_eval_metrics(metrics: dict[str, float], completed_episodes: int, avg
 
 
 def _print_navigation_play_log(obs, dones: torch.Tensor, step_count: int, env_index: int) -> None:
-    if not isinstance(obs, dict) or "debug" not in obs:
+    """Print navigation task diagnostics from the policy obs group."""
+    # Works for both PPO (policy group) and distillation (student/teacher groups).
+    group_key = "policy" if isinstance(obs, dict) and "policy" in obs else None
+    if group_key is None and isinstance(obs, dict) and "student" in obs:
+        group_key = "student"
+    if group_key is None:
         return
-    debug = obs["debug"]
-    if debug.ndim != 2 or debug.shape[0] == 0:
+    data = obs[group_key]
+    if data.ndim != 2 or data.shape[0] == 0:
         return
-    env_index = max(0, min(env_index, debug.shape[0] - 1))
-    row = debug[env_index]
+    env_index = max(0, min(env_index, data.shape[0] - 1))
+    row = data[env_index]
 
-    root_pos = row[DEBUG_OBS["root_position_w"].as_slice()]
-    base_lin_vel = row[DEBUG_OBS["base_lin_vel"].as_slice()]
-    base_ang_vel = row[DEBUG_OBS["base_ang_vel"].as_slice()]
-    goal_command = row[DEBUG_OBS["goal_command"].as_slice()]
-    start_pos = row[DEBUG_OBS["start_position_w"].as_slice()]
-    waypoint_pos = row[DEBUG_OBS["waypoint_position_w"].as_slice()]
-    goal_pos = row[DEBUG_OBS["goal_position_w"].as_slice()]
-    scenario_code = int(row[DEBUG_OBS["scenario_template_code"].as_slice()].item())
-    scenario_name = SCENARIO_TEMPLATE_NAMES.get(scenario_code, "unknown")
-
-    waypoint_delta = waypoint_pos - root_pos
-    goal_delta = goal_pos - root_pos
-    obstacle_positions = row[DEBUG_OBSTACLE_START:].view(-1, 2)
-    obstacle_positions = obstacle_positions[obstacle_positions.norm(dim=-1) > 1.0e-6][:8]
-    obstacles = ", ".join(f"({xy[0].item():+.2f},{xy[1].item():+.2f})" for xy in obstacle_positions)
+    if row.numel() == 189:
+        base_lin_vel = row[0:3]
+        projected_gravity = row[3:6]
+        goal_command = row[6:9]
+        state_text = f"projected_gravity=[{_format_vector(projected_gravity)}]"
+    else:
+        base_lin_vel = row[POLICY_OBS["base_lin_vel"].as_slice()]
+        base_ang_vel = row[POLICY_OBS["base_ang_vel"].as_slice()]
+        goal_command = row[POLICY_OBS["goal_command"].as_slice()]
+        state_text = f"base_ang_vel=[{_format_vector(base_ang_vel)}]"
     done = int(dones[env_index].item()) if dones.numel() > env_index else 0
 
     print(
         "[nav-play] "
-        f"step={step_count} env={env_index} done={done} scenario={scenario_name} "
-        f"root=[{_format_vector(root_pos)}] "
-        f"start=[{_format_vector(start_pos)}] "
-        f"waypoint=[{_format_vector(waypoint_pos)}] "
-        f"goal=[{_format_vector(goal_pos)}] "
-        f"waypoint_cmd=[{_format_vector(goal_command)}] "
-        f"waypoint_delta=[{_format_vector(waypoint_delta)}] "
-        f"waypoint_dist={waypoint_delta[:2].norm().item():.3f} "
-        f"goal_delta=[{_format_vector(goal_delta)}] "
-        f"goal_dist={goal_delta[:2].norm().item():.3f} "
+        f"step={step_count} env={env_index} done={done} "
+        f"goal_cmd=[{_format_vector(goal_command)}] "
         f"base_lin_vel=[{_format_vector(base_lin_vel)}] "
-        f"base_ang_vel=[{_format_vector(base_ang_vel)}] "
-        f"obstacles=[{obstacles}]"
+        f"{state_text}"
     )
 
 
@@ -588,6 +581,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+    _configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)

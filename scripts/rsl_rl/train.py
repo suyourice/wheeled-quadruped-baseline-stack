@@ -39,9 +39,8 @@ parser.add_argument(
 )
 parser.add_argument(
     "--locomotion_checkpoint", type=str, default=None,
-    help="Path to a pre-trained flat locomotion checkpoint. For PPO obstacle training, actor/critic first-layer "
-         "weights are zero-padded to match the obstacle env obs dimension (60D -> 90D). For obstacle distillation, "
-         "this initializes the frozen LLC inside the rule-based steering teacher.",
+    help="Path to a pre-trained fast-flat locomotion checkpoint. For HLC navigation tasks this is injected into "
+         "FrozenLLCActionTerm before env creation. Legacy obstacle tasks still use it for model warm-starts.",
 )
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
@@ -312,6 +311,22 @@ def _load_teacher_locomotion_checkpoint(teacher, ckpt_path: str, device: str) ->
     print(f"[INFO] Loaded standalone teacher frozen actor from '{actor_key}'")
 
 
+def _configure_frozen_llc_action(env_cfg, ckpt_path: str | None) -> bool:
+    """Inject the fast-flat LLC checkpoint into HLC action configs before env creation."""
+    actions_cfg = getattr(env_cfg, "actions", None)
+    llc_cmd_cfg = getattr(actions_cfg, "llc_cmd", None)
+    if llc_cmd_cfg is None:
+        return False
+    if not ckpt_path:
+        raise ValueError(
+            f"Task '{args_cli.task}' uses FrozenLLCActionTerm and requires --locomotion_checkpoint "
+            "before gym.make() so the frozen fast-flat LLC can be loaded."
+        )
+    llc_cmd_cfg.llc_checkpoint_path = ckpt_path
+    print(f"[INFO] Frozen LLC checkpoint injected into action term: {ckpt_path}")
+    return True
+
+
 def _build_teacher_for_eval(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
     """Instantiate the active distillation teacher for direct evaluation."""
     teacher_cfg = getattr(agent_cfg, "teacher", None)
@@ -472,6 +487,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+    uses_frozen_llc_action = _configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -522,8 +538,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
 
-    # Load flat locomotion checkpoint with obs-dim zero-padding (flat 60D → obstacle 90D)
-    if args_cli.locomotion_checkpoint is not None:
+    # Legacy PPO/distillation paths load locomotion weights into model modules.
+    # HLC navigation tasks load the same checkpoint inside FrozenLLCActionTerm before gym.make().
+    if args_cli.locomotion_checkpoint is not None and not uses_frozen_llc_action:
         if isinstance(runner, DistillationRunner):
             _load_distillation_teacher_locomotion_checkpoint(runner, args_cli.locomotion_checkpoint, agent_cfg.device)
         elif isinstance(runner, OnPolicyRunner):
