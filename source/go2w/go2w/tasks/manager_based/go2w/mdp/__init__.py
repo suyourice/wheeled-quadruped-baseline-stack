@@ -14,6 +14,7 @@ from isaaclab.envs.mdp import (
     JointPositionActionCfg,
     JointVelocityActionCfg,
 )
+from .actions import FrozenLLCActionTermCfg
 
 # -- Commands ------------------------------------------------------------------
 from isaaclab.envs.mdp import (
@@ -58,9 +59,8 @@ from isaaclab.envs.mdp import (
 from .observations import (
     goal_position_w,
     lidar_distances,
-    lidar_steering_features,
     local_goal_command_b,
-    navigation_scenario_code,
+    obstacle_polar_depth,
     obstacle_positions_rel,
     root_position_w,
     start_position_w,
@@ -75,15 +75,13 @@ from .rewards import (
     base_height_l2,
     goal_distance_tanh_reward,
     goal_heading_tanh_reward,
+    goal_progress_dense,
     goal_reached_bonus,
     goal_reached_termination,
     joint_deviation_l1_command_gated,
     joint_deviation_l1_curriculum,
-    obstacle_contact_termination,
     obstacle_contact_penalty,
-    obstacle_lateral_avoidance_reward,
-    obstacle_path_clearance_penalty,
-    obstacle_yaw_avoidance_reward,
+    obstacle_contact_termination,
     track_ang_vel_z_world_exp,
     track_lin_vel_xy_yaw_frame_exp,
     wheel_contact_penalty,
