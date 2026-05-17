@@ -3,7 +3,7 @@
 #SBATCH -p gpu
 #SBATCH --qos=default
 #SBATCH --gres=gpu:1
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --job-name=go2w_train
 #SBATCH --output=logs/slurm/%x_%j.out
 
