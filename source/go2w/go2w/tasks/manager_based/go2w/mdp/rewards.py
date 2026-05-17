@@ -11,6 +11,8 @@ They are adapted from the Dodo locomotion project (IsaacLab_Dodo).
 
 from __future__ import annotations
 
+import math
+import random
 from typing import TYPE_CHECKING
 
 import torch
@@ -329,3 +331,98 @@ def goal_reached_termination(
     """Terminate successful local-navigation episodes once the goal is reached."""
     goal_distance, heading_error = _goal_command_from_buffers(env, asset_cfg)
     return (goal_distance <= position_threshold) & (heading_error <= heading_threshold)
+
+
+def _resample_goal_positions_only(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    goal_forward_range: tuple[float, float],
+    goal_lateral_range: tuple[float, float],
+    goal_heading_jitter_range: tuple[float, float],
+    min_goal_distance: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Sample a new goal position for envs that just reached their goal.
+
+    Obstacles are NOT moved — only the goal buffer is updated so the
+    episode can continue toward a fresh target without a full reset.
+    """
+    _ensure_navigation_goal_buffers(env)
+    robot = env.scene[asset_cfg.name]
+
+    curr_pos_w = robot.data.root_pos_w[env_ids, :3].clone()
+    yaw_list = robot.data.heading_w[env_ids].cpu().tolist()
+
+    goal_pos_w = curr_pos_w.clone()
+    goal_heading_w = robot.data.heading_w[env_ids].clone()
+
+    for idx in range(len(env_ids)):
+        yaw_i = yaw_list[idx]
+        cos_yaw = math.cos(yaw_i)
+        sin_yaw = math.sin(yaw_i)
+
+        forward = goal_forward_range[0]
+        lateral = 0.0
+        for _ in range(50):
+            forward = random.uniform(*goal_forward_range)
+            lateral = random.uniform(*goal_lateral_range)
+            if math.hypot(forward, lateral) >= min_goal_distance:
+                break
+
+        goal_dx = forward * cos_yaw - lateral * sin_yaw
+        goal_dy = forward * sin_yaw + lateral * cos_yaw
+        goal_pos_w[idx, 0] += goal_dx
+        goal_pos_w[idx, 1] += goal_dy
+
+        path_heading = math.atan2(goal_dy, goal_dx)
+        jitter = random.uniform(*goal_heading_jitter_range)
+        goal_heading_w[idx] = math.atan2(
+            math.sin(path_heading + jitter),
+            math.cos(path_heading + jitter),
+        )
+
+    env._go2w_goal_pos_w[env_ids] = goal_pos_w
+    env._go2w_goal_heading_w[env_ids] = goal_heading_w
+
+
+def goal_reached_and_resample(
+    env: ManagerBasedRLEnv,
+    position_threshold: float = 0.35,
+    heading_threshold: float = 0.6,
+    goal_forward_range: tuple[float, float] = (2.5, 4.5),
+    goal_lateral_range: tuple[float, float] = (-1.5, 1.5),
+    goal_heading_jitter_range: tuple[float, float] = (-0.35, 0.35),
+    min_goal_distance: float = 2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Success bonus that immediately samples a new goal without ending the episode.
+
+    When the robot enters the goal zone, it receives a +1 reward (scaled by weight
+    in the config) and the goal is moved to a fresh position relative to the
+    robot's current pose.  Obstacles remain in place so the robot continues
+    navigating through the same cluttered environment.
+    """
+    if not hasattr(env, "_go2w_goals_reached_episode"):
+        env._go2w_goals_reached_episode = torch.zeros(env.num_envs, device=env.device)
+
+    goal_distance, heading_error = _goal_command_from_buffers(env, asset_cfg)
+    reached = (goal_distance <= position_threshold) & (heading_error <= heading_threshold)
+
+    env_ids = reached.nonzero(as_tuple=False).squeeze(-1)
+    if len(env_ids) > 0:
+        _resample_goal_positions_only(
+            env,
+            env_ids,
+            goal_forward_range,
+            goal_lateral_range,
+            goal_heading_jitter_range,
+            min_goal_distance,
+            asset_cfg,
+        )
+        env._go2w_goals_reached_episode[env_ids] += 1.0
+
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    env.extras["log"]["goals_per_episode"] = env._go2w_goals_reached_episode.mean()
+
+    return reached.float()

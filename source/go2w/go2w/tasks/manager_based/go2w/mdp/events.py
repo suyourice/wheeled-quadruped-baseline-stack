@@ -426,6 +426,8 @@ def reset_navigation_goals_and_obstacles(
         return
 
     _ensure_navigation_goal_buffers(env)
+    if hasattr(env, "_go2w_goals_reached_episode"):
+        env._go2w_goals_reached_episode[env_ids] = 0.0
 
     if max_obstacles is None:
         max_obstacles = len(obstacle_names)

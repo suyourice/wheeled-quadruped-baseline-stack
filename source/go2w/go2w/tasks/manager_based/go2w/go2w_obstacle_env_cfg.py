@@ -60,6 +60,7 @@ CURRICULUM_OBSTACLE_WARMUP_ITERATIONS = 1000
 CURRICULUM_COLLISION_WARMUP_ITERATIONS = 600
 CURRICULUM_SPEED_START_ITERATION = 0
 CURRICULUM_SPEED_WARMUP_ITERATIONS = 800
+NAV_CURRICULUM_COLLISION_START_ITERATION = 0
 OBSTACLE_MIN_SPAWN_DISTANCE_INITIAL = 2.2
 OBSTACLE_MIN_SPAWN_DISTANCE_FROM_ROBOT = 1.2
 OBSTACLE_WHEEL_VEL_SCALE = 28.0
@@ -300,12 +301,7 @@ class NavTeacherRewardsCfg:
     goal_progress = RewTerm(
         func=mdp.goal_progress_dense,
         weight=4.0,
-        params={"clip": 0.3},
-    )
-    goal_distance = RewTerm(
-        func=mdp.goal_distance_tanh_reward,
-        weight=2.0,
-        params={"std": NAV_GOAL_DISTANCE_STD},
+        params={"clip": 0.5},
     )
     goal_heading = RewTerm(
         func=mdp.goal_heading_tanh_reward,
@@ -313,11 +309,15 @@ class NavTeacherRewardsCfg:
         params={"std": NAV_GOAL_HEADING_STD},
     )
     goal_reached = RewTerm(
-        func=mdp.goal_reached_bonus,
-        weight=15.0,
+        func=mdp.goal_reached_and_resample,
+        weight=50.0,
         params={
             "position_threshold": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
             "heading_threshold": NAV_GOAL_SUCCESS_HEADING_THRESHOLD,
+            "goal_forward_range": NAV_GOAL_FORWARD_RANGE,
+            "goal_lateral_range": NAV_GOAL_LATERAL_RANGE,
+            "goal_heading_jitter_range": NAV_GOAL_HEADING_JITTER_RANGE,
+            "min_goal_distance": NAV_MIN_GOAL_DISTANCE,
         },
     )
 
@@ -328,7 +328,7 @@ class NavTeacherRewardsCfg:
         params={
             "sensor_cfg": SceneEntityCfg("obstacle_contacts"),
             "threshold": 1.0,
-            "start_iteration": 0,
+            "start_iteration": NAV_CURRICULUM_COLLISION_START_ITERATION,
             "warmup_iterations": CURRICULUM_COLLISION_WARMUP_ITERATIONS,
             "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
         },
@@ -380,7 +380,11 @@ class NavTeacherRewardsCfg:
     )
 
     # -- Termination -----------------------------------------------------------
-    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+    termination_penalty = RewTerm(
+        func=mdp.is_terminated_term,
+        weight=-200.0,
+        params={"term_keys": ["base_contact", "root_height_below_minimum"]},
+    )
 
 
 # =============================================================================
@@ -548,14 +552,9 @@ class Go2wNavTeacherEnvCfg(Go2wEnvCfg):
             "min_inter_obstacle_dist": 0.7,
         }
 
-        # Terminate on goal reached.
-        self.terminations.goal_reached = DoneTerm(
-            func=mdp.goal_reached_termination,
-            params={
-                "position_threshold": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
-                "heading_threshold": NAV_GOAL_SUCCESS_HEADING_THRESHOLD,
-            },
-        )
+        # Episode never terminates on goal reached — goal_reached_and_resample
+        # resamples the target in-place so navigation continues uninterrupted.
+        self.terminations.goal_reached = None
 
 
 @configclass
