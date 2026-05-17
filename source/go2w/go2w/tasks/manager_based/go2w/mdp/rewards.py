@@ -410,16 +410,24 @@ def goal_reached_and_resample(
 
     env_ids = reached.nonzero(as_tuple=False).squeeze(-1)
     if len(env_ids) > 0:
-        _resample_goal_positions_only(
-            env,
-            env_ids,
-            goal_forward_range,
-            goal_lateral_range,
-            goal_heading_jitter_range,
-            min_goal_distance,
-            asset_cfg,
-        )
-        env._go2w_goals_reached_episode[env_ids] += 1.0
+        if hasattr(env, "_nav_resample_on_goal"):
+            # Full resample: new goal + new obstacle layout around the robot's
+            # current position.  Save/restore the per-env goal counter so the
+            # reset function's zero-out doesn't erase in-episode progress.
+            saved = env._go2w_goals_reached_episode[env_ids].clone()
+            env._nav_resample_on_goal(env_ids)
+            env._go2w_goals_reached_episode[env_ids] = saved + 1.0
+        else:
+            _resample_goal_positions_only(
+                env,
+                env_ids,
+                goal_forward_range,
+                goal_lateral_range,
+                goal_heading_jitter_range,
+                min_goal_distance,
+                asset_cfg,
+            )
+            env._go2w_goals_reached_episode[env_ids] += 1.0
 
     if "log" not in env.extras:
         env.extras["log"] = {}

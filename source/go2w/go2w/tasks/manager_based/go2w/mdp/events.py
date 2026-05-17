@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import random
 from typing import TYPE_CHECKING
@@ -710,3 +711,41 @@ def reset_navigation_goals_and_obstacles(
         pose[:, 3] = 1.0
         obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
         obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+
+    # Store a callable so goal_reached_and_resample can trigger a full
+    # obstacle+goal resample in-place (no episode reset required).
+    env._nav_resample_on_goal = functools.partial(
+        reset_navigation_goals_and_obstacles,
+        env,
+        obstacle_names=obstacle_names,
+        min_obstacles=min_obstacles,
+        max_obstacles=max_obstacles,
+        empty_env_fraction=0.0,
+        spawn_range_x=spawn_range_x,
+        spawn_range_y=spawn_range_y,
+        obstacle_z=obstacle_z,
+        min_inter_obstacle_dist=min_inter_obstacle_dist,
+        goal_forward_range=goal_forward_range,
+        goal_lateral_range=goal_lateral_range,
+        goal_heading_jitter_range=goal_heading_jitter_range,
+        min_goal_distance=min_goal_distance,
+        start_exclusion_radius=start_exclusion_radius,
+        goal_exclusion_radius=goal_exclusion_radius,
+        head_on_progress_range=head_on_progress_range,
+        head_on_lateral_range=head_on_lateral_range,
+        edge_progress_range=edge_progress_range,
+        edge_lateral_range=edge_lateral_range,
+        diagonal_progress_range=diagonal_progress_range,
+        diagonal_lateral_range=diagonal_lateral_range,
+        offpath_progress_range=offpath_progress_range,
+        offpath_lateral_range=offpath_lateral_range,
+        narrow_gap_progress_range=narrow_gap_progress_range,
+        narrow_gap_center_lateral_range=narrow_gap_center_lateral_range,
+        narrow_gap_half_width_range=narrow_gap_half_width_range,
+        narrow_gap_probability=narrow_gap_probability,
+        fixed_goal_forward=fixed_goal_forward,
+        fixed_goal_lateral=fixed_goal_lateral,
+        fixed_goal_heading_jitter=fixed_goal_heading_jitter,
+        fixed_scenario_template=fixed_scenario_template,
+        park_distance=park_distance,
+    )
