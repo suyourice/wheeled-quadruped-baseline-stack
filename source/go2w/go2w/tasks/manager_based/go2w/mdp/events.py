@@ -376,6 +376,112 @@ def reset_obstacles_curriculum(
         obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
 
 
+def _resample_nav_on_goal_reached(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    obstacle_names: list[str],
+    num_obstacles: int,
+    spawn_half_x: float,
+    spawn_half_y: float,
+    min_inter_obstacle_dist: float,
+    goal_forward_range: tuple[float, float],
+    goal_lateral_range: tuple[float, float],
+    goal_heading_jitter_range: tuple[float, float],
+    min_goal_distance: float,
+    start_exclusion_radius: float,
+    goal_exclusion_radius: float,
+    obstacle_z: float,
+    park_distance: float,
+) -> None:
+    """Resample goal and obstacles mid-episode, centered on the robot's current world position.
+
+    Unlike reset_navigation_goals_and_obstacles (which uses env_origin-relative
+    spawn ranges), this function places obstacles in a box centered on the
+    midpoint between the robot and the new goal in world coordinates.  This
+    ensures obstacles appear along the path regardless of how far the robot has
+    travelled from the env origin.
+    """
+    _ensure_navigation_goal_buffers(env)
+    robot = env.scene["robot"]
+    n = len(env_ids)
+    device = env.device
+
+    # --- sample new goal from robot's current world position ---
+    curr_pos_w = robot.data.root_pos_w[env_ids, :3].clone()
+    yaw_t = robot.data.heading_w[env_ids]
+    yaw_list = yaw_t.cpu().tolist()
+
+    goal_pos_w = curr_pos_w.clone()
+    goal_heading_w = yaw_t.clone()
+
+    for idx in range(n):
+        yaw_i = yaw_list[idx]
+        cos_y, sin_y = math.cos(yaw_i), math.sin(yaw_i)
+        fwd, lat = goal_forward_range[0], 0.0
+        for _ in range(50):
+            fwd = random.uniform(*goal_forward_range)
+            lat = random.uniform(*goal_lateral_range)
+            if math.hypot(fwd, lat) >= min_goal_distance:
+                break
+        dx = fwd * cos_y - lat * sin_y
+        dy = fwd * sin_y + lat * cos_y
+        goal_pos_w[idx, 0] += dx
+        goal_pos_w[idx, 1] += dy
+        path_heading = math.atan2(dy, dx)
+        jitter = random.uniform(*goal_heading_jitter_range)
+        goal_heading_w[idx] = math.atan2(
+            math.sin(path_heading + jitter),
+            math.cos(path_heading + jitter),
+        )
+
+    env._go2w_goal_pos_w[env_ids] = goal_pos_w
+    env._go2w_goal_heading_w[env_ids] = goal_heading_w
+    env._go2w_start_pos_w[env_ids] = curr_pos_w
+    env._go2w_start_heading_w[env_ids] = yaw_t.clone()
+
+    # --- place obstacles along the robot → new goal corridor (world coords) ---
+    parked_world = curr_pos_w.clone()
+    parked_world[:, 0] += park_distance
+    parked_world[:, 2] = obstacle_z
+    world_positions_per_slot = [parked_world.clone() for _ in obstacle_names]
+
+    robot_xy = curr_pos_w[:, :2].cpu().tolist()
+    goal_xy = goal_pos_w[:, :2].cpu().tolist()
+
+    effective = min(num_obstacles, len(obstacle_names))
+    for env_idx in range(n):
+        rx, ry = robot_xy[env_idx]
+        gx, gy = goal_xy[env_idx]
+        mx = (rx + gx) * 0.5
+        my = (ry + gy) * 0.5
+        placed: list[tuple[float, float]] = []
+        slot = 0
+        for _ in range(effective):
+            for _ in range(100):
+                ox = mx + random.uniform(-spawn_half_x, spawn_half_x)
+                oy = my + random.uniform(-spawn_half_y, spawn_half_y)
+                if math.hypot(ox - rx, oy - ry) < start_exclusion_radius:
+                    continue
+                if math.hypot(ox - gx, oy - gy) < goal_exclusion_radius:
+                    continue
+                if any(math.hypot(ox - px, oy - py) < min_inter_obstacle_dist for px, py in placed):
+                    continue
+                placed.append((ox, oy))
+                world_positions_per_slot[slot][env_idx, 0] = ox
+                world_positions_per_slot[slot][env_idx, 1] = oy
+                world_positions_per_slot[slot][env_idx, 2] = obstacle_z
+                break
+            slot += 1
+
+    for slot_idx, name in enumerate(obstacle_names):
+        obstacle = env.scene[name]
+        pose = torch.zeros(n, 7, device=device)
+        pose[:, :3] = world_positions_per_slot[slot_idx]
+        pose[:, 3] = 1.0
+        obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
+        obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+
+
 def reset_navigation_goals_and_obstacles(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
@@ -712,18 +818,22 @@ def reset_navigation_goals_and_obstacles(
         obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
         obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
 
-    # Store a callable so goal_reached_and_resample can trigger a full
-    # obstacle+goal resample in-place (no episode reset required).
+    # Store a callable so goal_reached_and_resample can trigger obstacle+goal
+    # resample mid-episode.  Uses robot-world-centered placement so obstacles
+    # appear correctly even after the robot has moved far from the env origin.
+    _half_x = goal_forward_range[1] * 0.6 + 1.0
+    _half_y = max(abs(goal_lateral_range[0]), abs(goal_lateral_range[1])) + 1.0
+    _num_obs = min(
+        max_obstacles if max_obstacles is not None else len(obstacle_names),
+        len(obstacle_names),
+    )
     env._nav_resample_on_goal = functools.partial(
-        reset_navigation_goals_and_obstacles,
+        _resample_nav_on_goal_reached,
         env,
         obstacle_names=obstacle_names,
-        min_obstacles=min_obstacles,
-        max_obstacles=max_obstacles,
-        empty_env_fraction=0.0,
-        spawn_range_x=spawn_range_x,
-        spawn_range_y=spawn_range_y,
-        obstacle_z=obstacle_z,
+        num_obstacles=_num_obs,
+        spawn_half_x=_half_x,
+        spawn_half_y=_half_y,
         min_inter_obstacle_dist=min_inter_obstacle_dist,
         goal_forward_range=goal_forward_range,
         goal_lateral_range=goal_lateral_range,
@@ -731,21 +841,6 @@ def reset_navigation_goals_and_obstacles(
         min_goal_distance=min_goal_distance,
         start_exclusion_radius=start_exclusion_radius,
         goal_exclusion_radius=goal_exclusion_radius,
-        head_on_progress_range=head_on_progress_range,
-        head_on_lateral_range=head_on_lateral_range,
-        edge_progress_range=edge_progress_range,
-        edge_lateral_range=edge_lateral_range,
-        diagonal_progress_range=diagonal_progress_range,
-        diagonal_lateral_range=diagonal_lateral_range,
-        offpath_progress_range=offpath_progress_range,
-        offpath_lateral_range=offpath_lateral_range,
-        narrow_gap_progress_range=narrow_gap_progress_range,
-        narrow_gap_center_lateral_range=narrow_gap_center_lateral_range,
-        narrow_gap_half_width_range=narrow_gap_half_width_range,
-        narrow_gap_probability=narrow_gap_probability,
-        fixed_goal_forward=fixed_goal_forward,
-        fixed_goal_lateral=fixed_goal_lateral,
-        fixed_goal_heading_jitter=fixed_goal_heading_jitter,
-        fixed_scenario_template=fixed_scenario_template,
+        obstacle_z=obstacle_z,
         park_distance=park_distance,
     )
