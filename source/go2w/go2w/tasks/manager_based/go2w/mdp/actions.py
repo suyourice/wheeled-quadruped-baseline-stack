@@ -99,6 +99,14 @@ class FrozenLLCActionTerm(ActionTerm):
             self._llc_action[:] = self._frozen_actor(llc_obs)
         self._llc_last_action[:] = self._llc_action
 
+        # Mirror HLC velocity into base_velocity command buffer so debug_vis arrows
+        # reflect the actual [vx, vy, yaw] the nav policy is commanding.
+        try:
+            cmd = self._env.command_manager.get_command("base_velocity")
+            cmd[:] = self._processed_actions
+        except (AttributeError, KeyError):
+            pass
+
     def apply_actions(self) -> None:
         default_pos = self._asset.data.default_joint_pos
 

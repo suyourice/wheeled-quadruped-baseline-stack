@@ -571,6 +571,8 @@ class Go2wNavTeacherEnvCfg_PLAY(Go2wNavTeacherEnvCfg):
         self.events.add_base_mass = None
         self.observations.policy.enable_corruption = False
         self.observations.policy.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
+        self.commands.base_velocity.debug_vis = True
 
         self.events.reset_obstacles.params = {
             **_NAV_RESET_PARAMS_BASE,
@@ -619,6 +621,8 @@ class Go2wNavRLDistillEnvCfg_PLAY(Go2wNavRLDistillEnvCfg):
         self.events.add_base_mass = None
         self.observations.student.enable_corruption = False
         self.observations.teacher.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
+        self.commands.base_velocity.debug_vis = True
 
         self.events.reset_obstacles.params = {
             **_NAV_RESET_PARAMS_BASE,

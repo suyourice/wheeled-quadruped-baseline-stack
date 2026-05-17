@@ -230,6 +230,8 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
+import isaaclab.sim as sim_utils
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from rsl_rl.utils import resolve_callable
@@ -707,6 +709,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     termination_names = list(termination_manager.active_terms) if termination_manager is not None else []
     termination_counts: dict[str, int] = defaultdict(int)
     multi_term_episodes = 0
+
+    # Goal/start visualization markers — only created for nav tasks.
+    _base_env = env.unwrapped
+    _nav_goal_marker = None
+    _nav_start_marker = None
+    if hasattr(_base_env, "_go2w_goal_pos_w"):
+        _nav_goal_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/NavGoalMarker",
+                markers={
+                    "sphere": sim_utils.SphereCfg(
+                        radius=0.30,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.9, 0.1)),
+                    ),
+                },
+            )
+        )
+        _nav_start_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/NavStartMarker",
+                markers={
+                    "sphere": sim_utils.SphereCfg(
+                        radius=0.20,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.5, 1.0)),
+                    ),
+                },
+            )
+        )
+
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -723,6 +754,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 policy.reset(dones)
             else:
                 policy_nn.reset(dones)
+
+        # Update goal/start markers for nav tasks.
+        if _nav_goal_marker is not None:
+            goal_pos = _base_env._go2w_goal_pos_w.clone()
+            goal_pos[:, 2] += 0.35
+            _nav_goal_marker.visualize(translations=goal_pos)
+            start_pos = _base_env._go2w_start_pos_w.clone()
+            start_pos[:, 2] += 0.35
+            _nav_start_marker.visualize(translations=start_pos)
 
         episode_lengths += 1
         done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
