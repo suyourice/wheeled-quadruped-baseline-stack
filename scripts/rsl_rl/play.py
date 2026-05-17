@@ -113,6 +113,32 @@ parser.add_argument(
     default=None,
 )
 parser.add_argument(
+    "--nav_min_inter_obstacle_dist",
+    "--nav-min-inter-obstacle-dist",
+    dest="nav_min_inter_obstacle_dist",
+    type=float,
+    default=None,
+    help="Navigation play tasks only: minimum distance between obstacles in meters.",
+)
+parser.add_argument(
+    "--nav_start_exclusion_radius",
+    "--nav-start-exclusion-radius",
+    dest="nav_start_exclusion_radius",
+    type=float,
+    default=None,
+    help="Navigation play tasks only: minimum obstacle distance from the episode start in meters.",
+)
+parser.add_argument(
+    "--nav_head_on_progress_range",
+    "--nav-head-on-progress-range",
+    dest="nav_head_on_progress_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Navigation play tasks only: head_on obstacle progress along start-goal path, as fractions.",
+)
+parser.add_argument(
     "--nav_log_interval",
     "--nav-log-interval",
     dest="nav_log_interval",
@@ -418,6 +444,9 @@ def _override_navigation_play_case(
         or args_cli.nav_goal_forward is not None
         or args_cli.nav_goal_lateral is not None
         or args_cli.nav_goal_heading_jitter is not None
+        or args_cli.nav_min_inter_obstacle_dist is not None
+        or args_cli.nav_start_exclusion_radius is not None
+        or args_cli.nav_head_on_progress_range is not None
         or args_cli.nav_fixed_start
         or args_cli.nav_start_x is not None
         or args_cli.nav_start_y is not None
@@ -436,6 +465,15 @@ def _override_navigation_play_case(
         reset_params["fixed_goal_lateral"] = args_cli.nav_goal_lateral
     if args_cli.nav_goal_heading_jitter is not None:
         reset_params["fixed_goal_heading_jitter"] = args_cli.nav_goal_heading_jitter
+    if args_cli.nav_min_inter_obstacle_dist is not None:
+        reset_params["min_inter_obstacle_dist"] = args_cli.nav_min_inter_obstacle_dist
+    if args_cli.nav_start_exclusion_radius is not None:
+        reset_params["start_exclusion_radius"] = args_cli.nav_start_exclusion_radius
+    if args_cli.nav_head_on_progress_range is not None:
+        progress_min, progress_max = args_cli.nav_head_on_progress_range
+        if not 0.0 <= progress_min <= progress_max <= 1.0:
+            raise ValueError("--nav_head_on_progress_range requires 0.0 <= MIN <= MAX <= 1.0.")
+        reset_params["head_on_progress_range"] = (progress_min, progress_max)
 
     if (
         args_cli.nav_fixed_start
@@ -462,7 +500,10 @@ def _override_navigation_play_case(
         f"case={reset_params.get('fixed_scenario_template') or 'random'}, "
         f"goal_forward={reset_params.get('fixed_goal_forward')}, "
         f"goal_lateral={reset_params.get('fixed_goal_lateral')}, "
-        f"goal_heading_jitter={reset_params.get('fixed_goal_heading_jitter')}"
+        f"goal_heading_jitter={reset_params.get('fixed_goal_heading_jitter')}, "
+        f"min_inter_obstacle_dist={reset_params.get('min_inter_obstacle_dist')}, "
+        f"start_exclusion_radius={reset_params.get('start_exclusion_radius')}, "
+        f"head_on_progress_range={reset_params.get('head_on_progress_range')}"
     )
 
 
