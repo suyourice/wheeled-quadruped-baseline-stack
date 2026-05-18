@@ -101,8 +101,8 @@ NAV_LOCAL_PLANNER_ACTIVATION_THRESHOLD = 0.22
 NAV_LOCAL_PLANNER_LATERAL_PENALTY = 0.16
 NAV_LOCAL_PLANNER_MIN_IMPROVEMENT = 0.07
 NAV_LOCAL_PLANNER_MAX_BLEND = 0.65
-NAV_WAYPOINT_COMMAND_MIN_FORWARD = 0.45
-NAV_WAYPOINT_COMMAND_MAX_LATERAL = 0.85
+NAV_WAYPOINT_COMMAND_MIN_FORWARD = 0.0
+NAV_WAYPOINT_COMMAND_MAX_LATERAL = 1.5
 NAV_WAYPOINT_COMMAND_MAX_HEADING = 0.90
 
 # Unitree L2 reference spec: 360 x 96 deg FoV, 30 m max range.
@@ -300,8 +300,8 @@ class NavTeacherRewardsCfg:
     # -- Navigation (goal-conditioned) -----------------------------------------
     goal_progress = RewTerm(
         func=mdp.goal_progress_dense,
-        weight=4.0,
-        params={"clip": 0.5},
+        weight=6.0,
+        params={"clip": 1.5},
     )
     goal_heading = RewTerm(
         func=mdp.goal_heading_tanh_reward,
@@ -331,6 +331,15 @@ class NavTeacherRewardsCfg:
             "start_iteration": NAV_CURRICULUM_COLLISION_START_ITERATION,
             "warmup_iterations": CURRICULUM_COLLISION_WARMUP_ITERATIONS,
             "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
+        },
+    )
+    obstacle_ttc = RewTerm(
+        func=mdp.obstacle_nav_ttc_penalty,
+        weight=-3.0,
+        params={
+            "obstacle_names": OBSTACLE_NAMES,
+            "safe_ttc": 1.0,
+            "asset_cfg": SceneEntityCfg("robot"),
         },
     )
 

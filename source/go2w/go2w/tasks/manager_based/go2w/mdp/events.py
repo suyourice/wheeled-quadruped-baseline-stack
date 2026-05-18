@@ -400,86 +400,119 @@ def _resample_nav_on_goal_reached(
     midpoint between the robot and the new goal in world coordinates.  This
     ensures obstacles appear along the path regardless of how far the robot has
     travelled from the env origin.
+
+    Fully vectorized on GPU: all n envs are processed in parallel using tensor
+    operations instead of Python for-loops, avoiding CPU bottlenecks when many
+    envs reach the goal simultaneously.
     """
     _ensure_navigation_goal_buffers(env)
     robot = env.scene["robot"]
     n = len(env_ids)
     device = env.device
 
-    # --- sample new goal from robot's current world position ---
+    # --- sample new goal (vectorized over n envs) ---
     curr_pos_w = robot.data.root_pos_w[env_ids, :3].clone()
-    yaw_t = robot.data.heading_w[env_ids]
-    yaw_list = yaw_t.cpu().tolist()
+    yaw_t = robot.data.heading_w[env_ids]  # (n,)
+
+    T_GOAL = 50
+    fwd_lo, fwd_hi = goal_forward_range
+    lat_lo, lat_hi = goal_lateral_range
+    fwd_cands = torch.empty(n, T_GOAL, device=device).uniform_(fwd_lo, fwd_hi)  # (n, T)
+    lat_cands = torch.empty(n, T_GOAL, device=device).uniform_(lat_lo, lat_hi)  # (n, T)
+    dist_cands = (fwd_cands**2 + lat_cands**2).sqrt()                            # (n, T)
+    valid_goal = dist_cands >= min_goal_distance                                  # (n, T)
+    # argmax picks first True; if none valid, picks 0 (forward is always >=fwd_lo
+    # which is typically >= min_goal_distance, so this is safe in practice)
+    best_idx = valid_goal.long().argmax(dim=1)                                    # (n,)
+    arange_n = torch.arange(n, device=device)
+    fwd_chosen = fwd_cands[arange_n, best_idx]                                    # (n,)
+    lat_chosen = lat_cands[arange_n, best_idx]                                    # (n,)
+
+    cos_y = yaw_t.cos()
+    sin_y = yaw_t.sin()
+    dx = fwd_chosen * cos_y - lat_chosen * sin_y  # (n,)
+    dy = fwd_chosen * sin_y + lat_chosen * cos_y  # (n,)
 
     goal_pos_w = curr_pos_w.clone()
-    goal_heading_w = yaw_t.clone()
+    goal_pos_w[:, 0] += dx
+    goal_pos_w[:, 1] += dy
 
-    for idx in range(n):
-        yaw_i = yaw_list[idx]
-        cos_y, sin_y = math.cos(yaw_i), math.sin(yaw_i)
-        fwd, lat = goal_forward_range[0], 0.0
-        for _ in range(50):
-            fwd = random.uniform(*goal_forward_range)
-            lat = random.uniform(*goal_lateral_range)
-            if math.hypot(fwd, lat) >= min_goal_distance:
-                break
-        dx = fwd * cos_y - lat * sin_y
-        dy = fwd * sin_y + lat * cos_y
-        goal_pos_w[idx, 0] += dx
-        goal_pos_w[idx, 1] += dy
-        path_heading = math.atan2(dy, dx)
-        jitter = random.uniform(*goal_heading_jitter_range)
-        goal_heading_w[idx] = math.atan2(
-            math.sin(path_heading + jitter),
-            math.cos(path_heading + jitter),
-        )
+    path_heading = torch.atan2(dy, dx)  # (n,)
+    jit_lo, jit_hi = goal_heading_jitter_range
+    jitter = torch.empty(n, device=device).uniform_(jit_lo, jit_hi)
+    ph_j = path_heading + jitter
+    goal_heading_w = torch.atan2(ph_j.sin(), ph_j.cos())  # (n,)
 
     env._go2w_goal_pos_w[env_ids] = goal_pos_w
     env._go2w_goal_heading_w[env_ids] = goal_heading_w
     env._go2w_start_pos_w[env_ids] = curr_pos_w
     env._go2w_start_heading_w[env_ids] = yaw_t.clone()
 
-    # --- place obstacles along the robot → new goal corridor (world coords) ---
-    parked_world = curr_pos_w.clone()
-    parked_world[:, 0] += park_distance
-    parked_world[:, 2] = obstacle_z
-    world_positions_per_slot = [parked_world.clone() for _ in obstacle_names]
+    # --- place obstacles (vectorized over n envs, sequential over obstacle slots) ---
+    # Fallback position: park away from the arena so the obstacle is inactive.
+    park_xy = curr_pos_w[:, :2].clone()
+    park_xy[:, 0] += park_distance  # (n, 2)
 
-    robot_xy = curr_pos_w[:, :2].cpu().tolist()
-    goal_xy = goal_pos_w[:, :2].cpu().tolist()
+    robot_xy = curr_pos_w[:, :2]   # (n, 2)
+    goal_xy = goal_pos_w[:, :2]    # (n, 2)
+    midpoint_xy = (robot_xy + goal_xy) * 0.5  # (n, 2)
 
     effective = min(num_obstacles, len(obstacle_names))
-    for env_idx in range(n):
-        rx, ry = robot_xy[env_idx]
-        gx, gy = goal_xy[env_idx]
-        mx = (rx + gx) * 0.5
-        my = (ry + gy) * 0.5
-        placed: list[tuple[float, float]] = []
-        slot = 0
-        for _ in range(effective):
-            for _ in range(100):
-                ox = mx + random.uniform(-spawn_half_x, spawn_half_x)
-                oy = my + random.uniform(-spawn_half_y, spawn_half_y)
-                if math.hypot(ox - rx, oy - ry) < start_exclusion_radius:
-                    continue
-                if math.hypot(ox - gx, oy - gy) < goal_exclusion_radius:
-                    continue
-                if any(math.hypot(ox - px, oy - py) < min_inter_obstacle_dist for px, py in placed):
-                    continue
-                placed.append((ox, oy))
-                world_positions_per_slot[slot][env_idx, 0] = ox
-                world_positions_per_slot[slot][env_idx, 1] = oy
-                world_positions_per_slot[slot][env_idx, 2] = obstacle_z
-                break
-            slot += 1
+    T_OBS = 200  # candidates per obstacle per env (more attempts, same GPU cost)
+    half = torch.tensor([spawn_half_x, spawn_half_y], device=device)  # (2,)
 
+    # placed[:, i, :] = world-xy of the i-th placed obstacle, NaN until filled.
+    placed = torch.full((n, effective, 2), float("nan"), device=device)
+
+    # Pre-allocate candidate buffer once; reuse in-place each obstacle iteration.
+    cands_buf = torch.empty(n, T_OBS, 2, device=device)
+    robot_xy_exp = robot_xy.unsqueeze(1)  # (n, 1, 2) — constant across iterations
+    goal_xy_exp = goal_xy.unsqueeze(1)    # (n, 1, 2)
+    mid_exp = midpoint_xy.unsqueeze(1)    # (n, 1, 2)
+
+    for obs_i in range(effective):
+        # Resample candidates in-place to avoid repeated allocation.
+        cands_buf.uniform_(-1.0, 1.0).mul_(half)
+        cands = mid_exp + cands_buf  # (n, T_OBS, 2)
+
+        # Constraint 1: outside robot exclusion zone
+        valid = (cands - robot_xy_exp).norm(dim=-1) >= start_exclusion_radius  # (n, T_OBS)
+
+        # Constraint 2: outside goal exclusion zone
+        valid &= (cands - goal_xy_exp).norm(dim=-1) >= goal_exclusion_radius
+
+        # Constraint 3: away from all previously placed obstacles at once.
+        # placed[:, :obs_i, :] is (n, obs_i, 2); broadcast to (n, T_OBS, obs_i).
+        if obs_i > 0:
+            prev_all = placed[:, :obs_i, :].unsqueeze(1)                        # (n, 1, obs_i, 2)
+            cands_exp = cands.unsqueeze(2)                                       # (n, T_OBS, 1, 2)
+            d_all = (cands_exp - prev_all).norm(dim=-1)                         # (n, T_OBS, obs_i)
+            valid &= (d_all >= min_inter_obstacle_dist).all(dim=2)
+
+        # Pick first valid candidate; fall back to park position if none found.
+        has_valid = valid.any(dim=1)                                             # (n,)
+        first_valid_idx = valid.long().argmax(dim=1)                             # (n,)
+        chosen = cands[arange_n, first_valid_idx]                                # (n, 2)
+        chosen = torch.where(has_valid.unsqueeze(1), chosen, park_xy)
+        placed[:, obs_i, :] = chosen
+
+    # Write all obstacle poses to sim
+    pose_buf = torch.zeros(n, 7, device=device)
+    pose_buf[:, 3] = 1.0  # quaternion w
+    zero_vel = torch.zeros(n, 6, device=device)
     for slot_idx, name in enumerate(obstacle_names):
         obstacle = env.scene[name]
-        pose = torch.zeros(n, 7, device=device)
-        pose[:, :3] = world_positions_per_slot[slot_idx]
-        pose[:, 3] = 1.0
-        obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
-        obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+        if slot_idx < effective:
+            pose_buf[:, 0] = placed[:, slot_idx, 0]
+            pose_buf[:, 1] = placed[:, slot_idx, 1]
+            pose_buf[:, 2] = obstacle_z
+        else:
+            # remaining slots: park at park_distance
+            pose_buf[:, 0] = park_xy[:, 0]
+            pose_buf[:, 1] = park_xy[:, 1]
+            pose_buf[:, 2] = obstacle_z
+        obstacle.write_root_pose_to_sim(pose_buf.clone(), env_ids=env_ids)
+        obstacle.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
 
 
 def reset_navigation_goals_and_obstacles(

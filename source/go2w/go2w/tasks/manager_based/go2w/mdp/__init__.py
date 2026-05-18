@@ -84,6 +84,7 @@ from .rewards import (
     joint_deviation_l1_curriculum,
     obstacle_contact_penalty,
     obstacle_contact_termination,
+    obstacle_nav_ttc_penalty,
     track_ang_vel_z_world_exp,
     track_lin_vel_xy_yaw_frame_exp,
     wheel_contact_penalty,

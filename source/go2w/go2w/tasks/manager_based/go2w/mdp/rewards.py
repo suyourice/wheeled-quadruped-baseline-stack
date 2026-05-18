@@ -247,6 +247,40 @@ def goal_progress_dense(
     return progress.clamp(-clip, clip) / clip
 
 
+def obstacle_nav_ttc_penalty(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    safe_ttc: float = 1.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Dense TTC-based obstacle avoidance penalty for the navigation teacher.
+
+    For each obstacle, computes the time-to-collision (TTC) based on the robot's
+    velocity component toward the obstacle. Fires a penalty proportional to how
+    much below safe_ttc the current TTC is. Stationary robots and robots moving
+    away from obstacles receive zero penalty.
+
+        approach_speed = dot(v_robot_xy, unit_toward_obstacle).clamp(min=0)
+        ttc = dist / (approach_speed + eps)
+        penalty = sum_over_obstacles( max(0, safe_ttc - ttc) )
+    """
+    asset = env.scene[asset_cfg.name]
+    robot_vel_w = asset.data.root_lin_vel_w[:, :2]   # (N, 2)
+    robot_pos_w = asset.data.root_pos_w[:, :2]        # (N, 2)
+
+    # Stack all obstacle positions into a single (N, K, 2) tensor and process
+    # in one pass, replacing K separate GPU kernel sequences with one batched op.
+    obs_pos_all = torch.stack(
+        [env.scene[n].data.root_pos_w[:, :2] for n in obstacle_names], dim=1
+    )  # (N, K, 2)
+    diff = obs_pos_all - robot_pos_w.unsqueeze(1)                          # (N, K, 2)
+    dist = diff.norm(dim=-1).clamp(min=0.01)                               # (N, K)
+    unit = diff / dist.unsqueeze(-1)                                        # (N, K, 2)
+    approach = (robot_vel_w.unsqueeze(1) * unit).sum(dim=-1).clamp(min=0.0)  # (N, K)
+    ttc = dist / (approach + 1e-6)                                         # (N, K)
+    return (safe_ttc - ttc).clamp(min=0.0).sum(dim=1)                     # (N,)
+
+
 def obstacle_contact_penalty(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,

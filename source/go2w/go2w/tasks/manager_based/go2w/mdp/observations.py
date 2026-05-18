@@ -77,17 +77,18 @@ def obstacle_positions_rel(
 
     robot = env.scene[robot_cfg.name]
     robot_pos_w = robot.data.root_pos_w[:, :3]  # (N, 3)
-    robot_quat_w = robot.data.root_quat_w  # (N, 4)
+    robot_quat_w = robot.data.root_quat_w        # (N, 4)
 
-    rel_positions = []
-    for name in obstacle_names:
-        obstacle: RigidObject = env.scene[name]
-        obs_pos_w = obstacle.data.root_pos_w[:, :3]  # (N, 3)
-        rel_pos_w = obs_pos_w - robot_pos_w  # (N, 3)
-        rel_pos_b = quat_apply_inverse(robot_quat_w, rel_pos_w)  # (N, 3)
-        rel_positions.append(rel_pos_b[:, :2])  # only x, y
-
-    rel_positions = torch.stack(rel_positions, dim=1)  # (N, num_obstacles, 2)
+    # Stack all obstacle positions and apply quat_apply_inverse in one batched
+    # call instead of K separate calls.
+    obs_pos_all = torch.stack(
+        [env.scene[n].data.root_pos_w[:, :3] for n in obstacle_names], dim=1
+    )  # (N, K, 3)
+    rel_pos_w_all = obs_pos_all - robot_pos_w.unsqueeze(1)  # (N, K, 3)
+    N, K = rel_pos_w_all.shape[:2]
+    quat_exp = robot_quat_w.unsqueeze(1).expand(-1, K, -1).reshape(N * K, 4)
+    rel_pos_b_flat = quat_apply_inverse(quat_exp, rel_pos_w_all.reshape(N * K, 3))
+    rel_positions = rel_pos_b_flat.reshape(N, K, 3)[:, :, :2]  # (N, K, 2)
     dists = torch.norm(rel_positions, dim=-1)
 
     if num_closest is not None:
@@ -153,18 +154,19 @@ def obstacle_polar_depth(
         return torch.zeros(env.num_envs, num_bins, device=env.device)
 
     robot = env.scene[robot_cfg.name]
-    robot_pos_w = robot.data.root_pos_w[:, :3]  # (N, 3)
+    robot_pos_w = robot.data.root_pos_w[:, :3]       # (N, 3)
     robot_yaw_quat_w = yaw_quat(robot.data.root_quat_w)  # (N, 4)
 
-    rel_positions = []
-    for name in obstacle_names:
-        obstacle: RigidObject = env.scene[name]
-        obs_pos_w = obstacle.data.root_pos_w[:, :3]  # (N, 3)
-        rel_pos_w = obs_pos_w - robot_pos_w  # (N, 3)
-        rel_pos_b = quat_apply_inverse(robot_yaw_quat_w, rel_pos_w)  # (N, 3)
-        rel_positions.append(rel_pos_b[:, :2])  # (N, 2) x, y only
-
-    rel_xy = torch.stack(rel_positions, dim=1)  # (N, K, 2)
+    # Stack all obstacle world positions, then apply quat_apply_inverse in one
+    # batched call instead of K separate calls.
+    obs_pos_all = torch.stack(
+        [env.scene[n].data.root_pos_w[:, :3] for n in obstacle_names], dim=1
+    )  # (N, K, 3)
+    rel_pos_w_all = obs_pos_all - robot_pos_w.unsqueeze(1)  # (N, K, 3)
+    N, K = rel_pos_w_all.shape[:2]
+    quat_exp = robot_yaw_quat_w.unsqueeze(1).expand(-1, K, -1).reshape(N * K, 4)
+    rel_pos_b_flat = quat_apply_inverse(quat_exp, rel_pos_w_all.reshape(N * K, 3))
+    rel_xy = rel_pos_b_flat.reshape(N, K, 3)[:, :, :2]  # (N, K, 2)
     dists = torch.norm(rel_xy, dim=-1)  # (N, K)
 
     # Map bearing angle → bin index [0, num_bins)
