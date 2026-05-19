@@ -334,6 +334,14 @@ def obstacle_contact_penalty(
         forces = forces[:, :, sensor_cfg.body_ids, :]
     max_forces = forces.norm(dim=-1).max(dim=1)[0]
     contacts = (max_forces > threshold).float().sum(dim=1)
+
+    # Track per-episode collision flag for scenario-wise logging.
+    if not hasattr(env, "_go2w_had_collision_episode"):
+        env._go2w_had_collision_episode = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    reset_mask = env.episode_length_buf == 0
+    env._go2w_had_collision_episode[reset_mask] = False
+    env._go2w_had_collision_episode |= contacts > 0
+
     return _curriculum_scale(
         env, start_steps, warmup_steps, start_iteration, warmup_iterations, steps_per_iteration
     ) * contacts
@@ -503,4 +511,191 @@ def goal_reached_and_resample(
         env.extras["log"] = {}
     env.extras["log"]["goals_per_episode"] = env._go2w_goals_reached_episode.mean()
 
+    # Per-scenario logging: goals reached and collision rate in a single pass.
+    has_scenario = hasattr(env, "_go2w_scenario_template_id")
+    has_collision = hasattr(env, "_go2w_had_collision_episode")
+    if has_scenario:
+        template_ids = env._go2w_scenario_template_id
+        for tid, tname in _NAV_SCENARIO_NAMES.items():
+            mask = template_ids == tid
+            if mask.any():
+                env.extras["log"][f"goals_per_ep/{tname}"] = (
+                    env._go2w_goals_reached_episode[mask].mean()
+                )
+                if has_collision:
+                    env.extras["log"][f"collision_per_ep/{tname}"] = (
+                        env._go2w_had_collision_episode[mask].float().mean()
+                    )
+        if has_collision and len(env_ids) > 0:
+            env._go2w_had_collision_episode[env_ids] = False
+
     return reached.float()
+
+
+# =============================================================================
+# Navigation-specific reward functions (Phase 1: static obstacle teacher)
+# =============================================================================
+
+# Scenario id → name mapping shared by goal-reached and collision logging.
+_NAV_SCENARIO_NAMES: dict[int, str] = {
+    0: "empty", 1: "head_on", 2: "left_edge", 3: "right_edge",
+    4: "diag_left", 5: "diag_right", 6: "off_left", 7: "off_right",
+    8: "narrow_gap", 9: "random_fallback",
+    10: "partial_blockage_left_open", 11: "partial_blockage_right_open",
+    12: "cluttered", 13: "narrow_gap_wide", 14: "narrow_gap_barely",
+}
+
+
+def nav_clearance_penalty(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    min_safe_dist: float = 0.8,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalise proximity to any obstacle with a smooth gradient.
+
+    Returns a value in [0, 1]:
+      0   when nearest obstacle ≥ min_safe_dist (safe zone, no penalty)
+      1   when the robot is touching an obstacle (dist ≈ 0)
+
+    Intended use: weight should be negative (e.g. −1.5) so this acts as a
+    penalty. Complements obstacle_ttc which is command-direction-specific;
+    this term penalises closeness regardless of movement direction.
+    """
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    robot = env.scene[asset_cfg.name]
+    robot_pos = robot.data.root_pos_w[:, :2]
+
+    obs_pos = torch.stack(
+        [env.scene[n].data.root_pos_w[:, :2] for n in obstacle_names], dim=1
+    )  # (N, K, 2)
+    dists = (obs_pos - robot_pos.unsqueeze(1)).norm(dim=-1)  # (N, K)
+    nearest_dist = dists.min(dim=1).values.clamp(min=0.0)   # (N,)
+
+    # Smooth proximity penalty: 0 when safe, saturates at 1 when very close
+    intrusion = (min_safe_dist - nearest_dist).clamp(min=0.0, max=min_safe_dist)
+    penalty = (intrusion / min_safe_dist) ** 2  # quadratic near contact, zero far away
+    return penalty
+
+
+def _compute_nav_frontal_geometry(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    robot_cfg: SceneEntityCfg,
+    frontal_half_angle_deg: float,
+    max_distance: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared obstacle geometry for frontal-blockage reward functions.
+
+    Returns (frontal_blockage, left_blockage, right_blockage, vel_yaw,
+             closeness, angles, active) — all (N, ...) on env.device.
+    N = num_envs, K = num_obstacles in obstacle_names.
+    """
+    robot = env.scene[robot_cfg.name]
+    robot_yaw_quat = yaw_quat(robot.data.root_quat_w)
+
+    obs_pos_all = torch.stack(
+        [env.scene[n].data.root_pos_w[:, :3] for n in obstacle_names], dim=1
+    )  # (N, K, 3)
+    rel_w = obs_pos_all - robot.data.root_pos_w[:, :3].unsqueeze(1)
+    N, K = rel_w.shape[:2]
+
+    quat_exp = robot_yaw_quat.unsqueeze(1).expand(-1, K, -1).reshape(N * K, 4)
+    rel_xy = quat_apply_inverse(quat_exp, rel_w.reshape(N * K, 3)).reshape(N, K, 3)[:, :, :2]
+    dists = rel_xy.norm(dim=-1)
+    angles = torch.atan2(rel_xy[..., 1], rel_xy[..., 0])
+
+    active = dists < max_distance
+    closeness = (1.0 - (dists / max_distance).clamp(0.0, 1.0)) * active.float()
+
+    frontal_rad = math.radians(frontal_half_angle_deg)
+    k_norm = 1.0 / max(K, 1)
+    frontal_blockage = (closeness * ((angles.abs() < frontal_rad) & active).float()).sum(dim=1) * k_norm
+    left_blockage    = (closeness * ((angles >  frontal_rad) & (angles <= math.pi) & active).float()).sum(dim=1) * k_norm
+    right_blockage   = (closeness * ((angles < -frontal_rad) & (angles >= -math.pi) & active).float()).sum(dim=1) * k_norm
+
+    vel_yaw = quat_apply_inverse(robot_yaw_quat, robot.data.root_lin_vel_w[:, :3])
+    return frontal_blockage, left_blockage, right_blockage, vel_yaw, closeness, angles, active
+
+
+def nav_frontal_blocked_lateral_escape_reward(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    frontal_half_angle_deg: float = 45.0,
+    min_blockage_for_reward: float = 0.20,
+    side_diff_deadband: float = 0.04,
+    max_distance: float = 8.0,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward lateral escape velocity when the frontal corridor is blocked.
+
+    When frontal_blockage > min_blockage_for_reward, rewards lateral velocity
+    aligned with the clearer side.  This directly teaches "dodge-and-go-around"
+    behavior and breaks the local optimum where the robot stays still when blocked
+    but the goal-progress reward is too weak to drive avoidance maneuvers.
+
+    Convention:
+      - preferred_side_hint > 0 → go right (left has more obstacles)
+      - preferred_side_hint < 0 → go left  (right has more obstacles)
+      - lateral_vel > 0 in robot frame → moving left (+y)
+      - reward = blockage_gate × clamp(0, aligned_lateral / 2.0)
+
+    Returns a value in [0, 1].  Zero when not blocked or lateral direction wrong.
+    """
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    frontal_blockage, left_blockage, right_blockage, vel_yaw, _, _, _ = (
+        _compute_nav_frontal_geometry(env, obstacle_names, robot_cfg, frontal_half_angle_deg, max_distance)
+    )
+
+    side_diff = left_blockage - right_blockage
+    preferred_sign = torch.where(
+        side_diff.abs() > side_diff_deadband,
+        torch.sign(side_diff),
+        torch.zeros_like(side_diff),
+    )
+    # preferred_sign +1 (go right) → want lateral_vel < 0 → reward = +(-lateral_vel)
+    # preferred_sign -1 (go left)  → want lateral_vel > 0 → reward = +(lateral_vel)
+    aligned_lateral = -preferred_sign * vel_yaw[:, 1]
+
+    blockage_gate = (
+        (frontal_blockage - min_blockage_for_reward)
+        / (1.0 - min_blockage_for_reward + 1.0e-6)
+    ).clamp(0.0, 1.0)
+
+    return blockage_gate * (aligned_lateral / 2.0).clamp(0.0, 1.0)
+
+
+def nav_backward_escape_reward(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    frontal_half_angle_deg: float = 45.0,
+    min_blockage_for_reward: float = 0.35,
+    max_distance: float = 8.0,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward backward motion when the frontal corridor is heavily blocked.
+
+    Only activates when frontal_blockage > min_blockage_for_reward (default 0.35,
+    higher than the lateral escape threshold of 0.20) so backward escape is only
+    encouraged when the front is substantially closed off.
+
+    Returns a value in [0, 1]. Zero when not blocked or robot is moving forward.
+    """
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    frontal_blockage, _, _, vel_yaw, _, _, _ = (
+        _compute_nav_frontal_geometry(env, obstacle_names, robot_cfg, frontal_half_angle_deg, max_distance)
+    )
+
+    blockage_gate = (
+        (frontal_blockage - min_blockage_for_reward)
+        / (1.0 - min_blockage_for_reward + 1.0e-6)
+    ).clamp(0.0, 1.0)
+
+    # vx in robot yaw frame: negative means moving backward
+    return blockage_gate * (-vel_yaw[:, 0]).clamp(0.0, 1.0)
