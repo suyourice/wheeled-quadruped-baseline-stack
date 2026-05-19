@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -530,3 +531,242 @@ def start_position_w(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return the sampled episode start pose origin in world coordinates."""
     _ensure_navigation_goal_buffers(env)
     return env._go2w_start_pos_w
+
+
+# =============================================================================
+# Privileged navigation geometry features (teacher-only)
+# =============================================================================
+
+def _get_obstacle_relative_xy(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Obstacle positions in the robot yaw frame.
+
+    Returns:
+        rel_xy:  (N, K, 2)  - obstacle x/y in robot yaw frame
+        dists:   (N, K)     - Euclidean distance to each obstacle
+        angles:  (N, K)     - bearing angle ∈ (−π, π]
+    """
+    if len(obstacle_names) == 0:
+        N = env.num_envs
+        z = torch.zeros(N, 0, device=env.device)
+        return z.unsqueeze(-1).expand(-1, -1, 2), z, z
+
+    robot = env.scene[robot_cfg.name]
+    robot_pos_w = robot.data.root_pos_w[:, :3]
+    robot_yaw_quat = yaw_quat(robot.data.root_quat_w)
+
+    obs_pos_all = torch.stack(
+        [env.scene[n].data.root_pos_w[:, :3] for n in obstacle_names], dim=1
+    )  # (N, K, 3)
+    rel_w = obs_pos_all - robot_pos_w.unsqueeze(1)  # (N, K, 3)
+    N, K = rel_w.shape[:2]
+
+    quat_exp = robot_yaw_quat.unsqueeze(1).expand(-1, K, -1).reshape(N * K, 4)
+    rel_b = quat_apply_inverse(quat_exp, rel_w.reshape(N * K, 3))
+    rel_xy = rel_b.reshape(N, K, 3)[:, :, :2]            # (N, K, 2)
+    dists = torch.norm(rel_xy, dim=-1)                    # (N, K)
+    angles = torch.atan2(rel_xy[..., 1], rel_xy[..., 0])  # (N, K) ∈ (−π, π]
+    return rel_xy, dists, angles
+
+
+def obstacle_navigation_features(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str = "base_velocity",
+    max_distance: float = 8.0,
+    frontal_half_angle_deg: float = 45.0,
+    corridor_half_width: float = 0.65,
+    min_command_speed: float = 0.05,
+) -> torch.Tensor:
+    """Compact privileged navigation geometry features for the nav teacher (16D).
+
+    Converts privileged obstacle positions into explicit local-navigation inductive
+    bias features: frontal blockage, side clearance, gap availability, preferred
+    escape direction, and TTC proxy.  These are designed to accelerate PPO learning
+    by exposing structure that would otherwise need to be inferred from the raw
+    180-bin polar depth map.
+
+    Teacher-only (privileged).  The student learns equivalent information from
+    LiDAR/depth observations at distillation time.
+
+    Feature layout (16D):
+      [0]  nearest_dist_norm     - nearest obstacle dist / max_distance ∈ [0, 1]
+      [1]  nearest_sin           - sin(bearing to nearest obstacle)     ∈ [−1, 1]
+      [2]  nearest_cos           - cos(bearing to nearest obstacle)     ∈ [−1, 1]
+      [3]  frontal_blockage      - density in ±frontal_angle sector     ∈ [0, 1]
+      [4]  left_blockage         - density in left 90° sector           ∈ [0, 1]
+      [5]  right_blockage        - density in right 90° sector          ∈ [0, 1]
+      [6]  frontal_min_dist_norm - min dist in frontal sector / max     ∈ [0, 1]
+      [7]  left_min_dist_norm    - min dist in left hemisphere / max    ∈ [0, 1]
+      [8]  right_min_dist_norm   - min dist in right hemisphere / max   ∈ [0, 1]
+      [9]  preferred_side_hint   - (left_blockage − right_blockage)     ∈ [−1, 1]
+                                    positive = right preferred (left more blocked)
+                                    negative = left preferred (right more blocked)
+      [10] gap_available         - soft: passable frontal gap exists    ∈ [0, 1]
+      [11] gap_width_norm        - frontal gap width / (2×corridor_hw)  ∈ [0, 1]
+      [12] goal_path_blockage    - obstacle density along goal direction ∈ [0, 1]
+      [13] ttc_proxy             - time-to-collision risk from HLC cmd  ∈ [0, 1]
+      [14] obstacle_count_norm   - active obstacle count / total slots  ∈ [0, 1]
+      [15] rear_clearance        - min dist in rear hemisphere / max    ∈ [0, 1]
+    """
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, 16, device=env.device)
+
+    rel_xy, dists, angles = _get_obstacle_relative_xy(env, obstacle_names, robot_cfg)
+    N, K = dists.shape
+    device = env.device
+    frontal_rad = math.radians(frontal_half_angle_deg)
+
+    # Active obstacle mask (parked obstacles are at ~1000 m)
+    active = dists < max_distance  # (N, K)
+    dists_c = dists.clamp(max=max_distance)
+
+    # ------- nearest obstacle -------
+    big = max_distance * 10.0
+    masked_dists = torch.where(active, dists_c, torch.full_like(dists, big))
+    nearest_vals, nearest_idx = masked_dists.min(dim=1)       # (N,)
+    nearest_dist_norm = nearest_vals.clamp(max=max_distance) / max_distance
+
+    arange_n = torch.arange(N, device=device)
+    nearest_sin = angles[arange_n, nearest_idx].sin()
+    nearest_cos = angles[arange_n, nearest_idx].cos()
+
+    # ------- per-obstacle closeness -------
+    closeness = ((1.0 - dists_c / max_distance) * active.float()).clamp(0.0, 1.0)
+
+    # ------- sector masks -------
+    frontal_mask = (angles.abs() < frontal_rad) & active
+    left_mask    = (angles > frontal_rad) & (angles <= math.pi) & active
+    right_mask   = (angles < -frontal_rad) & (angles >= -math.pi) & active
+    rear_mask    = (angles.abs() > math.pi - frontal_rad) & active
+
+    k_norm = 1.0 / max(K, 1)
+    frontal_blockage = (closeness * frontal_mask.float()).sum(dim=1) * k_norm
+    left_blockage    = (closeness * left_mask.float()).sum(dim=1) * k_norm
+    right_blockage   = (closeness * right_mask.float()).sum(dim=1) * k_norm
+
+    # ------- min distance per sector -------
+    inf_val = max_distance * 2.0
+    fill = torch.full_like(dists, inf_val)
+    frontal_min = torch.where(frontal_mask, dists_c, fill).min(dim=1).values.clamp(max=max_distance)
+    left_min    = torch.where(left_mask,    dists_c, fill).min(dim=1).values.clamp(max=max_distance)
+    right_min   = torch.where(right_mask,   dists_c, fill).min(dim=1).values.clamp(max=max_distance)
+    rear_min    = torch.where(rear_mask,    dists_c, fill).min(dim=1).values.clamp(max=max_distance)
+
+    frontal_min_dist_norm = frontal_min / max_distance
+    left_min_dist_norm    = left_min    / max_distance
+    right_min_dist_norm   = right_min   / max_distance
+    rear_clearance        = rear_min    / max_distance
+
+    # ------- preferred side hint -------
+    # +1 → prefer right (left has more obstacles), −1 → prefer left
+    preferred_side_hint = (left_blockage - right_blockage).clamp(-1.0, 1.0)
+
+    # ------- gap availability (simplified) -------
+    # Frontal minimum distance > corridor_half_width → passable gap
+    gap_available = torch.sigmoid(
+        (frontal_min - corridor_half_width) / (corridor_half_width * 0.3)
+    )
+    gap_width_norm = (frontal_min / (corridor_half_width * 2.0)).clamp(0.0, 1.0)
+
+    # ------- goal path blockage -------
+    _ensure_navigation_goal_buffers(env)
+    robot = env.scene[robot_cfg.name]
+    robot_pos_2d = robot.data.root_pos_w[:, :2]
+    goal_dir_w = env._go2w_goal_pos_w[:, :2] - robot_pos_2d    # (N, 2) world frame
+    goal_dist_w = goal_dir_w.norm(dim=-1).clamp(min=0.01)
+    goal_dir_w = goal_dir_w / goal_dist_w.unsqueeze(-1)
+
+    # Rotate goal direction to robot yaw frame
+    h = robot.data.heading_w   # (N,)
+    cos_h, sin_h = torch.cos(h), torch.sin(h)
+    goal_dir_b_x = cos_h * goal_dir_w[:, 0] + sin_h * goal_dir_w[:, 1]
+    goal_dir_b_y = -sin_h * goal_dir_w[:, 0] + cos_h * goal_dir_w[:, 1]
+    goal_dir_b = torch.stack([goal_dir_b_x, goal_dir_b_y], dim=-1)  # (N, 2)
+
+    goal_forward = (rel_xy * goal_dir_b.unsqueeze(1)).sum(dim=-1)   # (N, K)
+    # Perpendicular (left normal of goal direction)
+    perp_b = torch.stack([-goal_dir_b[:, 1], goal_dir_b[:, 0]], dim=-1)
+    goal_lateral = (rel_xy * perp_b.unsqueeze(1)).sum(dim=-1).abs() # (N, K)
+    goal_corridor = corridor_half_width * 1.5
+    goal_path_mask = (goal_forward > 0.2) & (goal_forward < 5.0) & (goal_lateral < goal_corridor) & active
+    goal_path_blockage = (closeness * goal_path_mask.float()).sum(dim=1) * k_norm
+
+    # ------- TTC proxy from HLC command -------
+    # FrozenLLCActionTerm mirrors the HLC velocity into base_velocity.
+    cmd_xy = env.command_manager.get_command(command_name)[:, :2]   # (N, 2)
+    cmd_speed = cmd_xy.norm(dim=-1)
+    moving = cmd_speed > min_command_speed
+    clearance_m = (frontal_min - 0.20).clamp(min=0.0)  # front margin 0.20 m
+    ttc_val = clearance_m / cmd_speed.clamp(min=min_command_speed)
+    safe_ttc = 1.5
+    ttc_risk = ((safe_ttc - ttc_val) / safe_ttc).clamp(0.0, 1.0)
+    ttc_proxy = torch.where(moving, ttc_risk, torch.zeros_like(ttc_risk))
+
+    # ------- active obstacle count -------
+    obstacle_count_norm = active.float().sum(dim=1) / max(K, 1)
+
+    return torch.stack([
+        nearest_dist_norm,     # [0]
+        nearest_sin,           # [1]
+        nearest_cos,           # [2]
+        frontal_blockage,      # [3]
+        left_blockage,         # [4]
+        right_blockage,        # [5]
+        frontal_min_dist_norm, # [6]
+        left_min_dist_norm,    # [7]
+        right_min_dist_norm,   # [8]
+        preferred_side_hint,   # [9]
+        gap_available,         # [10]
+        gap_width_norm,        # [11]
+        goal_path_blockage,    # [12]
+        ttc_proxy,             # [13]
+        obstacle_count_norm,   # [14]
+        rear_clearance,        # [15]
+    ], dim=-1)  # (N, 16)
+
+
+def prev_hlc_actions(
+    env: ManagerBasedRLEnv,
+    num_frames: int = 2,
+    action_term_name: str = "llc_cmd",
+) -> torch.Tensor:
+    """Return the previous N frames of HLC velocity commands (N, num_frames × 3).
+
+    Maintains env._hlc_action_history of shape (num_envs, num_frames, 3).  On
+    each call it reads raw_actions from the named action term (which holds the
+    velocity command from the PREVIOUS physics step) and:
+      1. Returns the current buffer contents (steps t−1, t−2, ...) as the obs.
+      2. Shifts the buffer left and inserts the latest action at position 0.
+
+    The buffer is zeroed for newly-reset environments so episodes start clean.
+    """
+    buf_key = "_hlc_action_history"
+    if not hasattr(env, buf_key):
+        setattr(env, buf_key, torch.zeros(env.num_envs, num_frames, 3, device=env.device))
+    history: torch.Tensor = getattr(env, buf_key)
+
+    # Zero out history for episodes that just started
+    reset_ids = (env.episode_length_buf == 0).nonzero(as_tuple=False).squeeze(-1)
+    if reset_ids.numel() > 0:
+        history[reset_ids] = 0.0
+
+    # Snapshot previous history to return as observation
+    result = history.flatten(start_dim=1).clone()  # (N, num_frames*3)
+
+    # Read the last completed HLC action and shift into buffer
+    try:
+        term = env.action_manager.get_term(action_term_name)
+        latest = term.raw_actions.detach().clamp(-2.0, 2.0)  # (N, 3)
+    except (AttributeError, KeyError):
+        latest = torch.zeros(env.num_envs, 3, device=env.device)
+
+    if num_frames > 1:
+        history[:, 1:] = history[:, :-1].clone()
+    history[:, 0] = latest
+
+    return result  # (N, num_frames*3)
