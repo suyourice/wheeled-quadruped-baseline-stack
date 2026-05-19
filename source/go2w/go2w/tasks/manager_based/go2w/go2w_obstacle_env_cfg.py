@@ -57,7 +57,7 @@ PLAY_OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(PLAY_PHYSICAL_OBSTACLE_SLO
 CURRICULUM_STEPS_PER_ITERATION = 128
 CURRICULUM_OBSTACLE_START_ITERATION = 1700
 CURRICULUM_OBSTACLE_WARMUP_ITERATIONS = 1000
-CURRICULUM_COLLISION_WARMUP_ITERATIONS = 600
+CURRICULUM_COLLISION_WARMUP_ITERATIONS = 300
 CURRICULUM_SPEED_START_ITERATION = 0
 CURRICULUM_SPEED_WARMUP_ITERATIONS = 800
 NAV_CURRICULUM_COLLISION_START_ITERATION = 0
@@ -68,6 +68,12 @@ OBSTACLE_LIN_VEL_X = (-2.0, 2.0)
 OBSTACLE_LIN_VEL_Y = (-2.0, 2.0)
 OBSTACLE_ANG_VEL_Z = (-2.0, 2.0)
 OBSTACLE_COLLISION_WEIGHT = -40.0
+NAV_TTC_OBSTACLE_RADIUS = 0.22      # 0.3 m square half-diagonal: sqrt(0.15^2 + 0.15^2) ~= 0.212 m, rounded up.
+NAV_TTC_ROBOT_HALF_WIDTH = 0.30     # Wheels reach ~0.22 m from center; extra width covers gait/body sway.
+NAV_TTC_SAFETY_MARGIN = 0.05        # Keeps edge intrusions soft without blocking narrow-gap entries.
+NAV_TTC_FRONT_MARGIN = 0.20         # Approximate front half-length plus a small contact buffer.
+NAV_TTC_LOOKAHEAD_DISTANCE = 2.2    # About 1.1 s at 2.0 m/s, enough to turn without over-penalizing distant gaps.
+NAV_TTC_SUM_CLIP = 1.5              # Caps dense TTC cost when several obstacles overlap the same corridor.
 
 # Navigation task geometry
 NAV_GOAL_FORWARD_RANGE = (2.5, 4.5)
@@ -300,8 +306,8 @@ class NavTeacherRewardsCfg:
     # -- Navigation (goal-conditioned) -----------------------------------------
     goal_progress = RewTerm(
         func=mdp.goal_progress_dense,
-        weight=6.0,
-        params={"clip": 1.5},
+        weight=4.0,
+        params={"clip": 1.0},
     )
     goal_heading = RewTerm(
         func=mdp.goal_heading_tanh_reward,
@@ -310,7 +316,7 @@ class NavTeacherRewardsCfg:
     )
     goal_reached = RewTerm(
         func=mdp.goal_reached_and_resample,
-        weight=50.0,
+        weight=100.0,
         params={
             "position_threshold": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
             "heading_threshold": NAV_GOAL_SUCCESS_HEADING_THRESHOLD,
@@ -335,10 +341,17 @@ class NavTeacherRewardsCfg:
     )
     obstacle_ttc = RewTerm(
         func=mdp.obstacle_nav_ttc_penalty,
-        weight=-3.0,
+        weight=-4.0,
         params={
             "obstacle_names": OBSTACLE_NAMES,
             "safe_ttc": 1.0,
+            "command_name": "base_velocity",
+            "obstacle_radius": NAV_TTC_OBSTACLE_RADIUS,
+            "robot_half_width": NAV_TTC_ROBOT_HALF_WIDTH,
+            "safety_margin": NAV_TTC_SAFETY_MARGIN,
+            "robot_front_margin": NAV_TTC_FRONT_MARGIN,
+            "lookahead_distance": NAV_TTC_LOOKAHEAD_DISTANCE,
+            "sum_clip": NAV_TTC_SUM_CLIP,
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )

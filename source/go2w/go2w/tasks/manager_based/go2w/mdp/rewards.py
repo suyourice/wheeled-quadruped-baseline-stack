@@ -251,34 +251,70 @@ def obstacle_nav_ttc_penalty(
     env: ManagerBasedRLEnv,
     obstacle_names: list[str],
     safe_ttc: float = 1.5,
+    command_name: str = "base_velocity",
+    obstacle_radius: float = 0.22,
+    robot_half_width: float = 0.30,
+    safety_margin: float = 0.05,
+    robot_front_margin: float = 0.20,
+    lookahead_distance: float = 2.2,
+    sum_clip: float = 1.5,
+    min_command_speed: float = 0.05,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Dense TTC-based obstacle avoidance penalty for the navigation teacher.
+    """Soft corridor TTC penalty for the navigation teacher.
 
-    For each obstacle, computes the time-to-collision (TTC) based on the robot's
-    velocity component toward the obstacle. Fires a penalty proportional to how
-    much below safe_ttc the current TTC is. Stationary robots and robots moving
-    away from obstacles receive zero penalty.
+    The HLC command defines the intended path in the robot yaw frame. Obstacles
+    near the edge of that path receive a small penalty, while obstacles deeply
+    inside the swept corridor receive a strong penalty. This keeps narrow-gap
+    entries possible while still discouraging direct base collisions.
 
-        approach_speed = dot(v_robot_xy, unit_toward_obstacle).clamp(min=0)
-        ttc = dist / (approach_speed + eps)
-        penalty = sum_over_obstacles( max(0, safe_ttc - ttc) )
+        corridor_half_width = robot_half_width + obstacle_radius + safety_margin
+        lateral_risk = smoothstep(clamp((corridor_half_width - lateral) / corridor_half_width))
+        ttc = (forward - obstacle_radius - robot_front_margin) / command_speed
+        penalty = sum(lateral_risk * clamp((safe_ttc - ttc) / safe_ttc, 0, 1))
     """
     asset = env.scene[asset_cfg.name]
-    robot_vel_w = asset.data.root_lin_vel_w[:, :2]   # (N, 2)
-    robot_pos_w = asset.data.root_pos_w[:, :2]        # (N, 2)
+    command_xy = env.command_manager.get_command(command_name)[:, :2]      # (N, 2), yaw frame
+    command_speed = command_xy.norm(dim=-1).clamp(min=0.0)                 # (N,)
+    command_dir = command_xy / command_speed.clamp(min=min_command_speed).unsqueeze(-1)
+    moving = command_speed > min_command_speed
+    robot_pos_w = asset.data.root_pos_w[:, :2]                             # (N, 2)
 
     # Stack all obstacle positions into a single (N, K, 2) tensor and process
     # in one pass, replacing K separate GPU kernel sequences with one batched op.
     obs_pos_all = torch.stack(
         [env.scene[n].data.root_pos_w[:, :2] for n in obstacle_names], dim=1
     )  # (N, K, 2)
-    diff = obs_pos_all - robot_pos_w.unsqueeze(1)                          # (N, K, 2)
-    dist = diff.norm(dim=-1).clamp(min=0.01)                               # (N, K)
-    unit = diff / dist.unsqueeze(-1)                                        # (N, K, 2)
-    approach = (robot_vel_w.unsqueeze(1) * unit).sum(dim=-1).clamp(min=0.0)  # (N, K)
-    ttc = dist / (approach + 1e-6)                                         # (N, K)
-    return (safe_ttc - ttc).clamp(min=0.0).sum(dim=1)                     # (N,)
+    rel_w = obs_pos_all - robot_pos_w.unsqueeze(1)                         # (N, K, 2)
+
+    heading = asset.data.heading_w
+    cos_h = torch.cos(heading).unsqueeze(-1)
+    sin_h = torch.sin(heading).unsqueeze(-1)
+    rel_b_x = cos_h * rel_w[..., 0] + sin_h * rel_w[..., 1]
+    rel_b_y = -sin_h * rel_w[..., 0] + cos_h * rel_w[..., 1]
+    rel_b = torch.stack((rel_b_x, rel_b_y), dim=-1)                        # (N, K, 2)
+
+    forward = (rel_b * command_dir.unsqueeze(1)).sum(dim=-1)               # (N, K)
+    lateral = torch.abs(
+        command_dir[:, 0:1] * rel_b[..., 1] - command_dir[:, 1:2] * rel_b[..., 0]
+    )                                                                       # (N, K)
+
+    corridor_half_width = robot_half_width + obstacle_radius + safety_margin
+    intrusion = (corridor_half_width - lateral).clamp(min=0.0, max=corridor_half_width)
+    lateral_alpha = intrusion / corridor_half_width
+    lateral_risk = lateral_alpha * lateral_alpha * (3.0 - 2.0 * lateral_alpha)
+
+    forward_clearance = forward - obstacle_radius - robot_front_margin
+    ttc = forward_clearance / command_speed.clamp(min=min_command_speed).unsqueeze(-1)
+    ttc_risk = ((safe_ttc - ttc) / safe_ttc).clamp(min=0.0, max=1.0)
+
+    active = (
+        moving.unsqueeze(-1)
+        & (forward > 0.0)
+        & (forward_clearance < lookahead_distance)
+    )
+    penalty = lateral_risk * ttc_risk * active.to(lateral_risk.dtype)
+    return penalty.sum(dim=1).clamp(max=sum_clip)
 
 
 def obstacle_contact_penalty(
