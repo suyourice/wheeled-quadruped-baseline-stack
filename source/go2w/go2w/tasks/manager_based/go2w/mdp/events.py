@@ -544,6 +544,18 @@ def reset_navigation_goals_and_obstacles(
     narrow_gap_center_lateral_range: tuple[float, float] = (-0.15, 0.15),
     narrow_gap_half_width_range: tuple[float, float] = (0.38, 0.55),
     narrow_gap_probability: float = 0.35,
+    # New Phase-1 scenario parameters
+    partial_blockage_progress_range: tuple[float, float] = (0.2, 0.75),
+    partial_blockage_lateral_range: tuple[float, float] = (0.5, 1.15),
+    partial_blockage_probability: float = 0.20,
+    narrow_gap_wide_half_width_range: tuple[float, float] = (0.60, 0.80),
+    narrow_gap_barely_half_width_range: tuple[float, float] = (0.35, 0.48),
+    cluttered_progress_range: tuple[float, float] = (0.15, 0.85),
+    cluttered_lateral_range: tuple[float, float] = (-1.2, 1.2),
+    # Curriculum phase schedule: maps start_iteration → available template tuple.
+    # None means "all templates always available".
+    phase_schedule: dict[str, tuple[str, ...]] | None = None,
+    steps_per_iteration: int = 128,
     fixed_goal_forward: float | None = None,
     fixed_goal_lateral: float | None = None,
     fixed_goal_heading_jitter: float | None = None,
@@ -662,6 +674,7 @@ def reset_navigation_goals_and_obstacles(
         "diag_right",
         "off_left",
         "off_right",
+        "cluttered",
     )
     template_codes = {
         "empty": 0,
@@ -674,13 +687,31 @@ def reset_navigation_goals_and_obstacles(
         "off_right": 7,
         "narrow_gap": 8,
         "random_fallback": 9,
+        "partial_blockage_left_open": 10,
+        "partial_blockage_right_open": 11,
+        "cluttered": 12,
+        "narrow_gap_wide": 13,
+        "narrow_gap_barely": 14,
     }
-    valid_fixed_templates = set(template_choices) | {"empty", "narrow_gap", None}
+    _special_fixed = {
+        "empty", "narrow_gap", "narrow_gap_wide", "narrow_gap_barely",
+        "partial_blockage_left_open", "partial_blockage_right_open",
+    }
+    valid_fixed_templates = set(template_choices) | _special_fixed | {None}
     if fixed_template not in valid_fixed_templates:
+        _all_valid = sorted(set(template_choices) | _special_fixed)
         raise ValueError(
             f"Unsupported fixed_scenario_template={fixed_scenario_template!r}. "
-            f"Expected one of: random, empty, narrow_gap, {', '.join(template_choices)}."
+            f"Expected one of: random, {', '.join(_all_valid)}."
         )
+
+    # Determine active template pool from phase_schedule
+    _phase_active_templates: tuple[str, ...] | None = None
+    if phase_schedule is not None:
+        _current_step = env.common_step_counter
+        for _phase_key in sorted(phase_schedule.keys(), key=int):
+            if _current_step >= int(_phase_key) * steps_per_iteration:
+                _phase_active_templates = phase_schedule[_phase_key]
 
     for env_idx in range(n):
         active_count = int(active_counts[env_idx].item())
@@ -746,20 +777,66 @@ def reset_navigation_goals_and_obstacles(
             elif template == "off_right":
                 progress = random.uniform(*offpath_progress_range)
                 lateral_offset = -random.uniform(*offpath_lateral_range)
+            elif template == "partial_blockage_left_open":
+                progress = random.uniform(*partial_blockage_progress_range)
+                lateral_offset = random.uniform(*partial_blockage_lateral_range)
+            elif template == "partial_blockage_right_open":
+                progress = random.uniform(*partial_blockage_progress_range)
+                lateral_offset = -random.uniform(*partial_blockage_lateral_range)
+            elif template == "cluttered":
+                progress = random.uniform(*cluttered_progress_range)
+                lateral_offset = random.uniform(cluttered_lateral_range[0], cluttered_lateral_range[1])
             else:
                 progress = random.uniform(*head_on_progress_range)
                 lateral_offset = random.uniform(*head_on_lateral_range)
             return _place_from_path(progress, lateral_offset)
 
         next_slot = 0
-        use_narrow_gap = fixed_template == "narrow_gap" or (
-            fixed_template is None and active_count >= 2 and random.random() < narrow_gap_probability
+        _ng_set = {"narrow_gap", "narrow_gap_wide", "narrow_gap_barely"}
+        _pb_set = {"partial_blockage_left_open", "partial_blockage_right_open"}
+        _ng_phase_ok = _phase_active_templates is None or bool(_ng_set & set(_phase_active_templates))
+        _pb_phase_ok = _phase_active_templates is None or bool(_pb_set & set(_phase_active_templates))
+        use_narrow_gap = fixed_template in _ng_set or (
+            fixed_template is None and active_count >= 2
+            and _ng_phase_ok and random.random() < narrow_gap_probability
         )
+        use_partial_blockage = (
+            not use_narrow_gap
+            and (
+                fixed_template in _pb_set
+                or (
+                    fixed_template is None and active_count >= 2
+                    and _pb_phase_ok and random.random() < partial_blockage_probability
+                )
+            )
+        )
+
         if active_count >= 2 and use_narrow_gap:
-            scenario_code = template_codes["narrow_gap"]
+            # Determine narrow gap width variant
+            if fixed_template == "narrow_gap_wide":
+                _gap_hwrange = narrow_gap_wide_half_width_range
+                scenario_code = template_codes["narrow_gap_wide"]
+            elif fixed_template == "narrow_gap_barely":
+                _gap_hwrange = narrow_gap_barely_half_width_range
+                scenario_code = template_codes["narrow_gap_barely"]
+            else:
+                if _phase_active_templates is None:
+                    _ng_avail = ["narrow_gap", "narrow_gap_wide", "narrow_gap_barely"]
+                else:
+                    _ng_avail = [t for t in _phase_active_templates if t in _ng_set] or ["narrow_gap"]
+                _ng_pick = random.choice(_ng_avail)
+                if _ng_pick == "narrow_gap_wide":
+                    _gap_hwrange = narrow_gap_wide_half_width_range
+                    scenario_code = template_codes["narrow_gap_wide"]
+                elif _ng_pick == "narrow_gap_barely":
+                    _gap_hwrange = narrow_gap_barely_half_width_range
+                    scenario_code = template_codes["narrow_gap_barely"]
+                else:
+                    _gap_hwrange = narrow_gap_half_width_range
+                    scenario_code = template_codes["narrow_gap"]
             progress = random.uniform(*narrow_gap_progress_range)
             center_lateral = random.uniform(*narrow_gap_center_lateral_range)
-            gap_half_width = random.uniform(*narrow_gap_half_width_range)
+            gap_half_width = random.uniform(*_gap_hwrange)
             pair_offsets = (center_lateral + gap_half_width, center_lateral - gap_half_width)
             for pair_offset in pair_offsets:
                 placed = False
@@ -786,7 +863,51 @@ def reset_navigation_goals_and_obstacles(
                             break
                 next_slot += 1
 
-        if fixed_template in template_choices and next_slot < active_count:
+        elif active_count >= 2 and use_partial_blockage:
+            # Partial blockage: 2 obstacles clustered on one side, opposite side open
+            if fixed_template == "partial_blockage_left_open":
+                _pb_sign = 1.0
+                scenario_code = template_codes["partial_blockage_left_open"]
+            elif fixed_template == "partial_blockage_right_open":
+                _pb_sign = -1.0
+                scenario_code = template_codes["partial_blockage_right_open"]
+            else:
+                _pb_sign = random.choice([-1.0, 1.0])
+                scenario_code = template_codes[
+                    "partial_blockage_left_open" if _pb_sign > 0 else "partial_blockage_right_open"
+                ]
+            progress = random.uniform(*partial_blockage_progress_range)
+            lat_base = random.uniform(*partial_blockage_lateral_range)
+            pb_offsets = (_pb_sign * lat_base, _pb_sign * (lat_base + 0.5))
+            for pb_offset in pb_offsets:
+                placed = False
+                for _ in range(30):
+                    _pb_prog = progress + random.uniform(-0.05, 0.05)
+                    local_x, local_y = _place_from_path(_pb_prog, pb_offset)
+                    if _valid_position(local_x, local_y):
+                        placed_positions.append((local_x, local_y))
+                        world_positions_per_slot[next_slot][env_idx, 0] = origin_x + local_x
+                        world_positions_per_slot[next_slot][env_idx, 1] = origin_y + local_y
+                        world_positions_per_slot[next_slot][env_idx, 2] = obstacle_z
+                        placed = True
+                        break
+                if not placed:
+                    for _ in range(40):
+                        local_x = random.uniform(*spawn_range_x)
+                        local_y = random.uniform(*spawn_range_y)
+                        if _valid_position(local_x, local_y):
+                            scenario_code = template_codes["random_fallback"]
+                            placed_positions.append((local_x, local_y))
+                            world_positions_per_slot[next_slot][env_idx, 0] = origin_x + local_x
+                            world_positions_per_slot[next_slot][env_idx, 1] = origin_y + local_y
+                            world_positions_per_slot[next_slot][env_idx, 2] = obstacle_z
+                            placed = True
+                            break
+                next_slot += 1
+
+        # Place first obstacle for non-special fixed templates (excluding cluttered, which
+        # fills all slots uniformly rather than placing a single "anchor" obstacle).
+        if fixed_template in template_choices and fixed_template != "cluttered" and next_slot < active_count:
             scenario_code = template_codes[fixed_template]
             placed = False
             for _ in range(40):
@@ -812,10 +933,20 @@ def reset_navigation_goals_and_obstacles(
                         break
             next_slot += 1
 
+        # Build the fill-loop template pool, respecting fixed_template and phase.
+        if fixed_template == "cluttered":
+            scenario_code = template_codes["cluttered"]
+            _fill_choices: tuple[str, ...] = ("cluttered",)
+        elif _phase_active_templates is not None:
+            _filtered = tuple(t for t in template_choices if t in _phase_active_templates)
+            _fill_choices = _filtered if _filtered else template_choices
+        else:
+            _fill_choices = template_choices
+
         while next_slot < active_count:
             placed = False
             for _ in range(40):
-                template = random.choice(template_choices)
+                template = random.choice(_fill_choices)
                 local_x, local_y = _sample_template_position(template)
                 if _valid_position(local_x, local_y):
                     if scenario_code == template_codes["empty"]:

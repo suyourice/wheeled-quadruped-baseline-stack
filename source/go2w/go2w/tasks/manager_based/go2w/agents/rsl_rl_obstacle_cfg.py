@@ -21,9 +21,10 @@ from isaaclab_rl.rsl_rl import (
 class NavTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
     """PPO runner for the RL navigation teacher.
 
-    The actor observes 189D HLC navigation features and outputs a 3D velocity
-    command. The frozen fast-flat LLC checkpoint is loaded by the environment
-    action term, not by the PPO actor.
+    The actor observes 211D privileged HLC navigation features
+    (9D proprio + 180D obstacle depth + 16D geometry features + 6D action history)
+    and outputs a 3D velocity command. The frozen fast-flat LLC checkpoint is
+    loaded by the environment action term, not by the PPO actor.
     """
 
     num_steps_per_env = 128
@@ -72,7 +73,7 @@ class SimpleNavDistillAlgorithmCfg(RslRlDistillationAlgorithmCfg):
 
 @configclass
 class NavRLTeacherModelCfg(RslRlMLPModelCfg):
-    """Privileged teacher model (189D obs -> 3D HLC velocity, no normalization)."""
+    """Privileged teacher model (211D obs -> 3D HLC velocity, no normalization)."""
 
     class_name: str = "rsl_rl.models:MLPModel"
     obs_normalization: bool = False

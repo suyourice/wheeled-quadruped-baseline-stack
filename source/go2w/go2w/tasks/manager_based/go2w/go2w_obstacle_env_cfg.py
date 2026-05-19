@@ -8,9 +8,10 @@ Go2-W HLC/LLC navigation teacher and LiDAR student distillation environment.
 
 Training flow:
   1. Train RL navigation teacher (PPO) on goal-conditioned task:
-       obs  = base_lin_vel(3) + projected_gravity(3) + goal_command(3) + obstacle_polar_depth(180) = 189D
+       obs  = base_lin_vel(3) + projected_gravity(3) + goal_command(3)
+              + obstacle_polar_depth(180) + obstacle_nav_features(16) + prev_hlc_actions(6) = 211D
        acts = FrozenLLCActionTerm: 3D velocity [vx,vy,yaw] -> frozen fast-flat LLC -> 16D joints
-  2. Distill teacher into LiDAR student (action MSE, both 189D so direct MSE works):
+  2. Distill teacher into LiDAR student (action MSE, teacher=211D, student=189D):
        student obs = base_lin_vel(3) + projected_gravity(3) + goal_command(3) + lidar_scan(180) = 189D
 
   train.py --task Nav-Teacher-Go2w-v0 --locomotion_checkpoint <fast-flat-ckpt>
@@ -93,7 +94,40 @@ NAV_OFFPATH_LATERAL_RANGE = (1.3, 2.2)
 NAV_NARROW_GAP_PROGRESS_RANGE = (0.35, 0.75)
 NAV_NARROW_GAP_CENTER_LATERAL_RANGE = (-0.15, 0.15)
 NAV_NARROW_GAP_HALF_WIDTH_RANGE = (0.45, 0.65)
+NAV_NARROW_GAP_WIDE_HALF_WIDTH_RANGE = (0.60, 0.80)
+NAV_NARROW_GAP_BARELY_HALF_WIDTH_RANGE = (0.40, 0.52)  # physical gap: 0.50–0.74 m; min ≥ robot wheel span 0.44 m
 NAV_NARROW_GAP_PROBABILITY = 0.25
+NAV_PARTIAL_BLOCKAGE_PROGRESS_RANGE = (0.2, 0.75)
+NAV_PARTIAL_BLOCKAGE_LATERAL_RANGE = (0.5, 1.15)
+NAV_PARTIAL_BLOCKAGE_PROBABILITY = 0.20
+NAV_CLUTTERED_PROGRESS_RANGE = (0.15, 0.85)
+NAV_CLUTTERED_LATERAL_RANGE = (-1.2, 1.2)
+
+# Curriculum phase schedule: maps start_iteration → tuple of template names available.
+# Phase 0 (from iter 0): basic 7 templates + standard narrow gap.
+# Phase 1 (from iter 500): add partial blockage variants.
+# Phase 2 (from iter 1000): add wide/barely narrow gap variants + cluttered corridor.
+NAV_CURRICULUM_PHASE_SCHEDULE = {
+    "0": (
+        "head_on", "left_edge", "right_edge",
+        "diag_left", "diag_right", "off_left", "off_right",
+        "narrow_gap",
+    ),
+    "500": (
+        "head_on", "left_edge", "right_edge",
+        "diag_left", "diag_right", "off_left", "off_right",
+        "narrow_gap",
+        "partial_blockage_left_open", "partial_blockage_right_open",
+    ),
+    "1000": (
+        "head_on", "left_edge", "right_edge",
+        "diag_left", "diag_right", "off_left", "off_right",
+        "narrow_gap", "narrow_gap_wide", "narrow_gap_barely",
+        "partial_blockage_left_open", "partial_blockage_right_open",
+        "cluttered",
+    ),
+}
+
 NAV_GOAL_DISTANCE_STD = 1.2
 NAV_GOAL_HEADING_STD = 0.8
 NAV_GOAL_SUCCESS_POSITION_THRESHOLD = 0.35
@@ -107,7 +141,7 @@ NAV_LOCAL_PLANNER_ACTIVATION_THRESHOLD = 0.22
 NAV_LOCAL_PLANNER_LATERAL_PENALTY = 0.16
 NAV_LOCAL_PLANNER_MIN_IMPROVEMENT = 0.07
 NAV_LOCAL_PLANNER_MAX_BLEND = 0.65
-NAV_WAYPOINT_COMMAND_MIN_FORWARD = 0.0
+NAV_WAYPOINT_COMMAND_MIN_FORWARD = -0.3
 NAV_WAYPOINT_COMMAND_MAX_LATERAL = 1.5
 NAV_WAYPOINT_COMMAND_MAX_HEADING = 0.90
 
@@ -241,6 +275,15 @@ _NAV_RESET_PARAMS_BASE = {
     "narrow_gap_center_lateral_range": NAV_NARROW_GAP_CENTER_LATERAL_RANGE,
     "narrow_gap_half_width_range": NAV_NARROW_GAP_HALF_WIDTH_RANGE,
     "narrow_gap_probability": NAV_NARROW_GAP_PROBABILITY,
+    "narrow_gap_wide_half_width_range": NAV_NARROW_GAP_WIDE_HALF_WIDTH_RANGE,
+    "narrow_gap_barely_half_width_range": NAV_NARROW_GAP_BARELY_HALF_WIDTH_RANGE,
+    "partial_blockage_progress_range": NAV_PARTIAL_BLOCKAGE_PROGRESS_RANGE,
+    "partial_blockage_lateral_range": NAV_PARTIAL_BLOCKAGE_LATERAL_RANGE,
+    "partial_blockage_probability": NAV_PARTIAL_BLOCKAGE_PROBABILITY,
+    "cluttered_progress_range": NAV_CLUTTERED_PROGRESS_RANGE,
+    "cluttered_lateral_range": NAV_CLUTTERED_LATERAL_RANGE,
+    "phase_schedule": None,
+    "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
     "fixed_goal_forward": None,
     "fixed_goal_lateral": None,
     "fixed_goal_heading_jitter": None,
@@ -306,7 +349,7 @@ class NavTeacherRewardsCfg:
     # -- Navigation (goal-conditioned) -----------------------------------------
     goal_progress = RewTerm(
         func=mdp.goal_progress_dense,
-        weight=4.0,
+        weight=5.0,
         params={"clip": 1.0},
     )
     goal_heading = RewTerm(
@@ -337,6 +380,31 @@ class NavTeacherRewardsCfg:
             "start_iteration": NAV_CURRICULUM_COLLISION_START_ITERATION,
             "warmup_iterations": CURRICULUM_COLLISION_WARMUP_ITERATIONS,
             "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
+        },
+    )
+    nav_clearance = RewTerm(
+        func=mdp.nav_clearance_penalty,
+        weight=-1.5,
+        params={
+            "obstacle_names": OBSTACLE_NAMES,
+            "min_safe_dist": 0.8,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    nav_lateral_escape = RewTerm(
+        func=mdp.nav_frontal_blocked_lateral_escape_reward,
+        weight=2.5,
+        params={
+            "obstacle_names": OBSTACLE_NAMES,
+            "robot_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    nav_backward_escape = RewTerm(
+        func=mdp.nav_backward_escape_reward,
+        weight=0.5,
+        params={
+            "obstacle_names": OBSTACLE_NAMES,
+            "robot_cfg": SceneEntityCfg("robot"),
         },
     )
     obstacle_ttc = RewTerm(
@@ -416,9 +484,9 @@ class NavTeacherRewardsCfg:
 
 @configclass
 class NavTeacherObsCfg:
-    """PPO observations for the RL navigation teacher (189D).
+    """PPO observations for the RL navigation teacher (211D).
 
-    proprio(9D) + privileged obstacle polar depth(180D).
+    proprio(9D) + obstacle_polar_depth(180D) + obstacle_nav_features(16D) + prev_hlc_actions(6D).
     """
 
     @configclass
@@ -448,6 +516,23 @@ class NavTeacherObsCfg:
             },
         )
 
+        # Privileged geometry features (16D): nearest/frontal/side clearance,
+        # preferred lateral escape direction, gap detection, TTC proxy.
+        obstacle_nav_features = ObsTerm(
+            func=mdp.obstacle_navigation_features,
+            params={
+                "obstacle_names": OBSTACLE_NAMES,
+                "robot_cfg": SceneEntityCfg("robot"),
+                "command_name": "base_velocity",
+            },
+        )
+
+        # Short temporal action history (2 frames × 3D = 6D).
+        prev_actions = ObsTerm(
+            func=mdp.prev_hlc_actions,
+            params={"num_frames": 2, "action_term_name": "llc_cmd"},
+        )
+
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
@@ -460,7 +545,7 @@ class NavRLDistillObsCfg:
     """Distillation observations: student (LiDAR) and teacher (privileged).
 
     student: proprio(9D) + lidar_scan(180D) = 189D
-    teacher: proprio(9D) + obstacle_polar_depth(180D) = 189D
+    teacher: proprio(9D) + obstacle_polar_depth(180D) + obstacle_nav_features(16D) + prev_hlc_actions(6D) = 211D
     """
 
     @configclass
@@ -496,7 +581,7 @@ class NavRLDistillObsCfg:
 
     @configclass
     class TeacherCfg(ObsGroup):
-        """Privileged teacher observations (189D, matches NavTeacherObsCfg.PolicyCfg)."""
+        """Privileged teacher observations (211D, must match NavTeacherObsCfg.PolicyCfg)."""
 
         base_lin_vel      = ObsTerm(func=mdp.base_lin_vel,      noise=Unoise(n_min=-0.1,  n_max=0.1))
         projected_gravity = ObsTerm(func=mdp.projected_gravity,  noise=Unoise(n_min=-0.05, n_max=0.05))
@@ -520,6 +605,20 @@ class NavRLDistillObsCfg:
                 "num_bins": 180,
                 "max_distance": LIDAR_MAX_DISTANCE,
             },
+        )
+
+        obstacle_nav_features = ObsTerm(
+            func=mdp.obstacle_navigation_features,
+            params={
+                "obstacle_names": OBSTACLE_NAMES,
+                "robot_cfg": SceneEntityCfg("robot"),
+                "command_name": "base_velocity",
+            },
+        )
+
+        prev_actions = ObsTerm(
+            func=mdp.prev_hlc_actions,
+            params={"num_frames": 2, "action_term_name": "llc_cmd"},
         )
 
         def __post_init__(self):
@@ -572,6 +671,7 @@ class Go2wNavTeacherEnvCfg(Go2wEnvCfg):
             "max_obstacles": 12,
             "empty_env_fraction": 0.1,
             "min_inter_obstacle_dist": 0.7,
+            "phase_schedule": NAV_CURRICULUM_PHASE_SCHEDULE,
         }
 
         # Episode never terminates on goal reached — goal_reached_and_resample
@@ -593,6 +693,7 @@ class Go2wNavTeacherEnvCfg_PLAY(Go2wNavTeacherEnvCfg):
         self.events.add_base_mass = None
         self.observations.policy.enable_corruption = False
         self.observations.policy.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        self.observations.policy.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
         # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
         self.commands.base_velocity.debug_vis = True
 
@@ -626,6 +727,7 @@ class Go2wNavRLDistillEnvCfg(Go2wNavTeacherEnvCfg):
             "max_obstacles": 5,
             "empty_env_fraction": 0.05,
             "min_inter_obstacle_dist": 0.7,
+            "phase_schedule": NAV_CURRICULUM_PHASE_SCHEDULE,
         }
 
 
@@ -643,6 +745,7 @@ class Go2wNavRLDistillEnvCfg_PLAY(Go2wNavRLDistillEnvCfg):
         self.events.add_base_mass = None
         self.observations.student.enable_corruption = False
         self.observations.teacher.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        self.observations.teacher.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
         # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
         self.commands.base_velocity.debug_vis = True
 
