@@ -90,7 +90,45 @@ parser.add_argument(
         "narrow_gap",
     ],
     default="random",
-    help="Navigation play tasks only: force the sampled obstacle template.",
+    help="Navigation play tasks only: force the sampled obstacle template (legacy; use --scenario).",
+)
+parser.add_argument(
+    "--scenario",
+    dest="scenario",
+    choices=[
+        "random",
+        "empty",
+        "head_on",
+        "left_edge",
+        "right_edge",
+        "diag_left",
+        "diag_right",
+        "off_left",
+        "off_right",
+        "narrow_gap",
+        "narrow_gap_wide",
+        "narrow_gap_barely",
+        "partial_blockage_left_open",
+        "partial_blockage_right_open",
+        "cluttered",
+    ],
+    default=None,
+    help=(
+        "Navigation play tasks only: force this scenario template on every reset. "
+        "Takes precedence over --nav_case. "
+        "Choices include all Phase-0/1/2 templates."
+    ),
+)
+parser.add_argument(
+    "--fixed_layout",
+    "--fixed-layout",
+    dest="fixed_layout",
+    action="store_true",
+    default=False,
+    help=(
+        "Navigation play tasks only: use the same obstacle/goal layout on every "
+        "episode reset (seeded from --seed). Does NOT affect training."
+    ),
 )
 parser.add_argument(
     "--nav_fixed_start",
@@ -434,15 +472,22 @@ def _override_play_command_path_spawn(
 def _override_navigation_play_case(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     args_cli: argparse.Namespace,
+    env_seed: int,
 ):
-    """Override start/goal/template sampling for navigation play tasks."""
+    """Override start/goal/template sampling and layout seed for navigation play tasks."""
     events_cfg = getattr(env_cfg, "events", None)
     reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
     reset_base = getattr(events_cfg, "reset_base", None) if events_cfg is not None else None
     reset_params = getattr(reset_obstacles, "params", None)
 
+    # --scenario takes precedence over legacy --nav_case.
+    effective_scenario = args_cli.scenario if args_cli.scenario is not None else None
+    if effective_scenario is None and args_cli.nav_case != "random":
+        effective_scenario = args_cli.nav_case
+
     has_nav_override = (
-        args_cli.nav_case != "random"
+        effective_scenario is not None
+        or args_cli.fixed_layout
         or args_cli.nav_goal_forward is not None
         or args_cli.nav_goal_lateral is not None
         or args_cli.nav_goal_heading_jitter is not None
@@ -457,16 +502,27 @@ def _override_navigation_play_case(
     if not has_nav_override:
         return
     if reset_params is None or "fixed_scenario_template" not in reset_params:
-        raise ValueError("Navigation play overrides require a navigation-distillation play task.")
+        raise ValueError("Navigation play overrides require a navigation play task (Nav-Teacher-Go2w-Play-v0 or similar).")
 
-    if args_cli.nav_case != "random":
-        reset_params["fixed_scenario_template"] = args_cli.nav_case
+    if effective_scenario is not None:
+        reset_params["fixed_scenario_template"] = effective_scenario
+    if args_cli.fixed_layout:
+        reset_params["fixed_layout_seed"] = env_seed
+        print(f"[INFO] Fixed layout enabled: every episode reset uses seed={env_seed}")
     if args_cli.nav_goal_forward is not None:
         reset_params["fixed_goal_forward"] = args_cli.nav_goal_forward
+        # Goal resampling after success uses the range params captured in
+        # _nav_resample_on_goal, so pin the range too for repeated fixed tests.
+        reset_params["goal_forward_range"] = (args_cli.nav_goal_forward, args_cli.nav_goal_forward)
     if args_cli.nav_goal_lateral is not None:
         reset_params["fixed_goal_lateral"] = args_cli.nav_goal_lateral
+        reset_params["goal_lateral_range"] = (args_cli.nav_goal_lateral, args_cli.nav_goal_lateral)
     if args_cli.nav_goal_heading_jitter is not None:
         reset_params["fixed_goal_heading_jitter"] = args_cli.nav_goal_heading_jitter
+        reset_params["goal_heading_jitter_range"] = (
+            args_cli.nav_goal_heading_jitter,
+            args_cli.nav_goal_heading_jitter,
+        )
     if args_cli.nav_min_inter_obstacle_dist is not None:
         reset_params["min_inter_obstacle_dist"] = args_cli.nav_min_inter_obstacle_dist
     if args_cli.nav_start_exclusion_radius is not None:
@@ -498,14 +554,14 @@ def _override_navigation_play_case(
         print(f"[INFO] Navigation fixed start: x={start_x:.2f}, y={start_y:.2f}, yaw={start_yaw:.2f}")
 
     print(
-        "[INFO] Navigation play case: "
-        f"case={reset_params.get('fixed_scenario_template') or 'random'}, "
+        "[INFO] Navigation play overrides: "
+        f"scenario={reset_params.get('fixed_scenario_template') or 'random'}, "
+        f"fixed_layout={args_cli.fixed_layout}, "
         f"goal_forward={reset_params.get('fixed_goal_forward')}, "
         f"goal_lateral={reset_params.get('fixed_goal_lateral')}, "
         f"goal_heading_jitter={reset_params.get('fixed_goal_heading_jitter')}, "
         f"min_inter_obstacle_dist={reset_params.get('min_inter_obstacle_dist')}, "
-        f"start_exclusion_radius={reset_params.get('start_exclusion_radius')}, "
-        f"head_on_progress_range={reset_params.get('head_on_progress_range')}"
+        f"start_exclusion_radius={reset_params.get('start_exclusion_radius')}"
     )
 
 
@@ -535,7 +591,59 @@ def _format_eval_metrics(metrics: dict[str, float], completed_episodes: int, avg
     return " ".join(parts)
 
 
-def _print_navigation_play_log(obs, dones: torch.Tensor, step_count: int, env_index: int) -> None:
+_NAV_SCENARIO_ID_TO_NAME: dict[int, str] = {
+    0: "empty", 1: "head_on", 2: "left_edge", 3: "right_edge",
+    4: "diag_left", 5: "diag_right", 6: "off_left", 7: "off_right",
+    8: "narrow_gap", 9: "random_fallback",
+    10: "partial_blockage_left_open", 11: "partial_blockage_right_open",
+    12: "cluttered", 13: "narrow_gap_wide", 14: "narrow_gap_barely",
+}
+
+
+def _get_nav_env_info(base_env, env_index: int, last_hlc_cmd: torch.Tensor | None) -> dict:
+    """Collect nav task state for the watched env. Returns empty dict if not a nav task."""
+    info: dict = {}
+    if not hasattr(base_env, "_go2w_goal_pos_w"):
+        return info
+
+    ei = max(0, min(env_index, base_env.num_envs - 1))
+
+    scenario_id = int(base_env._go2w_scenario_template_id[ei].item()) if hasattr(base_env, "_go2w_scenario_template_id") else -1
+    info["scenario"] = _NAV_SCENARIO_ID_TO_NAME.get(scenario_id, f"id{scenario_id}")
+
+    goal = base_env._go2w_goal_pos_w[ei]
+    info["goal"] = (goal[0].item(), goal[1].item(), goal[2].item())
+
+    goals_reached = float(base_env._go2w_goals_reached_episode[ei].item()) if hasattr(base_env, "_go2w_goals_reached_episode") else 0.0
+    info["goals_reached"] = goals_reached
+
+    # HLC command (last policy output, 3D: vx vy yaw)
+    if last_hlc_cmd is not None and last_hlc_cmd.ndim == 2 and last_hlc_cmd.shape[0] > ei:
+        cmd = last_hlc_cmd[ei]
+        info["hlc_cmd"] = (cmd[0].item(), cmd[1].item(), cmd[2].item())
+
+    # Active obstacle positions (filter out obstacles parked >100 m away)
+    obstacle_names: list[str] = []
+    try:
+        obstacle_names = base_env.cfg.events.reset_obstacles.params.get("obstacle_names", [])
+    except Exception:
+        pass
+    active_obs = []
+    for name in obstacle_names:
+        try:
+            pos = base_env.scene[name].data.root_pos_w[ei]
+            x, y = pos[0].item(), pos[1].item()
+            if abs(x) < 500.0 and abs(y) < 500.0:
+                active_obs.append((x, y))
+        except Exception:
+            pass
+    info["obstacles"] = active_obs
+
+    return info
+
+
+def _print_navigation_play_log(obs, dones: torch.Tensor, step_count: int, env_index: int,
+                                base_env=None, last_hlc_cmd=None) -> None:
     """Print navigation task diagnostics from the policy obs group."""
     # Works for both PPO (policy group) and distillation (student/teacher groups).
     group_key = "policy" if isinstance(obs, dict) and "policy" in obs else None
@@ -561,12 +669,68 @@ def _print_navigation_play_log(obs, dones: torch.Tensor, step_count: int, env_in
         state_text = f"base_ang_vel=[{_format_vector(base_ang_vel)}]"
     done = int(dones[env_index].item()) if dones.numel() > env_index else 0
 
+    nav = _get_nav_env_info(base_env, env_index, last_hlc_cmd) if base_env is not None else {}
+    scenario_str = f" scenario={nav['scenario']}" if "scenario" in nav else ""
+    goals_str = f" goals={nav['goals_reached']:.0f}" if "goals_reached" in nav else ""
+    hlc_str = ""
+    if "hlc_cmd" in nav:
+        vx, vy, yaw = nav["hlc_cmd"]
+        hlc_str = f" hlc=[{vx:+.2f},{vy:+.2f},{yaw:+.2f}]"
+
     print(
         "[nav-play] "
-        f"step={step_count} env={env_index} done={done} "
+        f"step={step_count} env={env_index} done={done}"
+        f"{scenario_str}{goals_str}{hlc_str} "
         f"goal_cmd=[{_format_vector(goal_command)}] "
         f"base_lin_vel=[{_format_vector(base_lin_vel)}] "
         f"{state_text}"
+    )
+
+
+def _print_nav_episode_log(
+    base_env,
+    done_ids: torch.Tensor,
+    env_index: int,
+    last_hlc_cmd: torch.Tensor | None,
+    episode_collision_counts: dict[int, int],
+) -> None:
+    """Print a summary when an episode ends for the watched env."""
+    if base_env is None or not hasattr(base_env, "_go2w_goal_pos_w"):
+        return
+    ei = max(0, min(env_index, base_env.num_envs - 1))
+    if ei not in done_ids.tolist():
+        return
+
+    nav = _get_nav_env_info(base_env, ei, last_hlc_cmd)
+    if not nav:
+        return
+
+    goal_x, goal_y, goal_z = nav.get("goal", (0, 0, 0))
+    hlc_str = ""
+    if "hlc_cmd" in nav:
+        vx, vy, yaw = nav["hlc_cmd"]
+        hlc_str = f"  hlc_cmd: vx={vx:+.3f} vy={vy:+.3f} yaw={yaw:+.3f}\n"
+
+    obs_lines = ""
+    obstacles = nav.get("obstacles", [])
+    if obstacles:
+        obs_parts = [f"    [{x:+.2f}, {y:+.2f}]" for x, y in obstacles]
+        obs_lines = "  obstacles (" + str(len(obstacles)) + " active):\n" + "\n".join(obs_parts) + "\n"
+    else:
+        obs_lines = "  obstacles: none active\n"
+
+    collisions = episode_collision_counts.get(ei, 0)
+
+    print(
+        f"[nav-episode] env={ei}\n"
+        f"  scenario:      {nav.get('scenario', '?')}\n"
+        f"  goal_world:    [{goal_x:+.3f}, {goal_y:+.3f}, {goal_z:+.3f}]\n"
+        f"  goals_reached: {nav.get('goals_reached', 0):.0f}\n"
+        f"  collisions:    {collisions}\n"
+        f"{hlc_str}"
+        f"{obs_lines}"
+        ,
+        end="",
     )
 
 
@@ -589,17 +753,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.command_path_lateral_range,
         args_cli.command_path_min_speed,
     )
-    _override_navigation_play_case(env_cfg, args_cli)
 
-    # handle deprecated configurations
+    # Resolve seed early so _override_navigation_play_case can inject fixed_layout_seed.
+    # handle_deprecated_rsl_rl_cfg does not affect the seed path, so order is safe.
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-
-    # set the environment seed
-    # note: certain randomizations occur in the environment initialization so we set the seed here
     env_seed = _resolve_play_seed(args_cli, agent_cfg.seed)
     agent_cfg.seed = env_seed
     env_cfg.seed = env_seed
     print(f"[INFO] Play seed: {env_seed}")
+
+    _override_navigation_play_case(env_cfg, args_cli, env_seed)
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # specify directory for logging experiments
@@ -702,12 +865,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     timestep = 0
     step_count = 0
+    last_hlc_cmd: torch.Tensor | None = None
+    episode_collision_counts: dict[int, int] = defaultdict(int)
     episode_lengths = torch.zeros(env.unwrapped.num_envs, device=env.unwrapped.device, dtype=torch.long)
     completed_episodes = 0
     total_episode_length = 0.0
     termination_manager = getattr(env.unwrapped, "termination_manager", None)
     termination_names = list(termination_manager.active_terms) if termination_manager is not None else []
     termination_counts: dict[str, int] = defaultdict(int)
+    _obstacle_contact_term_idx: int | None = (
+        termination_names.index("obstacle_contact") if "obstacle_contact" in termination_names else None
+    )
     multi_term_episodes = 0
 
     # Goal/start visualization markers — only created for nav tasks.
@@ -755,6 +923,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             else:
                 policy_nn.reset(dones)
 
+        # Track last HLC command (policy output = 3D velocity) for logging.
+        last_hlc_cmd = actions.detach()
+
         # Update goal/start markers for nav tasks.
         if _nav_goal_marker is not None:
             goal_pos = _base_env._go2w_goal_pos_w.clone()
@@ -769,8 +940,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         num_done = int(done_ids.numel())
         if num_done > 0:
             total_episode_length += float(episode_lengths[done_ids].sum().item())
-            episode_lengths[done_ids] = 0
-            completed_episodes += num_done
             done_terms = (
                 termination_manager._last_episode_dones[done_ids] if termination_manager is not None else None
             )
@@ -778,9 +947,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 multi_term_episodes += int((done_terms.sum(dim=1) > 1).sum().item())
                 for idx, term_name in enumerate(termination_names):
                     termination_counts[term_name] += int(done_terms[:, idx].sum().item())
+                # Track per-env obstacle collision terminations for episode log.
+                if _obstacle_contact_term_idx is not None:
+                    for i, env_id in enumerate(done_ids.tolist()):
+                        if done_terms[i, _obstacle_contact_term_idx].item():
+                            episode_collision_counts[env_id] += 1
+
+            # Print episode summary for the watched nav env before resetting counts.
+            _print_nav_episode_log(
+                _base_env, done_ids, args_cli.nav_log_env, last_hlc_cmd, episode_collision_counts
+            )
+            # Reset collision count for episodes that just ended.
+            for env_id in done_ids.tolist():
+                episode_collision_counts[env_id] = 0
+            episode_lengths[done_ids] = 0
+            completed_episodes += num_done
 
         if args_cli.nav_log_interval > 0 and step_count % args_cli.nav_log_interval == 0:
-            _print_navigation_play_log(obs, dones, step_count, args_cli.nav_log_env)
+            _print_navigation_play_log(
+                obs, dones, step_count, args_cli.nav_log_env, _base_env, last_hlc_cmd
+            )
         if args_cli.nav_eval_episodes > 0 and (
             completed_episodes >= args_cli.nav_eval_episodes
             or (num_done > 0 and completed_episodes % max(args_cli.nav_eval_episodes // 4, 1) < num_done)
