@@ -93,6 +93,17 @@ def _ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
         env._go2w_start_heading_w = torch.zeros(env.num_envs, device=env.device)
     if not hasattr(env, "_go2w_scenario_template_id"):
         env._go2w_scenario_template_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    # Passable narrow-gap metadata: gap centerline in world frame, half width, and
+    # a passable flag set only for the narrow_gap / narrow_gap_wide / narrow_gap_barely
+    # scenarios. Reward helpers use these to encourage decisive gap traversal.
+    if not hasattr(env, "_go2w_gap_center_w"):
+        env._go2w_gap_center_w = torch.zeros(env.num_envs, 2, device=env.device)
+        env._go2w_gap_dir_w = torch.zeros(env.num_envs, 2, device=env.device)
+        env._go2w_gap_half_width = torch.zeros(env.num_envs, device=env.device)
+        env._go2w_gap_passable = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    # Per-env stuck counter for cluttered/blocked recovery diagnostics and gating.
+    if not hasattr(env, "_go2w_stuck_counter"):
+        env._go2w_stuck_counter = torch.zeros(env.num_envs, device=env.device)
 
 
 def reset_obstacles_curriculum(
@@ -448,6 +459,13 @@ def _resample_nav_on_goal_reached(
     env._go2w_start_pos_w[env_ids] = curr_pos_w
     env._go2w_start_heading_w[env_ids] = yaw_t.clone()
 
+    # Mid-episode resample produces a generic random layout (not a templated gap),
+    # so disable the passable-gap shaping and reset the stuck counter for these envs.
+    if hasattr(env, "_go2w_gap_passable"):
+        env._go2w_gap_passable[env_ids] = False
+    if hasattr(env, "_go2w_stuck_counter"):
+        env._go2w_stuck_counter[env_ids] = 0.0
+
     # --- place obstacles (vectorized over n envs, sequential over obstacle slots) ---
     # Fallback position: park away from the arena so the obstacle is inactive.
     park_xy = curr_pos_w[:, :2].clone()
@@ -687,6 +705,13 @@ def reset_navigation_goals_and_obstacles(
     parked_world[:, 2] = obstacle_z
     world_positions_per_slot = [parked_world.clone() for _ in obstacle_names]
 
+    # Per-call passable-gap metadata buffers, filled in the narrow-gap branch below.
+    # Defaults (zeros / not passable) cover every non-gap scenario.
+    gap_center_w_buf = torch.zeros(n, 2, device=device)
+    gap_dir_w_buf = torch.zeros(n, 2, device=device)
+    gap_half_w_buf = torch.zeros(n, device=device)
+    gap_passable_buf = torch.zeros(n, dtype=torch.bool, device=device)
+
     template_choices = (
         "head_on",
         "left_edge",
@@ -859,6 +884,15 @@ def reset_navigation_goals_and_obstacles(
             center_lateral = random.uniform(*narrow_gap_center_lateral_range)
             gap_half_width = random.uniform(*_gap_hwrange)
             pair_offsets = (center_lateral + gap_half_width, center_lateral - gap_half_width)
+            # Store the gap centerline (world frame) and half width so reward helpers
+            # can score traversal. The path direction equals the world direction
+            # because env origins are pure translations of the world frame.
+            _gap_cx_local, _gap_cy_local = _place_from_path(progress, center_lateral)
+            gap_center_w_buf[env_idx, 0] = origin_x + _gap_cx_local
+            gap_center_w_buf[env_idx, 1] = origin_y + _gap_cy_local
+            gap_dir_w_buf[env_idx, 0] = path_dir_x
+            gap_dir_w_buf[env_idx, 1] = path_dir_y
+            gap_half_w_buf[env_idx] = gap_half_width
             for pair_offset in pair_offsets:
                 placed = False
                 for _ in range(30):
@@ -994,6 +1028,20 @@ def reset_navigation_goals_and_obstacles(
             next_slot += 1
 
         env._go2w_scenario_template_id[env_ids[env_idx]] = scenario_code
+        # Only flag passable when both gap obstacles were actually placed at the
+        # gap (scenario_code stays a gap type; it is downgraded to random_fallback
+        # if placement fell back to uniform spawn).
+        if scenario_code in (
+            template_codes["narrow_gap"],
+            template_codes["narrow_gap_wide"],
+            template_codes["narrow_gap_barely"],
+        ):
+            gap_passable_buf[env_idx] = True
+
+    env._go2w_gap_center_w[env_ids] = gap_center_w_buf
+    env._go2w_gap_dir_w[env_ids] = gap_dir_w_buf
+    env._go2w_gap_half_width[env_ids] = gap_half_w_buf
+    env._go2w_gap_passable[env_ids] = gap_passable_buf
 
     for slot_idx, name in enumerate(obstacle_names):
         obstacle = env.scene[name]

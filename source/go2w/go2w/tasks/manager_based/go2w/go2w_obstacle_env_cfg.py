@@ -51,6 +51,14 @@ PLAY_NUM_OBSTACLES = PLAY_DEFAULT_ACTIVE_OBSTACLES
 PLAY_MIN_INTER_OBSTACLE_DIST = 0.7
 
 OBSTACLE_SIZE = (0.3, 0.3, 0.5)
+# Float the (kinematic, gravity-disabled) boxes slightly above the floor so they
+# never register an obstacle↔ground contact. Without this, every box rests on
+# z = OBSTACLE_SIZE[2]/2 and the obstacle contact sensor fires on the ground
+# reaction on every step (even in the empty scenario with boxes parked away).
+# The box still spans z ∈ [clearance, clearance + height], overlapping the robot
+# body/wheels, so robot↔obstacle collisions are still detected normally.
+OBSTACLE_GROUND_CLEARANCE = 0.05
+OBSTACLE_Z = OBSTACLE_SIZE[2] / 2 + OBSTACLE_GROUND_CLEARANCE
 OBSTACLE_SPAWN_RANGE = {"x": (-3.5, 3.5), "y": (-2.5, 2.5)}
 OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(TRAIN_PHYSICAL_OBSTACLE_SLOTS)]
 PLAY_OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(PLAY_PHYSICAL_OBSTACLE_SLOTS)]
@@ -145,6 +153,21 @@ NAV_WAYPOINT_COMMAND_MIN_FORWARD = -0.3
 NAV_WAYPOINT_COMMAND_MAX_LATERAL = 1.5
 NAV_WAYPOINT_COMMAND_MAX_HEADING = 0.90
 
+# Passable narrow-gap traversal, dense recovery, and grazing shaping.
+# Gap reward is gated only on the passable narrow-gap scenarios (8/13/14).
+NAV_PASSABLE_GAP_REWARD_WEIGHT = 1.5
+# Fraction of clearance/TTC penalty waived while aligned in a passable gap.
+NAV_CLEARANCE_PASSABLE_GAP_RELIEF = 0.5
+NAV_TTC_PASSABLE_GAP_RELIEF = 0.5
+# Dense recovery is gated only on blocked/cluttered states (scenarios 10/11/12
+# or a strongly blocked goal corridor).
+NAV_DENSE_RECOVERY_WEIGHT = 1.0
+# Mild near-contact (grazing) penalty, kept far weaker than obstacle_collision.
+NAV_GRAZING_WEIGHT = -0.5
+NAV_GRAZING_DISTANCE = 0.65
+NAV_GRAZING_CONTACT_DISTANCE = 0.50
+NAV_GRAZING_PASSABLE_GAP_RELIEF = 0.4
+
 # Unitree L2 reference spec: 360 x 96 deg FoV, 30 m max range.
 # Training uses a lightweight subset.
 LIDAR_MAX_DISTANCE = 20.0
@@ -195,7 +218,7 @@ def _make_obstacle_cfg(name: str, idx: int) -> RigidObjectCfg:
             activate_contact_sensors=True,
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(1.5 + idx * 0.5, 0.0, OBSTACLE_SIZE[2] / 2),
+            pos=(1.5 + idx * 0.5, 0.0, OBSTACLE_Z),
         ),
     )
 
@@ -214,6 +237,10 @@ class ObstacleSceneCfg(Go2wSceneCfg):
         prim_path="{ENV_REGEX_NS}/obstacle_.*",
         history_length=3,
         track_air_time=False,
+        # No contact filter: the sensor prim matches multiple obstacles per env, so
+        # Isaac's filtered-contact reporting is unsupported here. Instead the boxes
+        # are floated by OBSTACLE_GROUND_CLEARANCE so net_forces only ever reflect
+        # robot↔obstacle contacts (no obstacle↔ground reaction).
     )
 
     lidar = MultiMeshRayCasterCfg(
@@ -256,7 +283,7 @@ class ObstaclePlaySceneCfg(ObstacleSceneCfg):
 _NAV_RESET_PARAMS_BASE = {
     "spawn_range_x": OBSTACLE_SPAWN_RANGE["x"],
     "spawn_range_y": OBSTACLE_SPAWN_RANGE["y"],
-    "obstacle_z": OBSTACLE_SIZE[2] / 2,
+    "obstacle_z": OBSTACLE_Z,
     "goal_forward_range": NAV_GOAL_FORWARD_RANGE,
     "goal_lateral_range": NAV_GOAL_LATERAL_RANGE,
     "goal_heading_jitter_range": NAV_GOAL_HEADING_JITTER_RANGE,
@@ -324,7 +351,7 @@ class ObstacleEventCfg(EventCfg):
             "min_obstacles": 5,
             "spawn_range_x": OBSTACLE_SPAWN_RANGE["x"],
             "spawn_range_y": OBSTACLE_SPAWN_RANGE["y"],
-            "obstacle_z": OBSTACLE_SIZE[2] / 2,
+            "obstacle_z": OBSTACLE_Z,
             "min_spawn_distance_from_robot": OBSTACLE_MIN_SPAWN_DISTANCE_FROM_ROBOT,
             "min_spawn_distance_from_robot_initial": OBSTACLE_MIN_SPAWN_DISTANCE_INITIAL,
             "min_inter_obstacle_dist": 0.8,
@@ -388,6 +415,8 @@ class NavTeacherRewardsCfg:
         params={
             "obstacle_names": OBSTACLE_NAMES,
             "min_safe_dist": 0.8,
+            # Soften proximity penalty while threading a passable narrow gap.
+            "passable_gap_relief": NAV_CLEARANCE_PASSABLE_GAP_RELIEF,
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )
@@ -447,7 +476,41 @@ class NavTeacherRewardsCfg:
             "robot_front_margin": NAV_TTC_FRONT_MARGIN,
             "lookahead_distance": NAV_TTC_LOOKAHEAD_DISTANCE,
             "sum_clip": NAV_TTC_SUM_CLIP,
+            # Soften corridor TTC while aligned in a passable narrow gap so the
+            # robot is not blocked from entering barely-passable corridors.
+            "passable_gap_relief": NAV_TTC_PASSABLE_GAP_RELIEF,
             "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    # Encourage decisive traversal of passable narrow gaps (scenarios 8/13/14).
+    # Gated on the per-env _go2w_gap_passable flag set at reset; never fires for
+    # impossible-gap/dead-end layouts.
+    nav_passable_gap = RewTerm(
+        func=mdp.nav_passable_gap_traversal_reward,
+        weight=NAV_PASSABLE_GAP_REWARD_WEIGHT,
+        params={"robot_cfg": SceneEntityCfg("robot")},
+    )
+    # Encourage productive recovery (lateral/backward/turn) instead of stopping in
+    # cluttered/partial-blockage layouts. Gated on blocked/cluttered states only.
+    nav_dense_recovery = RewTerm(
+        func=mdp.nav_dense_recovery_reward,
+        weight=NAV_DENSE_RECOVERY_WEIGHT,
+        params={
+            "obstacle_names": OBSTACLE_NAMES,
+            "robot_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    # Mild near-contact penalty to reduce leg/wheel grazing; far weaker than the
+    # collision penalty and relieved while aligned in a passable gap.
+    nav_grazing = RewTerm(
+        func=mdp.nav_grazing_penalty,
+        weight=NAV_GRAZING_WEIGHT,
+        params={
+            "obstacle_names": OBSTACLE_NAMES,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "graze_distance": NAV_GRAZING_DISTANCE,
+            "contact_distance": NAV_GRAZING_CONTACT_DISTANCE,
+            "passable_gap_relief": NAV_GRAZING_PASSABLE_GAP_RELIEF,
         },
     )
 

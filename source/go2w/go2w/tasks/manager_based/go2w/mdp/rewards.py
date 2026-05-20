@@ -32,6 +32,16 @@ def _ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
         env._go2w_goal_heading_w = torch.zeros(env.num_envs, device=env.device)
         env._go2w_start_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
         env._go2w_start_heading_w = torch.zeros(env.num_envs, device=env.device)
+    if not hasattr(env, "_go2w_scenario_template_id"):
+        env._go2w_scenario_template_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    # Passable narrow-gap metadata (mirrors events._ensure_navigation_goal_buffers).
+    if not hasattr(env, "_go2w_gap_center_w"):
+        env._go2w_gap_center_w = torch.zeros(env.num_envs, 2, device=env.device)
+        env._go2w_gap_dir_w = torch.zeros(env.num_envs, 2, device=env.device)
+        env._go2w_gap_half_width = torch.zeros(env.num_envs, device=env.device)
+        env._go2w_gap_passable = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if not hasattr(env, "_go2w_stuck_counter"):
+        env._go2w_stuck_counter = torch.zeros(env.num_envs, device=env.device)
 
 
 def _goal_command_from_buffers(
@@ -259,6 +269,7 @@ def obstacle_nav_ttc_penalty(
     lookahead_distance: float = 2.2,
     sum_clip: float = 1.5,
     min_command_speed: float = 0.05,
+    passable_gap_relief: float = 0.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Soft corridor TTC penalty for the navigation teacher.
@@ -280,11 +291,8 @@ def obstacle_nav_ttc_penalty(
     moving = command_speed > min_command_speed
     robot_pos_w = asset.data.root_pos_w[:, :2]                             # (N, 2)
 
-    # Stack all obstacle positions into a single (N, K, 2) tensor and process
-    # in one pass, replacing K separate GPU kernel sequences with one batched op.
-    obs_pos_all = torch.stack(
-        [env.scene[n].data.root_pos_w[:, :2] for n in obstacle_names], dim=1
-    )  # (N, K, 2)
+    # Cached (N, K, 3) world-frame obstacle positions, sliced to xy.
+    obs_pos_all = _obstacle_positions_w(env, obstacle_names)[..., :2]      # (N, K, 2)
     rel_w = obs_pos_all - robot_pos_w.unsqueeze(1)                         # (N, K, 2)
 
     heading = asset.data.heading_w
@@ -314,7 +322,12 @@ def obstacle_nav_ttc_penalty(
         & (forward_clearance < lookahead_distance)
     )
     penalty = lateral_risk * ttc_risk * active.to(lateral_risk.dtype)
-    return penalty.sum(dim=1).clamp(max=sum_clip)
+    result = penalty.sum(dim=1).clamp(max=sum_clip)
+
+    if passable_gap_relief > 0.0:
+        relief = _passable_gap_relief(env, asset_cfg, passable_gap_relief)
+        result = result * (1.0 - relief)
+    return result
 
 
 def obstacle_contact_penalty(
@@ -327,7 +340,12 @@ def obstacle_contact_penalty(
     warmup_iterations: int | None = None,
     steps_per_iteration: int = 128,
 ) -> torch.Tensor:
-    """Count obstacle bodies with contact, with an optional curriculum scale."""
+    """Count obstacle bodies with contact, with an optional curriculum scale.
+
+    Obstacles are floated above the floor (OBSTACLE_GROUND_CLEARANCE) so their
+    net contact force only reflects robot↔obstacle contacts, never the box↔ground
+    reaction. This is what makes this count a true collision signal.
+    """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     forces = contact_sensor.data.net_forces_w_history
     if sensor_cfg.body_ids is not None:
@@ -355,7 +373,11 @@ def obstacle_contact_termination(
     start_iteration: int | None = None,
     steps_per_iteration: int = 128,
 ) -> torch.Tensor:
-    """Terminate an episode when any obstacle contact force exceeds threshold."""
+    """Terminate an episode when any obstacle contact force exceeds threshold.
+
+    Obstacles are floated above the floor (OBSTACLE_GROUND_CLEARANCE) so the
+    contact force reflects only robot↔obstacle contacts.
+    """
     if start_iteration is not None:
         start_steps = start_iteration * steps_per_iteration
     if env.common_step_counter < start_steps:
@@ -550,6 +572,7 @@ def nav_clearance_penalty(
     env: ManagerBasedRLEnv,
     obstacle_names: list[str],
     min_safe_dist: float = 0.8,
+    passable_gap_relief: float = 0.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Penalise proximity to any obstacle with a smooth gradient.
@@ -561,6 +584,10 @@ def nav_clearance_penalty(
     Intended use: weight should be negative (e.g. −1.5) so this acts as a
     penalty. Complements obstacle_ttc which is command-direction-specific;
     this term penalises closeness regardless of movement direction.
+
+    When passable_gap_relief > 0, the penalty is softened (up to that fraction)
+    while the robot is aligned and threading a passable narrow gap, so the policy
+    is not afraid of the close side obstacles of a corridor it can pass.
     """
     if len(obstacle_names) == 0:
         return torch.zeros(env.num_envs, device=env.device)
@@ -568,16 +595,55 @@ def nav_clearance_penalty(
     robot = env.scene[asset_cfg.name]
     robot_pos = robot.data.root_pos_w[:, :2]
 
-    obs_pos = torch.stack(
-        [env.scene[n].data.root_pos_w[:, :2] for n in obstacle_names], dim=1
-    )  # (N, K, 2)
+    obs_pos = _obstacle_positions_w(env, obstacle_names)[..., :2]  # (N, K, 2)
     dists = (obs_pos - robot_pos.unsqueeze(1)).norm(dim=-1)  # (N, K)
     nearest_dist = dists.min(dim=1).values.clamp(min=0.0)   # (N,)
 
     # Smooth proximity penalty: 0 when safe, saturates at 1 when very close
     intrusion = (min_safe_dist - nearest_dist).clamp(min=0.0, max=min_safe_dist)
     penalty = (intrusion / min_safe_dist) ** 2  # quadratic near contact, zero far away
+
+    if passable_gap_relief > 0.0:
+        relief = _passable_gap_relief(env, asset_cfg, passable_gap_relief)
+        penalty = penalty * (1.0 - relief)
     return penalty
+
+
+def _nav_step_cache(env: ManagerBasedRLEnv) -> dict:
+    """Return a per-step memo dict, cleared when the global step counter advances.
+
+    All reward terms in a navigation step are evaluated against identical
+    robot/obstacle poses, so the obstacle-geometry helpers (frontal geometry,
+    goal-path blockage, passable-gap geometry) can safely share their results
+    within the same step instead of recomputing the same GPU kernels several
+    times. The cache is keyed by env.common_step_counter so it self-invalidates
+    on the next step.
+    """
+    step = env.common_step_counter
+    if getattr(env, "_nav_reward_cache_step", None) != step:
+        env._nav_reward_cache = {}
+        env._nav_reward_cache_step = step
+    return env._nav_reward_cache
+
+
+def _obstacle_positions_w(env: ManagerBasedRLEnv, obstacle_names: list[str]) -> torch.Tensor:
+    """Cached (N, K, 3) world-frame obstacle positions for the current step.
+
+    Gathering K scene entities and stacking them is a Python-side loop that runs
+    once per obstacle reward term; memoising it removes most of the per-step
+    scene-access overhead. All navigation reward terms use the same obstacle
+    list, so the per-step length-keyed cache never collides.
+    """
+    cache = _nav_step_cache(env)
+    cache_key = ("obstacle_pos_w", len(obstacle_names))
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    pos = torch.stack(
+        [env.scene[n].data.root_pos_w[:, :3] for n in obstacle_names], dim=1
+    )  # (N, K, 3)
+    cache[cache_key] = pos
+    return pos
 
 
 def _compute_nav_frontal_geometry(
@@ -592,13 +658,20 @@ def _compute_nav_frontal_geometry(
     Returns (frontal_blockage, left_blockage, right_blockage, vel_yaw,
              closeness, angles, active) — all (N, ...) on env.device.
     N = num_envs, K = num_obstacles in obstacle_names.
+
+    Result is memoised per step (shared by lateral-escape, impossible-gap, and
+    dense-recovery terms which all call this with the same arguments).
     """
+    cache = _nav_step_cache(env)
+    cache_key = ("frontal_geom", frontal_half_angle_deg, max_distance)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     robot = env.scene[robot_cfg.name]
     robot_yaw_quat = yaw_quat(robot.data.root_quat_w)
 
-    obs_pos_all = torch.stack(
-        [env.scene[n].data.root_pos_w[:, :3] for n in obstacle_names], dim=1
-    )  # (N, K, 3)
+    obs_pos_all = _obstacle_positions_w(env, obstacle_names)  # (N, K, 3)
     rel_w = obs_pos_all - robot.data.root_pos_w[:, :3].unsqueeze(1)
     N, K = rel_w.shape[:2]
 
@@ -617,7 +690,9 @@ def _compute_nav_frontal_geometry(
     right_blockage   = (closeness * ((angles < -frontal_rad) & (angles >= -math.pi) & active).float()).sum(dim=1) * k_norm
 
     vel_yaw = quat_apply_inverse(robot_yaw_quat, robot.data.root_lin_vel_w[:, :3])
-    return frontal_blockage, left_blockage, right_blockage, vel_yaw, closeness, angles, active
+    result = (frontal_blockage, left_blockage, right_blockage, vel_yaw, closeness, angles, active)
+    cache[cache_key] = result
+    return result
 
 
 def _compute_goal_path_blockage(
@@ -632,9 +707,18 @@ def _compute_goal_path_blockage(
     Projects each obstacle onto the axis from the robot to its current goal and
     measures lateral deviation from that axis.  Returns a value in [0, 1] per
     environment — 0 when the corridor is clear, approaching 1 when blocked.
+
+    Result is memoised per step (shared by lateral-escape, open-path, and
+    dense-recovery terms which all call this with the same arguments).
     """
     if len(obstacle_names) == 0:
         return torch.zeros(env.num_envs, device=env.device)
+
+    cache = _nav_step_cache(env)
+    cache_key = ("goal_path_blockage", corridor_half_width, max_distance)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     _ensure_navigation_goal_buffers(env)
     robot = env.scene[robot_cfg.name]
@@ -648,9 +732,7 @@ def _compute_goal_path_blockage(
     goal_vec_b = quat_apply_inverse(robot_yaw_quat, goal_vec_w_3d)[:, :2]
     goal_dir_b = goal_vec_b / goal_dist.unsqueeze(-1)  # (N, 2) unit vector toward goal
 
-    obs_pos_all = torch.stack(
-        [env.scene[n].data.root_pos_w[:, :3] for n in obstacle_names], dim=1
-    )
+    obs_pos_all = _obstacle_positions_w(env, obstacle_names)  # (N, K, 3)
     rel_w = obs_pos_all - robot.data.root_pos_w[:, :3].unsqueeze(1)
     N, K = rel_w.shape[:2]
 
@@ -678,7 +760,91 @@ def _compute_goal_path_blockage(
     # Averaging by K made a single obstacle on the direct path nearly invisible
     # when many play/training slots were parked far away.
     blockage = (closeness * intrusion * active.float()).max(dim=1).values
-    return blockage.clamp(0.0, 1.0)
+    result = blockage.clamp(0.0, 1.0)
+    cache[cache_key] = result
+    return result
+
+
+def _compute_passable_gap_geometry(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    half_width_margin: float = 0.15,
+    approach_max_forward: float = 3.5,
+    approach_back_tol: float = 0.3,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Relate the robot to the stored passable-gap centerline.
+
+    Reads the per-env gap buffers populated at reset (only set for the
+    narrow_gap / narrow_gap_wide / narrow_gap_barely scenarios). For every
+    other scenario the passable flag is False so callers see an inactive gap.
+
+    Returns (passable, approaching, forward_to_gap, lateral_err, align,
+             forward_vel, speed) — all (N,) on env.device.
+      passable     : bool, scenario is a passable narrow gap
+      approaching  : bool, gap is ahead/just-passed and within range
+      forward_to_gap: signed distance to gap center along the gap direction (>0 ahead)
+      lateral_err  : absolute lateral offset from the gap centerline [m]
+      align        : 1 on the centerline → 0 at the gap edge ∈ [0, 1]
+      forward_vel  : world velocity projected onto the gap direction [m/s]
+      speed        : planar speed [m/s]
+
+    Result is memoised per step (shared by the passable-gap reward and the
+    clearance/TTC/grazing relief which all call this with the same arguments).
+    """
+    if not hasattr(env, "_go2w_gap_passable"):
+        z = torch.zeros(env.num_envs, device=env.device)
+        b = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        return b, b, z, z, z, z, z
+
+    cache = _nav_step_cache(env)
+    cache_key = ("passable_gap_geom", half_width_margin, approach_max_forward, approach_back_tol)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    robot = env.scene[robot_cfg.name]
+    robot_pos = robot.data.root_pos_w[:, :2]
+    gap_center = env._go2w_gap_center_w
+    gap_dir = env._go2w_gap_dir_w
+    half_w = env._go2w_gap_half_width
+    passable = env._go2w_gap_passable
+
+    to_gap = gap_center - robot_pos                                    # (N, 2)
+    forward_to_gap = (to_gap * gap_dir).sum(dim=-1)                    # (N,)
+    perp = torch.stack([-gap_dir[:, 1], gap_dir[:, 0]], dim=-1)        # left normal
+    lateral_err = (to_gap * perp).sum(dim=-1).abs()                    # (N,)
+    align = 1.0 - (lateral_err / (half_w + half_width_margin).clamp(min=1.0e-3)).clamp(0.0, 1.0)
+
+    vel_w = robot.data.root_lin_vel_w[:, :2]
+    forward_vel = (vel_w * gap_dir).sum(dim=-1)
+    speed = vel_w.norm(dim=-1)
+
+    approaching = (
+        passable
+        & (forward_to_gap > -approach_back_tol)
+        & (forward_to_gap < approach_max_forward)
+    )
+    result = (passable, approaching, forward_to_gap, lateral_err, align, forward_vel, speed)
+    cache[cache_key] = result
+    return result
+
+
+def _passable_gap_relief(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    max_relief: float = 0.0,
+) -> torch.Tensor:
+    """Return a per-env relief factor in [0, max_relief] for passable narrow gaps.
+
+    Relief is highest when the robot is aligned with the gap centerline and is
+    actively approaching/threading a passable gap. Used to soften clearance and
+    TTC penalties only in passable corridors, never elsewhere. Collision penalty
+    is intentionally left untouched by this helper.
+    """
+    if max_relief <= 0.0 or not hasattr(env, "_go2w_gap_passable"):
+        return torch.zeros(env.num_envs, device=env.device)
+    _, approaching, _, _, align, _, _ = _compute_passable_gap_geometry(env, robot_cfg)
+    return max_relief * approaching.float() * align
 
 
 def nav_frontal_blocked_lateral_escape_reward(
@@ -961,3 +1127,209 @@ def nav_impossible_gap_penalty(
         (impossible_gap_gate > 0.1) & (turn_away > 0.05)
     ).float().mean()
     return result
+
+
+def nav_passable_gap_traversal_reward(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    forward_vel_ref: float = 1.0,
+    align_weight: float = 0.5,
+    progress_weight: float = 0.5,
+    stop_speed: float = 0.1,
+) -> torch.Tensor:
+    """Encourage decisive traversal of passable narrow gaps.
+
+    Active only for the narrow_gap / narrow_gap_wide / narrow_gap_barely scenarios
+    (gated by the per-env _go2w_gap_passable flag set at reset) and only while the
+    gap is ahead of, or just behind, the robot. It rewards:
+      - alignment with the gap centerline (always, while approaching),
+      - forward progress through the gap, scaled by alignment so the policy is
+        only encouraged to push forward when it is actually lined up with the gap.
+
+    The forward-progress term naturally rewards not stopping in front of a passable
+    gap (a stationary robot earns only the alignment part). It returns roughly
+    [0, 1] and is intended to be used with a moderate positive weight so it never
+    forces unsafe squeezing.  It does NOT activate for impossible-gap/dead-end
+    layouts because those scenarios never set the passable flag.
+    """
+    _, approaching, _, lateral_err, align, forward_vel, speed = (
+        _compute_passable_gap_geometry(env, robot_cfg)
+    )
+    active = approaching.float()
+    progress = (forward_vel / max(forward_vel_ref, 1.0e-6)).clamp(0.0, 1.0)
+    reward = active * (align_weight * align + progress_weight * align * progress)
+
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    denom = active.sum().clamp(min=1.0)
+    env.extras["log"]["passable_gap_activation_rate"] = active.mean()
+    env.extras["log"]["passable_gap_alignment_error"] = (lateral_err * active).sum() / denom
+    env.extras["log"]["passable_gap_progress_mean"] = (forward_vel.clamp(min=0.0) * active).sum() / denom
+    env.extras["log"]["passable_gap_stop_rate"] = (
+        ((speed < stop_speed).float()) * active
+    ).sum() / denom
+    return reward
+
+
+def nav_dense_recovery_reward(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    frontal_half_angle_deg: float = 45.0,
+    max_distance: float = 8.0,
+    frontal_block_threshold: float = 0.25,
+    goal_path_block_threshold: float = 0.20,
+    goal_path_corridor_half_width: float = 0.7,
+    generic_block_threshold: float = 0.45,
+    min_goal_dist: float = 1.0,
+    side_blocked_threshold: float = 0.15,
+    side_diff_deadband: float = 0.04,
+    vel_ref: float = 1.0,
+    stop_speed: float = 0.12,
+    stuck_steps_for_penalty: int = 10,
+    stop_penalty: float = 0.5,
+) -> torch.Tensor:
+    """Encourage productive recovery (not stopping) in cluttered/blocked layouts.
+
+    Active only when the goal is still far AND the path is genuinely blocked AND
+    the scenario is a blocked one (cluttered / partial-blockage) or the direct
+    goal corridor is strongly blocked. It rewards:
+      - lateral velocity toward the more open side,
+      - small backward motion when both sides are blocked,
+      - turn-away yaw command when both sides are blocked,
+    and penalises sustained stopping (tracked via a per-env stuck counter) while
+    the goal is unreached and the path is blocked.
+
+    Returns roughly [-stop_penalty, 1]; use a positive weight. It never activates
+    on empty/open-path layouts, so it is not a global movement reward.
+    """
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    _ensure_navigation_goal_buffers(env)
+
+    frontal_blockage, left_blockage, right_blockage, vel_yaw, _, _, _ = (
+        _compute_nav_frontal_geometry(env, obstacle_names, robot_cfg, frontal_half_angle_deg, max_distance)
+    )
+    goal_path_blockage = _compute_goal_path_blockage(
+        env, obstacle_names, robot_cfg, goal_path_corridor_half_width, max_distance
+    )
+
+    robot = env.scene[robot_cfg.name]
+    goal_dist = (env._go2w_goal_pos_w[:, :2] - robot.data.root_pos_w[:, :2]).norm(dim=-1)
+    speed = robot.data.root_lin_vel_w[:, :2].norm(dim=-1)
+
+    fr_gate = (
+        (frontal_blockage - frontal_block_threshold) / (1.0 - frontal_block_threshold + 1.0e-6)
+    ).clamp(0.0, 1.0)
+    gp_gate = (
+        (goal_path_blockage - goal_path_block_threshold) / (1.0 - goal_path_block_threshold + 1.0e-6)
+    ).clamp(0.0, 1.0)
+    blocked_gate = torch.maximum(fr_gate, gp_gate)
+    goal_far = (goal_dist > min_goal_dist).float()
+
+    # Scenario gate: blocked/cluttered templates, or any strongly blocked corridor.
+    sid = env._go2w_scenario_template_id
+    in_blocked_scenario = ((sid == 10) | (sid == 11) | (sid == 12)).float()
+    generic_blocked = (goal_path_blockage > generic_block_threshold).float()
+    scenario_gate = torch.maximum(in_blocked_scenario, generic_blocked)
+    recovery_active = blocked_gate * goal_far * scenario_gate
+
+    # Productive recovery directions.
+    side_diff = left_blockage - right_blockage
+    preferred_sign = torch.where(
+        side_diff.abs() > side_diff_deadband,
+        torch.sign(side_diff),
+        torch.zeros_like(side_diff),
+    )
+    aligned_lateral = -preferred_sign * vel_yaw[:, 1]
+    lateral_score = (aligned_lateral / max(vel_ref, 1.0e-6)).clamp(0.0, 1.0)
+
+    both_sides_blocked = (torch.minimum(left_blockage, right_blockage) > side_blocked_threshold).float()
+    backward_score = both_sides_blocked * (-vel_yaw[:, 0] / max(vel_ref, 1.0e-6)).clamp(0.0, 1.0)
+
+    preferred_turn = -preferred_sign
+    hlc_yaw_cmd = env.action_manager.action[:, 2]  # HLC [vx, vy, yaw_rate]
+    turn_score = both_sides_blocked * (preferred_turn * hlc_yaw_cmd / 1.5).clamp(0.0, 1.0)
+
+    move_score = (lateral_score + 0.5 * backward_score + 0.3 * turn_score).clamp(0.0, 1.0)
+
+    # Per-env stuck counter: increment while slow and far from goal, reset otherwise
+    # and on episode start. Penalise only sustained (not momentary) stopping.
+    if not hasattr(env, "_go2w_stuck_counter"):
+        env._go2w_stuck_counter = torch.zeros(env.num_envs, device=env.device)
+    stuck_now = (speed < stop_speed) & (goal_dist > min_goal_dist)
+    env._go2w_stuck_counter = torch.where(
+        stuck_now, env._go2w_stuck_counter + 1.0, torch.zeros_like(env._go2w_stuck_counter)
+    )
+    env._go2w_stuck_counter[env.episode_length_buf == 0] = 0.0
+    sustained_stuck = (env._go2w_stuck_counter >= stuck_steps_for_penalty).float()
+
+    result = recovery_active * (move_score - stop_penalty * sustained_stuck)
+
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    active_mask = (recovery_active > 0.05).float()
+    denom = active_mask.sum().clamp(min=1.0)
+    env.extras["log"]["dense_recovery_activation_rate"] = active_mask.mean()
+    env.extras["log"]["dense_recovery_move_mean"] = (move_score * active_mask).sum() / denom
+    env.extras["log"]["dense_recovery_stuck_rate"] = sustained_stuck.mean()
+    cluttered_mask = (sid == 12).float()
+    cdenom = cluttered_mask.sum().clamp(min=1.0)
+    env.extras["log"]["cluttered_stuck_rate"] = (sustained_stuck * cluttered_mask).sum() / cdenom
+    return result
+
+
+def nav_grazing_penalty(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    graze_distance: float = 0.65,
+    contact_distance: float = 0.50,
+    passable_gap_relief: float = 0.0,
+    max_distance: float = 8.0,
+) -> torch.Tensor:
+    """Mild near-contact (grazing) penalty separate from the collision penalty.
+
+    Penalises being very close to the nearest obstacle (center-to-center distance
+    in the [contact_distance, graze_distance] band) without requiring a full
+    contact event. It is intentionally weak so it nudges the policy to leave a
+    slightly larger margin and reduce leg/wheel scraping without making it timid.
+    In passable narrow gaps the penalty is relieved in proportion to centerline
+    alignment, so threading a passable corridor is not discouraged. The full
+    collision penalty (separate term) remains stronger and unchanged.
+
+    Returns a value in [0, 1]; use a small negative weight.
+    """
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    robot = env.scene[robot_cfg.name]
+    robot_pos = robot.data.root_pos_w[:, :2]
+    obs_pos = _obstacle_positions_w(env, obstacle_names)[..., :2]  # (N, K, 2)
+    dists = (obs_pos - robot_pos.unsqueeze(1)).norm(dim=-1)  # (N, K)
+    nearest = dists.min(dim=1).values  # (N,)
+
+    band = max(graze_distance - contact_distance, 1.0e-6)
+    graze = ((graze_distance - nearest) / band).clamp(0.0, 1.0)
+
+    relief = _passable_gap_relief(env, robot_cfg, passable_gap_relief)
+    penalty = graze * (1.0 - relief)
+
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    env.extras["log"]["grazing_penalty_mean"] = penalty.mean()
+    env.extras["log"]["near_contact_activation_rate"] = (graze > 0.05).float().mean()
+    env.extras["log"]["min_obstacle_distance_mean"] = nearest.clamp(max=max_distance).mean()
+    if hasattr(env, "_go2w_scenario_template_id"):
+        sid = env._go2w_scenario_template_id
+        narrow_mask = ((sid == 8) | (sid == 13) | (sid == 14)).float()
+        cluttered_mask = (sid == 12).float()
+        graze_active = (graze > 0.05).float()
+        env.extras["log"]["narrow_gap_grazing_rate"] = (
+            (graze_active * narrow_mask).sum() / narrow_mask.sum().clamp(min=1.0)
+        )
+        env.extras["log"]["cluttered_grazing_rate"] = (
+            (graze_active * cluttered_mask).sum() / cluttered_mask.sum().clamp(min=1.0)
+        )
+    return penalty
