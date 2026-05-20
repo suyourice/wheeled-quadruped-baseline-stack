@@ -397,14 +397,41 @@ class NavTeacherRewardsCfg:
         params={
             "obstacle_names": OBSTACLE_NAMES,
             "robot_cfg": SceneEntityCfg("robot"),
+            # Gate lateral escape on goal_path_blockage so the reward is
+            # suppressed when the direct robot→goal corridor is clear.
+            "goal_path_min_blockage": 0.10,
+            "goal_path_corridor_half_width": 0.7,
         },
     )
-    nav_backward_escape = RewTerm(
-        func=mdp.nav_backward_escape_reward,
-        weight=0.5,
+    # Reward straight-line progress toward the goal when the direct path is open.
+    # Suppressed when goal_path_blockage is high so avoidance maneuvers are free.
+    nav_open_path_straightness = RewTerm(
+        func=mdp.nav_open_path_straightness_reward,
+        weight=1.2,
         params={
             "obstacle_names": OBSTACLE_NAMES,
             "robot_cfg": SceneEntityCfg("robot"),
+            "goal_path_corridor_half_width": 0.7,
+        },
+    )
+    # Encourage calm (low speed, low yaw rate) when the robot is very close to goal.
+    nav_near_goal_settling = RewTerm(
+        func=mdp.nav_near_goal_settling_reward,
+        weight=0.8,
+        params={"settling_distance": 0.5},
+    )
+    # Penalise pushing forward when hemmed in on all sides (impossible gap).
+    nav_impossible_gap = RewTerm(
+        func=mdp.nav_impossible_gap_penalty,
+        weight=-2.0,
+        params={
+            "obstacle_names": OBSTACLE_NAMES,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "high_frontal_threshold": 0.40,
+            "side_blocked_threshold": 0.15,
+            "min_gap_available": 0.35,
+            "min_gap_width_norm": 0.45,
+            "gap_reference_width": 0.7,
         },
     )
     obstacle_ttc = RewTerm(

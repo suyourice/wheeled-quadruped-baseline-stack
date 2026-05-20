@@ -694,7 +694,8 @@ def obstacle_navigation_features(
     goal_lateral = (rel_xy * perp_b.unsqueeze(1)).sum(dim=-1).abs() # (N, K)
     goal_corridor = corridor_half_width * 1.5
     goal_path_mask = (goal_forward > 0.2) & (goal_forward < 5.0) & (goal_lateral < goal_corridor) & active
-    goal_path_blockage = (closeness * goal_path_mask.float()).sum(dim=1) * k_norm
+    goal_intrusion = (goal_corridor - goal_lateral).clamp(0.0, goal_corridor) / goal_corridor
+    goal_path_blockage = (closeness * goal_intrusion * goal_path_mask.float()).max(dim=1).values
 
     # ------- TTC proxy from HLC command -------
     # FrozenLLCActionTerm mirrors the HLC velocity into base_velocity.
