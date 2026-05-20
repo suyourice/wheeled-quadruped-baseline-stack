@@ -561,6 +561,7 @@ def reset_navigation_goals_and_obstacles(
     fixed_goal_heading_jitter: float | None = None,
     fixed_scenario_template: str | None = None,
     park_distance: float = 1000.0,
+    fixed_layout_seed: int | None = None,
 ) -> None:
     """Sample explicit start-goal local-navigation tasks and place varied obstacles.
 
@@ -586,6 +587,13 @@ def reset_navigation_goals_and_obstacles(
     fixed_template = None if fixed_scenario_template is None else fixed_scenario_template.lower()
     if fixed_template == "random":
         fixed_template = None
+
+    # When fixed_layout_seed is set, use a seeded RNG so every reset produces
+    # the same obstacle/goal layout.  Training always passes None → default
+    # random module behavior is preserved.
+    import random as _rm
+    _rng = _rm.Random(fixed_layout_seed) if fixed_layout_seed is not None else _rm
+    random = _rng  # noqa: F841 — shadows module import; all uses below (incl. closures) pick up _rng
 
     n = len(env_ids)
     device = env.device
@@ -644,14 +652,27 @@ def reset_navigation_goals_and_obstacles(
 
     goal_local_xy = (goal_pos_w[:, :2] - env_origins[:, :2]).cpu().tolist()
 
-    active_counts = torch.randint(
-        low=min_obstacles,
-        high=max_obstacles + 1,
-        size=(n,),
-        device=device,
-    )
+    if fixed_layout_seed is not None:
+        active_counts = torch.tensor(
+            [_rng.randint(min_obstacles, max_obstacles) for _ in range(n)],
+            dtype=torch.long,
+            device=device,
+        )
+    else:
+        active_counts = torch.randint(
+            low=min_obstacles,
+            high=max_obstacles + 1,
+            size=(n,),
+            device=device,
+        )
     if empty_env_fraction > 0.0:
-        empty_mask = torch.rand(n, device=device) < max(0.0, min(1.0, empty_env_fraction))
+        if fixed_layout_seed is not None:
+            _frac = max(0.0, min(1.0, empty_env_fraction))
+            empty_mask = torch.tensor(
+                [_rng.random() < _frac for _ in range(n)], dtype=torch.bool, device=device
+            )
+        else:
+            empty_mask = torch.rand(n, device=device) < max(0.0, min(1.0, empty_env_fraction))
         active_counts = torch.where(empty_mask, torch.zeros_like(active_counts), active_counts)
     if fixed_template == "empty":
         active_counts = torch.zeros_like(active_counts)
