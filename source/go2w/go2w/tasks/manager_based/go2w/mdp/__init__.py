@@ -71,7 +71,12 @@ from .observations import (
 )
 
 # -- Events (local custom) -----------------------------------------------------
-from .events import reset_navigation_goals_and_obstacles, reset_obstacles_curriculum, update_locomotion_curriculum
+from .events import (
+    move_dynamic_play_obstacles,
+    reset_navigation_goals_and_obstacles,
+    reset_obstacles_curriculum,
+    update_locomotion_curriculum,
+)
 
 # -- Rewards (local custom) ----------------------------------------------------
 from .rewards import (

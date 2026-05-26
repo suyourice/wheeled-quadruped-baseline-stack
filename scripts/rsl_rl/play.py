@@ -19,6 +19,10 @@ import cli_args  # isort: skip
 DEFAULT_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
 DEFAULT_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
 DEFAULT_COMMAND_PATH_MIN_SPEED = 0.2
+DEFAULT_DYNAMIC_OBSTACLE_SPEED_RANGE = (0.25, 0.70)
+DEFAULT_DYNAMIC_OBSTACLE_LATERAL_SPEED = 0.12
+DEFAULT_DYNAMIC_OBSTACLE_LONGITUDINAL_EXTENT = 2.0
+DEFAULT_DYNAMIC_OBSTACLE_LATERAL_EXTENT = 0.30
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play an RL agent with RSL-RL.")
@@ -36,6 +40,56 @@ parser.add_argument(
     type=int,
     default=None,
     help="Obstacle play tasks only: force this many active boxes in the scene.",
+)
+parser.add_argument(
+    "--dynamic_obstacles",
+    "--dynamic-obstacles",
+    dest="dynamic_obstacles",
+    action="store_true",
+    default=False,
+    help="Navigation play tasks only: move active obstacles like pedestrians during inference.",
+)
+parser.add_argument(
+    "--dynamic_obstacle_speed_range",
+    "--dynamic-obstacle-speed-range",
+    dest="dynamic_obstacle_speed_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Longitudinal pedestrian speed range [m/s]. Default: 0.25 0.70",
+)
+parser.add_argument(
+    "--dynamic_obstacle_lateral_speed",
+    "--dynamic-obstacle-lateral-speed",
+    dest="dynamic_obstacle_lateral_speed",
+    type=float,
+    default=None,
+    help="Maximum lateral drift speed [m/s]. Default: 0.12",
+)
+parser.add_argument(
+    "--dynamic_obstacle_longitudinal_extent",
+    "--dynamic-obstacle-longitudinal-extent",
+    dest="dynamic_obstacle_longitudinal_extent",
+    type=float,
+    default=None,
+    help="Maximum longitudinal excursion from each spawn point [m]. Default: 2.0",
+)
+parser.add_argument(
+    "--dynamic_obstacle_lateral_extent",
+    "--dynamic-obstacle-lateral-extent",
+    dest="dynamic_obstacle_lateral_extent",
+    type=float,
+    default=None,
+    help="Maximum lateral excursion from each spawn point [m]. Default: 0.30",
+)
+parser.add_argument(
+    "--dynamic_obstacle_min_separation",
+    "--dynamic-obstacle-min-separation",
+    dest="dynamic_obstacle_min_separation",
+    type=float,
+    default=None,
+    help="Minimum center-to-center distance maintained between moving obstacles [m]. Default: reset spacing.",
 )
 parser.add_argument(
     "--command_path_obstacles",
@@ -269,6 +323,7 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 import isaaclab.sim as sim_utils
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
@@ -288,6 +343,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import go2w.tasks  # noqa: F401
+from go2w.tasks.manager_based.go2w import mdp as go2w_mdp
 from go2w.tasks.manager_based.go2w.observation_layout import POLICY_OBS
 
 
@@ -411,6 +467,84 @@ def _override_play_obstacle_count(
     params["min_obstacles"] = num_obstacles
     params["max_obstacles"] = num_obstacles
     print(f"[INFO] Active play obstacles: {num_obstacles}/{max_available}")
+
+
+def _override_dynamic_navigation_play(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    args_cli: argparse.Namespace,
+):
+    """Add pedestrian-style obstacle motion only for opt-in navigation play."""
+    has_dynamic_params = any(
+        value is not None
+        for value in (
+            args_cli.dynamic_obstacle_speed_range,
+            args_cli.dynamic_obstacle_lateral_speed,
+            args_cli.dynamic_obstacle_longitudinal_extent,
+            args_cli.dynamic_obstacle_lateral_extent,
+            args_cli.dynamic_obstacle_min_separation,
+        )
+    )
+    if not args_cli.dynamic_obstacles:
+        if has_dynamic_params:
+            raise ValueError("Dynamic obstacle tuning flags require --dynamic_obstacles.")
+        return
+
+    events_cfg = getattr(env_cfg, "events", None)
+    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
+    reset_params = getattr(reset_obstacles, "params", None)
+    if reset_params is None or "fixed_scenario_template" not in reset_params:
+        raise ValueError("--dynamic_obstacles requires a navigation play task.")
+
+    speed_range = (
+        tuple(args_cli.dynamic_obstacle_speed_range)
+        if args_cli.dynamic_obstacle_speed_range is not None
+        else DEFAULT_DYNAMIC_OBSTACLE_SPEED_RANGE
+    )
+    if speed_range[0] < 0.0 or speed_range[0] > speed_range[1]:
+        raise ValueError("--dynamic_obstacle_speed_range requires 0 <= MIN <= MAX.")
+    lateral_speed = (
+        args_cli.dynamic_obstacle_lateral_speed
+        if args_cli.dynamic_obstacle_lateral_speed is not None
+        else DEFAULT_DYNAMIC_OBSTACLE_LATERAL_SPEED
+    )
+    longitudinal_extent = (
+        args_cli.dynamic_obstacle_longitudinal_extent
+        if args_cli.dynamic_obstacle_longitudinal_extent is not None
+        else DEFAULT_DYNAMIC_OBSTACLE_LONGITUDINAL_EXTENT
+    )
+    lateral_extent = (
+        args_cli.dynamic_obstacle_lateral_extent
+        if args_cli.dynamic_obstacle_lateral_extent is not None
+        else DEFAULT_DYNAMIC_OBSTACLE_LATERAL_EXTENT
+    )
+    min_separation = (
+        args_cli.dynamic_obstacle_min_separation
+        if args_cli.dynamic_obstacle_min_separation is not None
+        else float(reset_params.get("min_inter_obstacle_dist", 0.7))
+    )
+    if min(lateral_speed, longitudinal_extent, lateral_extent, min_separation) < 0.0:
+        raise ValueError("Dynamic obstacle speed, extents, and separation must be non-negative.")
+
+    events_cfg.dynamic_play_obstacles = EventTerm(
+        func=go2w_mdp.move_dynamic_play_obstacles,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            "obstacle_names": reset_params.get("obstacle_names", []),
+            "obstacle_z": reset_params.get("obstacle_z", 0.30),
+            "longitudinal_speed_range": speed_range,
+            "lateral_speed_max": lateral_speed,
+            "longitudinal_extent": longitudinal_extent,
+            "lateral_extent": lateral_extent,
+            "min_inter_obstacle_dist": min_separation,
+        },
+    )
+    print(
+        "[INFO] Dynamic navigation play obstacles: "
+        f"speed={speed_range}, lateral_speed=+/-{lateral_speed:.2f}, "
+        f"extent=({longitudinal_extent:.2f}, {lateral_extent:.2f}), "
+        f"min_separation={min_separation:.2f}"
+    )
 
 
 def _override_play_command_path_spawn(
@@ -763,6 +897,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Play seed: {env_seed}")
 
     _override_navigation_play_case(env_cfg, args_cli, env_seed)
+    _override_dynamic_navigation_play(env_cfg, args_cli)
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # specify directory for logging experiments

@@ -532,6 +532,144 @@ def _resample_nav_on_goal_reached(
         obstacle.write_root_pose_to_sim(pose_buf.clone(), env_ids=env_ids)
         obstacle.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
 
+    # A new corridor was sampled; dynamic-play motion must restart from these
+    # freshly placed obstacles rather than continuing old anchor trajectories.
+    if hasattr(env, "_go2w_dynamic_obstacle_initialized"):
+        env._go2w_dynamic_obstacle_initialized[env_ids] = False
+
+
+def move_dynamic_play_obstacles(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor | None,
+    obstacle_names: list[str],
+    obstacle_z: float,
+    longitudinal_speed_range: tuple[float, float] = (0.25, 0.70),
+    lateral_speed_max: float = 0.12,
+    longitudinal_extent: float = 2.0,
+    lateral_extent: float = 0.30,
+    min_inter_obstacle_dist: float = 0.7,
+    active_distance: float = 100.0,
+) -> None:
+    """Move active play obstacles like pedestrians along the current corridor.
+
+    This function is intentionally wired only by ``play.py`` when the dynamic
+    play flag is enabled. Obstacles move predominantly along the start-to-goal
+    corridor with a small lateral component. Their motion reflects at a bounded
+    excursion from each sampled pose and rejects any proposed step that would
+    violate the obstacle-to-obstacle separation constraint.
+    """
+    if len(obstacle_names) == 0:
+        return
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    if len(env_ids) == 0:
+        return
+
+    _ensure_navigation_goal_buffers(env)
+    n_envs = env.num_envs
+    n_slots = len(obstacle_names)
+    device = env.device
+
+    if (
+        not hasattr(env, "_go2w_dynamic_obstacle_initialized")
+        or env._go2w_dynamic_anchor_xy.shape != (n_envs, n_slots, 2)
+    ):
+        env._go2w_dynamic_obstacle_initialized = torch.zeros(n_envs, dtype=torch.bool, device=device)
+        env._go2w_dynamic_anchor_xy = torch.zeros(n_envs, n_slots, 2, device=device)
+        env._go2w_dynamic_dir_xy = torch.zeros(n_envs, n_slots, 2, device=device)
+        env._go2w_dynamic_long_speed = torch.zeros(n_envs, n_slots, device=device)
+        env._go2w_dynamic_lat_speed = torch.zeros(n_envs, n_slots, device=device)
+
+    positions_xy = torch.stack(
+        [env.scene[name].data.root_pos_w[env_ids, :2] for name in obstacle_names], dim=1
+    )
+    robot_xy = env.scene["robot"].data.root_pos_w[env_ids, :2]
+    active = (positions_xy - robot_xy.unsqueeze(1)).norm(dim=-1) < active_distance
+
+    corridor = env._go2w_goal_pos_w[env_ids, :2] - env._go2w_start_pos_w[env_ids, :2]
+    corridor_norm = corridor.norm(dim=-1, keepdim=True)
+    fallback_yaw = env.scene["robot"].data.heading_w[env_ids]
+    fallback_dir = torch.stack((fallback_yaw.cos(), fallback_yaw.sin()), dim=-1)
+    corridor_dir = torch.where(
+        corridor_norm > 1.0e-6,
+        corridor / corridor_norm.clamp(min=1.0e-6),
+        fallback_dir,
+    )
+
+    needs_init = ~env._go2w_dynamic_obstacle_initialized[env_ids]
+    if needs_init.any():
+        init_ids = env_ids[needs_init]
+        init_active = active[needs_init]
+        init_dir = corridor_dir[needs_init].unsqueeze(1).expand(-1, n_slots, -1)
+        signs = torch.randint(0, 2, init_active.shape, device=device, dtype=torch.int64).float() * 2.0 - 1.0
+        speed_lo, speed_hi = longitudinal_speed_range
+        long_speed = torch.empty(init_active.shape, device=device).uniform_(speed_lo, speed_hi) * signs
+        lat_speed = torch.empty(init_active.shape, device=device).uniform_(-lateral_speed_max, lateral_speed_max)
+        long_speed = torch.where(init_active, long_speed, torch.zeros_like(long_speed))
+        lat_speed = torch.where(init_active, lat_speed, torch.zeros_like(lat_speed))
+
+        env._go2w_dynamic_anchor_xy[init_ids] = positions_xy[needs_init]
+        env._go2w_dynamic_dir_xy[init_ids] = init_dir
+        env._go2w_dynamic_long_speed[init_ids] = long_speed
+        env._go2w_dynamic_lat_speed[init_ids] = lat_speed
+        env._go2w_dynamic_obstacle_initialized[init_ids] = True
+        # Static-gap shaping is no longer meaningful once the gap obstacles move.
+        # This affects play reward logs only; the pretrained policy observation is unchanged.
+        env._go2w_gap_passable[init_ids] = False
+
+    anchor = env._go2w_dynamic_anchor_xy[env_ids]
+    path_dir = env._go2w_dynamic_dir_xy[env_ids]
+    normal = torch.stack((-path_dir[..., 1], path_dir[..., 0]), dim=-1)
+    long_speed = env._go2w_dynamic_long_speed[env_ids]
+    lat_speed = env._go2w_dynamic_lat_speed[env_ids]
+
+    offset = positions_xy - anchor
+    long_offset = (offset * path_dir).sum(dim=-1)
+    lat_offset = (offset * normal).sum(dim=-1)
+    dt = env.step_dt
+
+    next_long = long_offset + long_speed * dt
+    reflect_long = next_long.abs() > longitudinal_extent
+    long_speed = torch.where(reflect_long, -long_speed, long_speed)
+    next_long = (long_offset + long_speed * dt).clamp(-longitudinal_extent, longitudinal_extent)
+
+    next_lat = lat_offset + lat_speed * dt
+    reflect_lat = next_lat.abs() > lateral_extent
+    lat_speed = torch.where(reflect_lat, -lat_speed, lat_speed)
+    next_lat = (lat_offset + lat_speed * dt).clamp(-lateral_extent, lateral_extent)
+
+    proposed = anchor + next_long.unsqueeze(-1) * path_dir + next_lat.unsqueeze(-1) * normal
+    proposed = torch.where(active.unsqueeze(-1), proposed, positions_xy)
+
+    # Resolve motion slot-by-slot against current or already accepted positions.
+    # Rejected obstacles stay in place and reverse direction for the next step.
+    accepted = positions_xy.clone()
+    for slot_idx in range(n_slots):
+        candidate = proposed[:, slot_idx]
+        distances = (candidate.unsqueeze(1) - accepted).norm(dim=-1)
+        others = torch.arange(n_slots, device=device) != slot_idx
+        conflict = (
+            (distances < min_inter_obstacle_dist)
+            & active
+            & others.unsqueeze(0)
+        ).any(dim=1)
+        conflict &= active[:, slot_idx]
+        accepted[:, slot_idx] = torch.where(conflict.unsqueeze(-1), positions_xy[:, slot_idx], candidate)
+        long_speed[:, slot_idx] = torch.where(conflict, -long_speed[:, slot_idx], long_speed[:, slot_idx])
+        lat_speed[:, slot_idx] = torch.where(conflict, -lat_speed[:, slot_idx], lat_speed[:, slot_idx])
+
+    env._go2w_dynamic_long_speed[env_ids] = long_speed
+    env._go2w_dynamic_lat_speed[env_ids] = lat_speed
+
+    zero_vel = torch.zeros(len(env_ids), 6, device=device)
+    for slot_idx, name in enumerate(obstacle_names):
+        pose = torch.zeros(len(env_ids), 7, device=device)
+        pose[:, :2] = accepted[:, slot_idx]
+        pose[:, 2] = obstacle_z
+        pose[:, 3] = 1.0
+        env.scene[name].write_root_pose_to_sim(pose, env_ids=env_ids)
+        env.scene[name].write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+
 
 def reset_navigation_goals_and_obstacles(
     env: ManagerBasedRLEnv,
@@ -1050,6 +1188,9 @@ def reset_navigation_goals_and_obstacles(
         pose[:, 3] = 1.0
         obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
         obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+
+    if hasattr(env, "_go2w_dynamic_obstacle_initialized"):
+        env._go2w_dynamic_obstacle_initialized[env_ids] = False
 
     # Store a callable so goal_reached_and_resample can trigger obstacle+goal
     # resample mid-episode.  Uses robot-world-centered placement so obstacles
