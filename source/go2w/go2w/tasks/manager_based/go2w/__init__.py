@@ -102,3 +102,27 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavRLDistillRunnerCfg",
     },
 )
+
+# =============================================================================
+# RL navigation distillation (teacher privileged + obstacle, student depth camera)
+# =============================================================================
+
+gym.register(
+    id="Navigation-Depth-Distill-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavDepthRLDistillEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavDepthRLDistillEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
+    },
+)

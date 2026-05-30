@@ -3,13 +3,14 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""RSL-RL configs for Go2-W RL navigation teacher and LiDAR student distillation."""
+"""RSL-RL configs for Go2-W RL navigation teacher and student distillation."""
 
 from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import (
     RslRlDistillationAlgorithmCfg,
     RslRlDistillationRunnerCfg,
+    RslRlCNNModelCfg,
     RslRlMLPModelCfg,
     RslRlOnPolicyRunnerCfg,
     RslRlPpoActorCriticCfg,
@@ -21,8 +22,9 @@ from isaaclab_rl.rsl_rl import (
 class NavTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
     """PPO runner for the RL navigation teacher.
 
-    The actor observes 211D privileged HLC navigation features
-    (9D proprio + 180D obstacle depth + 16D geometry features + 6D action history)
+    The actor observes 451D privileged HLC navigation features
+    (9D proprio + 180D obstacle depth + 16D geometry features
+    + 240D full obstacle geometry + 6D action history)
     and outputs a 3D velocity command. The frozen fast-flat LLC checkpoint is
     loaded by the environment action term, not by the PPO actor.
     """
@@ -69,11 +71,14 @@ class SimpleNavDistillAlgorithmCfg(RslRlDistillationAlgorithmCfg):
         "go2w.tasks.manager_based.go2w.distillation_algorithms:SimpleActionDistillation"
     )
     action_loss_weight: float = 1.0
+    safety_loss_weight: float = 0.0
+    safety_clearance_threshold: float = 0.65
+    safety_weight_clip: float = 5.0
 
 
 @configclass
 class NavRLTeacherModelCfg(RslRlMLPModelCfg):
-    """Privileged teacher model (211D obs -> 3D HLC velocity, no normalization)."""
+    """Privileged teacher model (451D obs -> 3D HLC velocity, no normalization)."""
 
     class_name: str = "rsl_rl.models:MLPModel"
     obs_normalization: bool = False
@@ -86,6 +91,26 @@ class NavLiDARStudentModelCfg(RslRlMLPModelCfg):
     class_name: str = "rsl_rl.models:MLPModel"
     obs_normalization: bool = False
     distribution_cfg = RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.35)
+
+
+@configclass
+class NavDepthStudentModelCfg(RslRlCNNModelCfg):
+    """Depth student model: CNN(depth history) + MLP(state) -> 3D HLC velocity."""
+
+    class_name: str = "rsl_rl.models:CNNModel"
+    obs_normalization: bool = False
+    distribution_cfg = RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.35)
+    cnn_cfg = RslRlCNNModelCfg.CNNCfg(
+        output_channels=[16, 32, 64],
+        kernel_size=[5, 3, 3],
+        stride=[2, 2, 2],
+        padding="zeros",
+        norm="none",
+        activation="elu",
+        max_pool=False,
+        global_pool="none",
+        flatten=True,
+    )
 
 
 @configclass
@@ -118,4 +143,37 @@ class NavRLDistillRunnerCfg(RslRlDistillationRunnerCfg):
         max_grad_norm=1.0,
         loss_type="mse",
         action_loss_weight=1.0,
+    )
+
+
+@configclass
+class NavDepthRLDistillRunnerCfg(NavRLDistillRunnerCfg):
+    """Distillation runner: privileged RL teacher -> depth-CNN student."""
+
+    num_steps_per_env = 64
+    max_iterations = 700
+    save_interval = 50
+    experiment_name = "go2w_nav_depth_distill"
+    logger = "wandb"
+    wandb_project = "go2w_nav_depth_distill"
+
+    obs_groups = {
+        "student": ["student_state", "student_depth"],
+        "teacher": ["teacher"],
+    }
+
+    student = NavDepthStudentModelCfg(
+        hidden_dims=[256, 128, 64],
+        activation="elu",
+    )
+    algorithm = SimpleNavDistillAlgorithmCfg(
+        num_learning_epochs=4,
+        learning_rate=5.0e-4,
+        gradient_length=8,
+        max_grad_norm=1.0,
+        loss_type="mse",
+        action_loss_weight=1.0,
+        safety_loss_weight=2.5,
+        safety_clearance_threshold=0.65,
+        safety_weight_clip=4.0,
     )
