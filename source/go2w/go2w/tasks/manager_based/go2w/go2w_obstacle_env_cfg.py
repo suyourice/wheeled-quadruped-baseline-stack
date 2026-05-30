@@ -4,19 +4,25 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-Go2-W HLC/LLC navigation teacher and LiDAR student distillation environment.
+Go2-W HLC/LLC navigation teacher and student distillation environments.
 
 Training flow:
   1. Train RL navigation teacher (PPO) on goal-conditioned task:
        obs  = base_lin_vel(3) + projected_gravity(3) + goal_command(3)
-              + obstacle_polar_depth(180) + obstacle_nav_features(16) + prev_hlc_actions(6) = 211D
+              + obstacle_polar_depth(180) + obstacle_nav_features(16)
+              + obstacle_full_geometry(240) + prev_hlc_actions(6) = 451D
        acts = FrozenLLCActionTerm: 3D velocity [vx,vy,yaw] -> frozen fast-flat LLC -> 16D joints
-  2. Distill teacher into LiDAR student (action MSE, teacher=211D, student=189D):
+  2. Distill teacher into LiDAR student (action MSE, teacher=451D, student=189D):
        student obs = base_lin_vel(3) + projected_gravity(3) + goal_command(3) + lidar_scan(180) = 189D
+  3. Distill teacher into depth student:
+       student obs = state(15D) + depth history stack from a head-mounted D456-like camera
 
   train.py --task Nav-Teacher-Go2w-v0 --locomotion_checkpoint <fast-flat-ckpt>
   train.py --task Navigation-RL-Distill-Go2w-v0 --teacher_checkpoint <teacher-ckpt> --locomotion_checkpoint <fast-flat-ckpt>
+  train.py --task Navigation-Depth-Distill-Go2w-v0 --teacher_checkpoint <teacher-ckpt> --locomotion_checkpoint <fast-flat-ckpt>
 """
+
+import math
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
@@ -26,13 +32,18 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCfg
+from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCameraCfg, MultiMeshRayCasterCfg
 from isaaclab.sensors.ray_caster import patterns
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from . import mdp
 from .go2w_env_cfg import EventCfg, Go2wEnvCfg, Go2wSceneCfg
+from .mdp.obstacle_geometry import (
+    OBSTACLE_SHAPE_CONE,
+    OBSTACLE_SHAPE_CUBOID,
+    OBSTACLE_SHAPE_CYLINDER,
+)
 
 # =============================================================================
 # Constants
@@ -40,7 +51,7 @@ from .go2w_env_cfg import EventCfg, Go2wEnvCfg, Go2wSceneCfg
 
 # Physical obstacle slots
 TRAIN_PHYSICAL_OBSTACLE_SLOTS = 15
-PLAY_PHYSICAL_OBSTACLE_SLOTS = 64
+PLAY_PHYSICAL_OBSTACLE_SLOTS = 15
 PLAY_DEFAULT_ACTIVE_OBSTACLES = 5
 
 # Convenience aliases
@@ -51,12 +62,45 @@ PLAY_NUM_OBSTACLES = PLAY_DEFAULT_ACTIVE_OBSTACLES
 PLAY_MIN_INTER_OBSTACLE_DIST = 0.7
 
 OBSTACLE_SIZE = (0.3, 0.3, 0.5)
-# Float the (kinematic, gravity-disabled) boxes slightly above the floor so they
-# never register an obstacle↔ground contact. Without this, every box rests on
+# Fixed physical assets used as a randomized training pool. Most slots retain
+# the familiar baseline box; the remaining slots introduce real shape/size diversity.
+TRAIN_OBSTACLE_SPECS = (
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.30, 0.30)),
+    ("cuboid", (0.18, 0.24)),
+    ("cuboid", (0.46, 0.30)),
+    ("cuboid", (0.46, 0.46)),
+    ("cylinder", (0.44, 0.44)),
+    ("cone", (0.54, 0.54)),
+)
+_SHAPE_ID_BY_KIND = {
+    "cuboid": OBSTACLE_SHAPE_CUBOID,
+    "cylinder": OBSTACLE_SHAPE_CYLINDER,
+    "cone": OBSTACLE_SHAPE_CONE,
+}
+TRAIN_OBSTACLE_SHAPE_IDS = tuple(_SHAPE_ID_BY_KIND[kind] for kind, _ in TRAIN_OBSTACLE_SPECS)
+TRAIN_OBSTACLE_WIDTHS = tuple(size[0] for _, size in TRAIN_OBSTACLE_SPECS)
+TRAIN_OBSTACLE_DEPTHS = tuple(size[1] for _, size in TRAIN_OBSTACLE_SPECS)
+PLAY_OBSTACLE_SPECS = TRAIN_OBSTACLE_SPECS + (
+    ("cuboid", (OBSTACLE_SIZE[0], OBSTACLE_SIZE[1])),
+) * (PLAY_PHYSICAL_OBSTACLE_SLOTS - TRAIN_PHYSICAL_OBSTACLE_SLOTS)
+PLAY_OBSTACLE_SHAPE_IDS = tuple(_SHAPE_ID_BY_KIND[kind] for kind, _ in PLAY_OBSTACLE_SPECS)
+PLAY_OBSTACLE_WIDTHS = tuple(size[0] for _, size in PLAY_OBSTACLE_SPECS)
+PLAY_OBSTACLE_DEPTHS = tuple(size[1] for _, size in PLAY_OBSTACLE_SPECS)
+# Float the (kinematic, gravity-disabled) obstacles slightly above the floor so
+# they never register an obstacle-to-ground contact. Without this, every asset rests on
 # z = OBSTACLE_SIZE[2]/2 and the obstacle contact sensor fires on the ground
-# reaction on every step (even in the empty scenario with boxes parked away).
-# The box still spans z ∈ [clearance, clearance + height], overlapping the robot
-# body/wheels, so robot↔obstacle collisions are still detected normally.
+# reaction on every step (even in the empty scenario with obstacles parked away).
+# Each asset still spans the robot collision height, so robot-to-obstacle
+# contacts are detected normally.
 OBSTACLE_GROUND_CLEARANCE = 0.05
 OBSTACLE_Z = OBSTACLE_SIZE[2] / 2 + OBSTACLE_GROUND_CLEARANCE
 OBSTACLE_SPAWN_RANGE = {"x": (-3.5, 3.5), "y": (-2.5, 2.5)}
@@ -77,12 +121,19 @@ OBSTACLE_LIN_VEL_X = (-2.0, 2.0)
 OBSTACLE_LIN_VEL_Y = (-2.0, 2.0)
 OBSTACLE_ANG_VEL_Z = (-2.0, 2.0)
 OBSTACLE_COLLISION_WEIGHT = -40.0
-NAV_TTC_OBSTACLE_RADIUS = 0.22      # 0.3 m square half-diagonal: sqrt(0.15^2 + 0.15^2) ~= 0.212 m, rounded up.
+NAV_TTC_FALLBACK_OBSTACLE_RADIUS = 0.22  # Used only if physical footprint metadata is unavailable.
 NAV_TTC_ROBOT_HALF_WIDTH = 0.30     # Wheels reach ~0.22 m from center; extra width covers gait/body sway.
 NAV_TTC_SAFETY_MARGIN = 0.05        # Keeps edge intrusions soft without blocking narrow-gap entries.
 NAV_TTC_FRONT_MARGIN = 0.20         # Approximate front half-length plus a small contact buffer.
 NAV_TTC_LOOKAHEAD_DISTANCE = 2.2    # About 1.1 s at 2.0 m/s, enough to turn without over-penalizing distant gaps.
 NAV_TTC_SUM_CLIP = 1.5              # Caps dense TTC cost when several obstacles overlap the same corridor.
+NAV_OBSTACLE_RADIUS_MARGIN = 0.03
+NAV_PHYSICAL_SLOT_RANDOMIZATION_START_ITERATION = 500
+NAV_PHYSICAL_SLOT_RANDOMIZATION_WARMUP_ITERATIONS = 500
+NAV_RANDOMIZE_OBSTACLE_YAW = True
+NAV_OBSTACLE_YAW_RANGE = (-math.pi, math.pi)
+NAV_PASSABLE_GAP_ROBOT_WIDTH = 0.44
+NAV_PASSABLE_GAP_MIN_WIDTH = 0.50
 
 # Navigation task geometry
 NAV_GOAL_FORWARD_RANGE = (2.5, 4.5)
@@ -103,7 +154,7 @@ NAV_NARROW_GAP_PROGRESS_RANGE = (0.35, 0.75)
 NAV_NARROW_GAP_CENTER_LATERAL_RANGE = (-0.15, 0.15)
 NAV_NARROW_GAP_HALF_WIDTH_RANGE = (0.45, 0.65)
 NAV_NARROW_GAP_WIDE_HALF_WIDTH_RANGE = (0.60, 0.80)
-NAV_NARROW_GAP_BARELY_HALF_WIDTH_RANGE = (0.40, 0.52)  # physical gap: 0.50–0.74 m; min ≥ robot wheel span 0.44 m
+NAV_NARROW_GAP_BARELY_HALF_WIDTH_RANGE = (0.40, 0.52)  # Geometry filtering rejects samples below the passable free width.
 NAV_NARROW_GAP_PROBABILITY = 0.25
 NAV_PARTIAL_BLOCKAGE_PROGRESS_RANGE = (0.2, 0.75)
 NAV_PARTIAL_BLOCKAGE_LATERAL_RANGE = (0.5, 1.15)
@@ -164,8 +215,9 @@ NAV_TTC_PASSABLE_GAP_RELIEF = 0.5
 NAV_DENSE_RECOVERY_WEIGHT = 1.0
 # Mild near-contact (grazing) penalty, kept far weaker than obstacle_collision.
 NAV_GRAZING_WEIGHT = -0.5
-NAV_GRAZING_DISTANCE = 0.65
-NAV_GRAZING_CONTACT_DISTANCE = 0.50
+NAV_CLEARANCE_SURFACE_BUFFER = 0.20
+NAV_GRAZING_DISTANCE = 0.05
+NAV_GRAZING_CONTACT_DISTANCE = -0.10
 NAV_GRAZING_PASSABLE_GAP_RELIEF = 0.4
 
 # Unitree L2 reference spec: 360 x 96 deg FoV, 30 m max range.
@@ -175,6 +227,46 @@ LIDAR_HORIZONTAL_FOV = (0.0, 360.0)
 LIDAR_HORIZONTAL_RES = 2.0   # 180 rays
 LIDAR_CHANNELS = 1            # single horizontal ring for 180D HLC student obs
 LIDAR_VERTICAL_FOV = (0.0, 0.0)
+
+# Intel RealSense D456-style depth student setup. The native sensor supports
+# 1280 x 720 depth, but distillation trains on a small 16:9 image to keep rollout
+# storage and ray-casting cost manageable.
+D456_DEPTH_MIN_DISTANCE = 0.60
+D456_DEPTH_MAX_DISTANCE = 6.0
+D456_DEPTH_HORIZONTAL_FOV_DEG = 86.0
+D456_DEPTH_VERTICAL_FOV_DEG = 57.0
+D456_NATIVE_DEPTH_RESOLUTION = (1280, 720)
+DEPTH_IMAGE_WIDTH = 128
+DEPTH_IMAGE_HEIGHT = 72
+DEPTH_HISTORY_LENGTH = 3
+DEPTH_DISTILL_NUM_ENVS = 512
+DEPTH_DISTILL_MIN_OBSTACLES = 6
+DEPTH_DISTILL_MAX_OBSTACLES = 10
+DEPTH_DISTILL_EMPTY_ENV_FRACTION = 0.05
+DEPTH_DISTILL_MIN_INTER_OBSTACLE_DIST = 0.9
+DEPTH_DISTILL_DYNAMIC_START_ITERATION = 250
+DEPTH_DISTILL_DYNAMIC_WARMUP_ITERATIONS = 250
+DEPTH_DISTILL_DYNAMIC_SPEED_RANGE = (0.03, 0.40)
+DEPTH_DISTILL_DYNAMIC_LATERAL_SPEED = 0.08
+DEPTH_DISTILL_DYNAMIC_LONGITUDINAL_EXTENT = 1.4
+DEPTH_DISTILL_DYNAMIC_LATERAL_EXTENT = 0.35
+DEPTH_DISTILL_DYNAMIC_SPEED_CHANGE_INTERVAL = (1.2, 2.8)
+DEPTH_DISTILL_DYNAMIC_WANDER_FRACTION = 0.15
+D456_CAMERA_FOCAL_LENGTH_CM = 24.0
+D456_CAMERA_HORIZONTAL_APERTURE_CM = 2.0 * D456_CAMERA_FOCAL_LENGTH_CM * math.tan(
+    math.radians(D456_DEPTH_HORIZONTAL_FOV_DEG) * 0.5
+)
+D456_CAMERA_VERTICAL_APERTURE_CM = 2.0 * D456_CAMERA_FOCAL_LENGTH_CM * math.tan(
+    math.radians(D456_DEPTH_VERTICAL_FOV_DEG) * 0.5
+)
+D456_CAMERA_PITCH_DOWN_DEG = 5.0
+_D456_CAMERA_PITCH_HALF_RAD = math.radians(D456_CAMERA_PITCH_DOWN_DEG) * 0.5
+D456_CAMERA_PITCH_DOWN_QUAT_WXYZ = (
+    math.cos(_D456_CAMERA_PITCH_HALF_RAD),
+    0.0,
+    math.sin(_D456_CAMERA_PITCH_HALF_RAD),
+    0.0,
+)
 
 
 # =============================================================================
@@ -199,46 +291,84 @@ class HLCNavActionsCfg:
 # =============================================================================
 
 
-def _make_obstacle_cfg(name: str, idx: int) -> RigidObjectCfg:
-    """Create a kinematic box obstacle config."""
+def _make_obstacle_cfg(
+    name: str,
+    idx: int,
+    shape_kind: str = "cuboid",
+    footprint_size: tuple[float, float] = (OBSTACLE_SIZE[0], OBSTACLE_SIZE[1]),
+) -> RigidObjectCfg:
+    """Create a physical obstacle with variable footprint and fixed height."""
+    width, depth = footprint_size
+    spawn_kwargs = {
+        "rigid_props": sim_utils.RigidBodyPropertiesCfg(
+            kinematic_enabled=True,
+            disable_gravity=True,
+        ),
+        "collision_props": sim_utils.CollisionPropertiesCfg(
+            collision_enabled=True,
+        ),
+        "visual_material": sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.8, 0.2, 0.2),
+        ),
+        "activate_contact_sensors": True,
+    }
+    if shape_kind == "cuboid":
+        spawn = sim_utils.CuboidCfg(
+            size=(width, depth, OBSTACLE_SIZE[2]),
+            **spawn_kwargs,
+        )
+    elif shape_kind == "cylinder":
+        spawn = sim_utils.CylinderCfg(
+            radius=max(width, depth) / 2.0,
+            height=OBSTACLE_SIZE[2],
+            **spawn_kwargs,
+        )
+    elif shape_kind == "cone":
+        spawn = sim_utils.ConeCfg(
+            radius=max(width, depth) / 2.0,
+            height=OBSTACLE_SIZE[2],
+            **spawn_kwargs,
+        )
+    else:
+        raise ValueError(f"Unsupported obstacle shape: {shape_kind!r}")
+
     return RigidObjectCfg(
         prim_path=f"{{ENV_REGEX_NS}}/{name}",
-        spawn=sim_utils.CuboidCfg(
-            size=OBSTACLE_SIZE,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-                disable_gravity=True,
-            ),
-            collision_props=sim_utils.CollisionPropertiesCfg(
-                collision_enabled=True,
-            ),
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.8, 0.2, 0.2),
-            ),
-            activate_contact_sensors=True,
-        ),
+        spawn=spawn,
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=(1.5 + idx * 0.5, 0.0, OBSTACLE_Z),
         ),
     )
 
 
+def make_play_obstacle_cfg(
+    name: str,
+    idx: int,
+    shape_kind: str,
+    footprint_size: tuple[float, float],
+) -> RigidObjectCfg:
+    """Create an overridden play obstacle asset."""
+    return _make_obstacle_cfg(name, idx, shape_kind, footprint_size)
+
+
 @configclass
 class ObstacleSceneCfg(Go2wSceneCfg):
-    """Scene with Go2-W robot, flat ground, static box obstacles, and LiDAR."""
+    """Scene with Go2-W robot, flat ground, physical obstacle variants, and LiDAR."""
 
     replicate_physics: bool = False  # each env needs independent physics
 
-    for i in range(NUM_OBSTACLES):
-        vars()[f"obstacle_{i}"] = _make_obstacle_cfg(f"obstacle_{i}", i)
-    del i
+    for i, (shape_kind, footprint_size) in enumerate(TRAIN_OBSTACLE_SPECS):
+        vars()[f"obstacle_{i}"] = _make_obstacle_cfg(
+            f"obstacle_{i}", i, shape_kind, footprint_size
+        )
+    del i, shape_kind, footprint_size
 
     obstacle_contacts = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/obstacle_.*",
         history_length=3,
         track_air_time=False,
         # No contact filter: the sensor prim matches multiple obstacles per env, so
-        # Isaac's filtered-contact reporting is unsupported here. Instead the boxes
+        # Isaac's filtered-contact reporting is unsupported here. Instead obstacles
         # are floated by OBSTACLE_GROUND_CLEARANCE so net_forces only ever reflect
         # robot↔obstacle contacts (no obstacle↔ground reaction).
     )
@@ -268,11 +398,57 @@ class ObstacleSceneCfg(Go2wSceneCfg):
 
 @configclass
 class ObstaclePlaySceneCfg(ObstacleSceneCfg):
-    """Play scene with extra obstacle slots for dense-clutter visual testing."""
+    """Play scene with configurable obstacle capacity for visual testing."""
 
-    for i in range(NUM_OBSTACLES, PLAY_MAX_OBSTACLES):
-        vars()[f"obstacle_{i}"] = _make_obstacle_cfg(f"obstacle_{i}", i)
-    del i
+    if PLAY_MAX_OBSTACLES > NUM_OBSTACLES:
+        for i in range(NUM_OBSTACLES, PLAY_MAX_OBSTACLES):
+            vars()[f"obstacle_{i}"] = _make_obstacle_cfg(f"obstacle_{i}", i)
+        del i
+
+
+def _make_depth_camera_cfg() -> MultiMeshRayCasterCameraCfg:
+    """Create a lightweight D456-like ray-cast depth camera."""
+    return MultiMeshRayCasterCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/Head_upper",
+        offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
+            pos=(0.0, 0.0, 0.095),
+            rot=D456_CAMERA_PITCH_DOWN_QUAT_WXYZ,
+            convention="world",
+        ),
+        data_types=["distance_to_image_plane"],
+        depth_clipping_behavior="max",
+        pattern_cfg=patterns.PinholeCameraPatternCfg(
+            focal_length=D456_CAMERA_FOCAL_LENGTH_CM,
+            horizontal_aperture=D456_CAMERA_HORIZONTAL_APERTURE_CM,
+            vertical_aperture=D456_CAMERA_VERTICAL_APERTURE_CM,
+            width=DEPTH_IMAGE_WIDTH,
+            height=DEPTH_IMAGE_HEIGHT,
+        ),
+        max_distance=D456_DEPTH_MAX_DISTANCE,
+        mesh_prim_paths=[
+            "/World/ground",
+            MultiMeshRayCasterCfg.RaycastTargetCfg(
+                prim_expr="{ENV_REGEX_NS}/obstacle_.*",
+                track_mesh_transforms=True,
+                is_shared=True,
+            ),
+        ],
+        debug_vis=False,
+    )
+
+
+@configclass
+class DepthObstacleSceneCfg(ObstacleSceneCfg):
+    """Training scene with LiDAR compatibility plus a head-mounted depth camera."""
+
+    depth_camera = _make_depth_camera_cfg()
+
+
+@configclass
+class DepthObstaclePlaySceneCfg(ObstaclePlaySceneCfg):
+    """Play scene with extra obstacle slots plus a head-mounted depth camera."""
+
+    depth_camera = _make_depth_camera_cfg()
 
 
 # =============================================================================
@@ -315,12 +491,20 @@ _NAV_RESET_PARAMS_BASE = {
     "fixed_goal_lateral": None,
     "fixed_goal_heading_jitter": None,
     "fixed_scenario_template": None,
+    "obstacle_radius_margin": 0.0,
+    "randomize_physical_obstacle_slots": False,
+    "randomize_obstacle_yaw": NAV_RANDOMIZE_OBSTACLE_YAW,
+    "obstacle_yaw_range": NAV_OBSTACLE_YAW_RANGE,
+    "passable_gap_min_width": NAV_PASSABLE_GAP_MIN_WIDTH,
+    "passable_gap_robot_width": NAV_PASSABLE_GAP_ROBOT_WIDTH,
 }
 
 
 @configclass
 class ObstacleEventCfg(EventCfg):
     """Base obstacle-environment events (legacy obstacle curriculum for compatibility)."""
+
+    depth_distill_dynamic_obstacles: EventTerm | None = None
 
     speed_curriculum: EventTerm | None = EventTerm(
         func=mdp.update_locomotion_curriculum,
@@ -356,6 +540,9 @@ class ObstacleEventCfg(EventCfg):
             "min_spawn_distance_from_robot_initial": OBSTACLE_MIN_SPAWN_DISTANCE_INITIAL,
             "min_inter_obstacle_dist": 0.8,
             "min_survival_steps": 800,
+            "fixed_obstacle_shape_ids": TRAIN_OBSTACLE_SHAPE_IDS,
+            "fixed_obstacle_widths": TRAIN_OBSTACLE_WIDTHS,
+            "fixed_obstacle_depths": TRAIN_OBSTACLE_DEPTHS,
         },
     )
 
@@ -414,7 +601,8 @@ class NavTeacherRewardsCfg:
         weight=-1.5,
         params={
             "obstacle_names": OBSTACLE_NAMES,
-            "min_safe_dist": 0.8,
+            "min_safe_dist": NAV_CLEARANCE_SURFACE_BUFFER,
+            "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
             # Soften proximity penalty while threading a passable narrow gap.
             "passable_gap_relief": NAV_CLEARANCE_PASSABLE_GAP_RELIEF,
             "asset_cfg": SceneEntityCfg("robot"),
@@ -437,6 +625,15 @@ class NavTeacherRewardsCfg:
     nav_open_path_straightness = RewTerm(
         func=mdp.nav_open_path_straightness_reward,
         weight=1.2,
+        params={
+            "obstacle_names": OBSTACLE_NAMES,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "goal_path_corridor_half_width": 0.7,
+        },
+    )
+    nav_open_path_goal_heading = RewTerm(
+        func=mdp.nav_open_path_goal_heading_reward,
+        weight=0.6,
         params={
             "obstacle_names": OBSTACLE_NAMES,
             "robot_cfg": SceneEntityCfg("robot"),
@@ -470,7 +667,7 @@ class NavTeacherRewardsCfg:
             "obstacle_names": OBSTACLE_NAMES,
             "safe_ttc": 1.0,
             "command_name": "base_velocity",
-            "obstacle_radius": NAV_TTC_OBSTACLE_RADIUS,
+            "obstacle_radius": NAV_TTC_FALLBACK_OBSTACLE_RADIUS,
             "robot_half_width": NAV_TTC_ROBOT_HALF_WIDTH,
             "safety_margin": NAV_TTC_SAFETY_MARGIN,
             "robot_front_margin": NAV_TTC_FRONT_MARGIN,
@@ -510,6 +707,7 @@ class NavTeacherRewardsCfg:
             "robot_cfg": SceneEntityCfg("robot"),
             "graze_distance": NAV_GRAZING_DISTANCE,
             "contact_distance": NAV_GRAZING_CONTACT_DISTANCE,
+            "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
             "passable_gap_relief": NAV_GRAZING_PASSABLE_GAP_RELIEF,
         },
     )
@@ -567,6 +765,22 @@ class NavTeacherRewardsCfg:
     )
 
 
+def _retarget_nav_rewards_to_play_obstacles(rewards: NavTeacherRewardsCfg) -> None:
+    """Use the full play obstacle slot list for footprint-aware reward terms."""
+    reward_names = (
+        "nav_clearance",
+        "nav_lateral_escape",
+        "nav_open_path_straightness",
+        "nav_open_path_goal_heading",
+        "nav_impossible_gap",
+        "obstacle_ttc",
+        "nav_dense_recovery",
+        "nav_grazing",
+    )
+    for reward_name in reward_names:
+        getattr(rewards, reward_name).params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+
+
 # =============================================================================
 # Observations
 # =============================================================================
@@ -574,9 +788,10 @@ class NavTeacherRewardsCfg:
 
 @configclass
 class NavTeacherObsCfg:
-    """PPO observations for the RL navigation teacher (211D).
+    """PPO observations for the RL navigation teacher (451D).
 
-    proprio(9D) + obstacle_polar_depth(180D) + obstacle_nav_features(16D) + prev_hlc_actions(6D).
+    proprio(9D) + obstacle_polar_depth(180D) + obstacle_nav_features(16D)
+    + obstacle_full_geometry(240D) + prev_hlc_actions(6D).
     """
 
     @configclass
@@ -603,6 +818,7 @@ class NavTeacherObsCfg:
                 "obstacle_names": OBSTACLE_NAMES,
                 "num_bins": 180,
                 "max_distance": LIDAR_MAX_DISTANCE,
+                "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
             },
         )
 
@@ -614,6 +830,20 @@ class NavTeacherObsCfg:
                 "obstacle_names": OBSTACLE_NAMES,
                 "robot_cfg": SceneEntityCfg("robot"),
                 "command_name": "base_velocity",
+                "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
+            },
+        )
+
+        # Teacher-only full geometry (15 slots x 16D): active flag, robot-frame
+        # position, projected footprint, shape, clearance, and relative yaw.
+        obstacle_full_geometry = ObsTerm(
+            func=mdp.obstacle_full_geometry_features,
+            params={
+                "obstacle_names": OBSTACLE_NAMES,
+                "robot_cfg": SceneEntityCfg("robot"),
+                "num_slots": PRIVILEGED_OBSTACLE_SLOTS,
+                "max_distance": 8.0,
+                "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
             },
         )
 
@@ -635,7 +865,8 @@ class NavRLDistillObsCfg:
     """Distillation observations: student (LiDAR) and teacher (privileged).
 
     student: proprio(9D) + lidar_scan(180D) = 189D
-    teacher: proprio(9D) + obstacle_polar_depth(180D) + obstacle_nav_features(16D) + prev_hlc_actions(6D) = 211D
+    teacher: proprio(9D) + obstacle_polar_depth(180D) + obstacle_nav_features(16D)
+             + obstacle_full_geometry(240D) + prev_hlc_actions(6D) = 451D
     """
 
     @configclass
@@ -671,7 +902,7 @@ class NavRLDistillObsCfg:
 
     @configclass
     class TeacherCfg(ObsGroup):
-        """Privileged teacher observations (211D, must match NavTeacherObsCfg.PolicyCfg)."""
+        """Privileged teacher observations (451D, must match NavTeacherObsCfg.PolicyCfg)."""
 
         base_lin_vel      = ObsTerm(func=mdp.base_lin_vel,      noise=Unoise(n_min=-0.1,  n_max=0.1))
         projected_gravity = ObsTerm(func=mdp.projected_gravity,  noise=Unoise(n_min=-0.05, n_max=0.05))
@@ -694,6 +925,7 @@ class NavRLDistillObsCfg:
                 "obstacle_names": OBSTACLE_NAMES,
                 "num_bins": 180,
                 "max_distance": LIDAR_MAX_DISTANCE,
+                "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
             },
         )
 
@@ -703,6 +935,18 @@ class NavRLDistillObsCfg:
                 "obstacle_names": OBSTACLE_NAMES,
                 "robot_cfg": SceneEntityCfg("robot"),
                 "command_name": "base_velocity",
+                "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
+            },
+        )
+
+        obstacle_full_geometry = ObsTerm(
+            func=mdp.obstacle_full_geometry_features,
+            params={
+                "obstacle_names": OBSTACLE_NAMES,
+                "robot_cfg": SceneEntityCfg("robot"),
+                "num_slots": PRIVILEGED_OBSTACLE_SLOTS,
+                "max_distance": 8.0,
+                "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
             },
         )
 
@@ -719,6 +963,68 @@ class NavRLDistillObsCfg:
     teacher: TeacherCfg = TeacherCfg()
 
 
+@configclass
+class NavDepthRLDistillObsCfg:
+    """Depth distillation observations.
+
+    student_state: proprio/goal/action history (15D)
+    student_depth: depth history stack (T x H x W)
+    teacher: privileged teacher observation matching NavTeacherObsCfg.PolicyCfg
+    """
+
+    @configclass
+    class StudentStateCfg(ObsGroup):
+        """Low-dimensional student state paired with depth images."""
+
+        base_lin_vel      = ObsTerm(func=mdp.base_lin_vel,      noise=Unoise(n_min=-0.1,  n_max=0.1))
+        projected_gravity = ObsTerm(func=mdp.projected_gravity,  noise=Unoise(n_min=-0.05, n_max=0.05))
+
+        goal_command = ObsTerm(
+            func=mdp.local_goal_command_b,
+            params={
+                "use_lidar_refinement": False,
+                "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
+                "goal_snap_distance": NAV_WAYPOINT_GOAL_SNAP_DISTANCE,
+                "command_min_forward": NAV_WAYPOINT_COMMAND_MIN_FORWARD,
+                "command_max_lateral": NAV_WAYPOINT_COMMAND_MAX_LATERAL,
+                "command_max_heading": NAV_WAYPOINT_COMMAND_MAX_HEADING,
+            },
+        )
+
+        prev_actions = ObsTerm(
+            func=mdp.prev_hlc_actions,
+            params={"num_frames": 2, "action_term_name": "llc_cmd"},
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class StudentDepthCfg(ObsGroup):
+        """Head-mounted D456-like depth history for the CNN student."""
+
+        depth_stack = ObsTerm(
+            func=mdp.depth_closeness_image,
+            params={
+                "sensor_cfg": SceneEntityCfg("depth_camera"),
+                "data_type": "distance_to_image_plane",
+                "min_depth": D456_DEPTH_MIN_DISTANCE,
+                "max_depth": D456_DEPTH_MAX_DISTANCE,
+            },
+            history_length=DEPTH_HISTORY_LENGTH,
+            flatten_history_dim=False,
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    student_state: StudentStateCfg = StudentStateCfg()
+    student_depth: StudentDepthCfg = StudentDepthCfg()
+    teacher: NavRLDistillObsCfg.TeacherCfg = NavRLDistillObsCfg.TeacherCfg()
+
+
 # =============================================================================
 # Environment configs
 # =============================================================================
@@ -729,7 +1035,7 @@ class Go2wNavTeacherEnvCfg(Go2wEnvCfg):
     """RL navigation teacher environment.
 
     Inherits locomotion infrastructure from Go2wEnvCfg and adds:
-    - Obstacle scene (boxes + LiDAR)
+    - Obstacle scene (physical shape variants + LiDAR)
     - Goal-conditioned reward structure
     - Navigation reset event
     """
@@ -762,6 +1068,13 @@ class Go2wNavTeacherEnvCfg(Go2wEnvCfg):
             "empty_env_fraction": 0.1,
             "min_inter_obstacle_dist": 0.7,
             "phase_schedule": NAV_CURRICULUM_PHASE_SCHEDULE,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "fixed_obstacle_shape_ids": TRAIN_OBSTACLE_SHAPE_IDS,
+            "fixed_obstacle_widths": TRAIN_OBSTACLE_WIDTHS,
+            "fixed_obstacle_depths": TRAIN_OBSTACLE_DEPTHS,
+            "randomize_physical_obstacle_slots": True,
+            "physical_slot_randomization_start_iteration": NAV_PHYSICAL_SLOT_RANDOMIZATION_START_ITERATION,
+            "physical_slot_randomization_warmup_iterations": NAV_PHYSICAL_SLOT_RANDOMIZATION_WARMUP_ITERATIONS,
         }
 
         # Episode never terminates on goal reached — goal_reached_and_resample
@@ -784,6 +1097,8 @@ class Go2wNavTeacherEnvCfg_PLAY(Go2wNavTeacherEnvCfg):
         self.observations.policy.enable_corruption = False
         self.observations.policy.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
         self.observations.policy.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        self.observations.policy.obstacle_full_geometry.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        _retarget_nav_rewards_to_play_obstacles(self.rewards)
         # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
         self.commands.base_velocity.debug_vis = True
 
@@ -794,6 +1109,13 @@ class Go2wNavTeacherEnvCfg_PLAY(Go2wNavTeacherEnvCfg):
             "max_obstacles": PLAY_NUM_OBSTACLES,
             "empty_env_fraction": 0.0,
             "min_inter_obstacle_dist": PLAY_MIN_INTER_OBSTACLE_DIST,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "fixed_obstacle_shape_ids": PLAY_OBSTACLE_SHAPE_IDS,
+            "fixed_obstacle_widths": PLAY_OBSTACLE_WIDTHS,
+            "fixed_obstacle_depths": PLAY_OBSTACLE_DEPTHS,
+            "randomize_physical_obstacle_slots": True,
+            "physical_slot_randomization_start_iteration": 0,
+            "physical_slot_randomization_warmup_iterations": 0,
         }
 
 
@@ -818,6 +1140,13 @@ class Go2wNavRLDistillEnvCfg(Go2wNavTeacherEnvCfg):
             "empty_env_fraction": 0.05,
             "min_inter_obstacle_dist": 0.7,
             "phase_schedule": NAV_CURRICULUM_PHASE_SCHEDULE,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "fixed_obstacle_shape_ids": TRAIN_OBSTACLE_SHAPE_IDS,
+            "fixed_obstacle_widths": TRAIN_OBSTACLE_WIDTHS,
+            "fixed_obstacle_depths": TRAIN_OBSTACLE_DEPTHS,
+            "randomize_physical_obstacle_slots": True,
+            "physical_slot_randomization_start_iteration": NAV_PHYSICAL_SLOT_RANDOMIZATION_START_ITERATION,
+            "physical_slot_randomization_warmup_iterations": NAV_PHYSICAL_SLOT_RANDOMIZATION_WARMUP_ITERATIONS,
         }
 
 
@@ -836,6 +1165,8 @@ class Go2wNavRLDistillEnvCfg_PLAY(Go2wNavRLDistillEnvCfg):
         self.observations.student.enable_corruption = False
         self.observations.teacher.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
         self.observations.teacher.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        self.observations.teacher.obstacle_full_geometry.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        _retarget_nav_rewards_to_play_obstacles(self.rewards)
         # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
         self.commands.base_velocity.debug_vis = True
 
@@ -846,4 +1177,98 @@ class Go2wNavRLDistillEnvCfg_PLAY(Go2wNavRLDistillEnvCfg):
             "max_obstacles": PLAY_NUM_OBSTACLES,
             "empty_env_fraction": 0.0,
             "min_inter_obstacle_dist": PLAY_MIN_INTER_OBSTACLE_DIST,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "fixed_obstacle_shape_ids": PLAY_OBSTACLE_SHAPE_IDS,
+            "fixed_obstacle_widths": PLAY_OBSTACLE_WIDTHS,
+            "fixed_obstacle_depths": PLAY_OBSTACLE_DEPTHS,
+            "randomize_physical_obstacle_slots": True,
+            "physical_slot_randomization_start_iteration": 0,
+            "physical_slot_randomization_warmup_iterations": 0,
+        }
+
+
+@configclass
+class Go2wNavDepthRLDistillEnvCfg(Go2wNavRLDistillEnvCfg):
+    """Depth-camera student distillation environment."""
+
+    scene: DepthObstacleSceneCfg = DepthObstacleSceneCfg(num_envs=DEPTH_DISTILL_NUM_ENVS, env_spacing=8.0)
+    observations: NavDepthRLDistillObsCfg = NavDepthRLDistillObsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.depth_camera.update_period = self.decimation * self.sim.dt
+        self.events.reset_obstacles.params = {
+            **_NAV_RESET_PARAMS_BASE,
+            "obstacle_names": OBSTACLE_NAMES,
+            "min_obstacles": DEPTH_DISTILL_MIN_OBSTACLES,
+            "max_obstacles": DEPTH_DISTILL_MAX_OBSTACLES,
+            "empty_env_fraction": DEPTH_DISTILL_EMPTY_ENV_FRACTION,
+            "min_inter_obstacle_dist": DEPTH_DISTILL_MIN_INTER_OBSTACLE_DIST,
+            "phase_schedule": None,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "fixed_obstacle_shape_ids": TRAIN_OBSTACLE_SHAPE_IDS,
+            "fixed_obstacle_widths": TRAIN_OBSTACLE_WIDTHS,
+            "fixed_obstacle_depths": TRAIN_OBSTACLE_DEPTHS,
+            "randomize_physical_obstacle_slots": True,
+            "physical_slot_randomization_start_iteration": 0,
+            "physical_slot_randomization_warmup_iterations": 0,
+        }
+        self.events.depth_distill_dynamic_obstacles = EventTerm(
+            func=mdp.move_dynamic_play_obstacles,
+            mode="interval",
+            interval_range_s=(0.0, 0.0),
+            params={
+                "obstacle_names": OBSTACLE_NAMES,
+                "obstacle_z": OBSTACLE_Z,
+                "longitudinal_speed_range": DEPTH_DISTILL_DYNAMIC_SPEED_RANGE,
+                "lateral_speed_max": DEPTH_DISTILL_DYNAMIC_LATERAL_SPEED,
+                "longitudinal_extent": DEPTH_DISTILL_DYNAMIC_LONGITUDINAL_EXTENT,
+                "lateral_extent": DEPTH_DISTILL_DYNAMIC_LATERAL_EXTENT,
+                "min_inter_obstacle_dist": DEPTH_DISTILL_MIN_INTER_OBSTACLE_DIST,
+                "velocity_resample_interval_range": DEPTH_DISTILL_DYNAMIC_SPEED_CHANGE_INTERVAL,
+                "random_trajectory_fraction": DEPTH_DISTILL_DYNAMIC_WANDER_FRACTION,
+                "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+                "start_iteration": DEPTH_DISTILL_DYNAMIC_START_ITERATION,
+                "warmup_iterations": DEPTH_DISTILL_DYNAMIC_WARMUP_ITERATIONS,
+                "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
+            },
+        )
+
+
+@configclass
+class Go2wNavDepthRLDistillEnvCfg_PLAY(Go2wNavDepthRLDistillEnvCfg):
+    """Play/eval env for the depth-camera student distillation."""
+
+    scene: DepthObstaclePlaySceneCfg = DepthObstaclePlaySceneCfg(num_envs=16, env_spacing=5.0)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 16
+        self.scene.env_spacing = 5.0
+        self.events.push_robot = None
+        self.events.add_base_mass = None
+        self.events.depth_distill_dynamic_obstacles = None
+        self.observations.student_state.enable_corruption = False
+        self.observations.student_depth.enable_corruption = False
+        self.observations.teacher.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        self.observations.teacher.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        self.observations.teacher.obstacle_full_geometry.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+        _retarget_nav_rewards_to_play_obstacles(self.rewards)
+        # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
+        self.commands.base_velocity.debug_vis = True
+
+        self.events.reset_obstacles.params = {
+            **_NAV_RESET_PARAMS_BASE,
+            "obstacle_names": PLAY_OBSTACLE_NAMES,
+            "min_obstacles": PLAY_NUM_OBSTACLES,
+            "max_obstacles": PLAY_NUM_OBSTACLES,
+            "empty_env_fraction": 0.0,
+            "min_inter_obstacle_dist": PLAY_MIN_INTER_OBSTACLE_DIST,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "fixed_obstacle_shape_ids": PLAY_OBSTACLE_SHAPE_IDS,
+            "fixed_obstacle_widths": PLAY_OBSTACLE_WIDTHS,
+            "fixed_obstacle_depths": PLAY_OBSTACLE_DEPTHS,
+            "randomize_physical_obstacle_slots": True,
+            "physical_slot_randomization_start_iteration": 0,
+            "physical_slot_randomization_warmup_iterations": 0,
         }
