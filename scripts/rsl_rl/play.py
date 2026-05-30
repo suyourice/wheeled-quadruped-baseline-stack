@@ -19,6 +19,13 @@ import cli_args  # isort: skip
 DEFAULT_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
 DEFAULT_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
 DEFAULT_COMMAND_PATH_MIN_SPEED = 0.2
+DEFAULT_DYNAMIC_OBSTACLE_SPEED_RANGE = (0.25, 0.70)
+DEFAULT_DYNAMIC_OBSTACLE_LATERAL_SPEED = 0.12
+DEFAULT_DYNAMIC_OBSTACLE_LONGITUDINAL_EXTENT = 2.0
+DEFAULT_DYNAMIC_OBSTACLE_LATERAL_EXTENT = 0.30
+DEFAULT_DYNAMIC_OBSTACLE_SPEED_CHANGE_INTERVAL = (0.8, 2.5)
+DEFAULT_DYNAMIC_OBSTACLE_WANDER_FRACTION = 0.35
+DEFAULT_RANDOM_OBSTACLE_FOOTPRINT_RANGE = (0.12, 0.60)
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play an RL agent with RSL-RL.")
@@ -35,7 +42,101 @@ parser.add_argument(
     dest="num_obstacles",
     type=int,
     default=None,
-    help="Obstacle play tasks only: force this many active boxes in the scene.",
+    help="Obstacle play tasks only: force this many active obstacles in the scene.",
+)
+parser.add_argument(
+    "--dynamic_obstacles",
+    "--dynamic-obstacles",
+    dest="dynamic_obstacles",
+    action="store_true",
+    default=False,
+    help="Navigation play tasks only: move active obstacles like pedestrians during inference.",
+)
+parser.add_argument(
+    "--dynamic_obstacle_speed_range",
+    "--dynamic-obstacle-speed-range",
+    dest="dynamic_obstacle_speed_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Longitudinal pedestrian speed range [m/s]. Default: 0.25 0.70",
+)
+parser.add_argument(
+    "--dynamic_obstacle_lateral_speed",
+    "--dynamic-obstacle-lateral-speed",
+    dest="dynamic_obstacle_lateral_speed",
+    type=float,
+    default=None,
+    help="Maximum lateral drift speed [m/s]. Default: 0.12",
+)
+parser.add_argument(
+    "--dynamic_obstacle_longitudinal_extent",
+    "--dynamic-obstacle-longitudinal-extent",
+    dest="dynamic_obstacle_longitudinal_extent",
+    type=float,
+    default=None,
+    help="Maximum longitudinal excursion from each spawn point [m]. Default: 2.0",
+)
+parser.add_argument(
+    "--dynamic_obstacle_lateral_extent",
+    "--dynamic-obstacle-lateral-extent",
+    dest="dynamic_obstacle_lateral_extent",
+    type=float,
+    default=None,
+    help="Maximum lateral excursion from each spawn point [m]. Default: 0.30",
+)
+parser.add_argument(
+    "--dynamic_obstacle_min_separation",
+    "--dynamic-obstacle-min-separation",
+    dest="dynamic_obstacle_min_separation",
+    type=float,
+    default=None,
+    help="Minimum center-to-center distance maintained between moving obstacles [m]. Default: reset spacing.",
+)
+parser.add_argument(
+    "--dynamic_obstacle_mixed_motion",
+    "--dynamic-obstacle-mixed-motion",
+    dest="dynamic_obstacle_mixed_motion",
+    action="store_true",
+    default=False,
+    help="Dynamic play only: vary per-obstacle speeds over time and let a subset wander in random directions.",
+)
+parser.add_argument(
+    "--dynamic_obstacle_speed_change_interval",
+    "--dynamic-obstacle-speed-change-interval",
+    dest="dynamic_obstacle_speed_change_interval",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Mixed motion only: seconds between per-obstacle velocity updates. Default: 0.8 2.5",
+)
+parser.add_argument(
+    "--dynamic_obstacle_wander_fraction",
+    "--dynamic-obstacle-wander-fraction",
+    dest="dynamic_obstacle_wander_fraction",
+    type=float,
+    default=None,
+    help="Mixed motion only: fraction of active obstacles that follow random trajectories. Default: 0.35",
+)
+parser.add_argument(
+    "--random_obstacle_shapes",
+    "--random-obstacle-shapes",
+    dest="random_obstacle_shapes",
+    action="store_true",
+    default=False,
+    help="Navigation play tasks only: randomize each obstacle as a box, cylinder, or cone with a fixed height.",
+)
+parser.add_argument(
+    "--random_obstacle_footprint_range",
+    "--random-obstacle-footprint-range",
+    dest="random_obstacle_footprint_range",
+    type=float,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Random obstacle width/diameter range [m]. Default: 0.12 0.60",
 )
 parser.add_argument(
     "--command_path_obstacles",
@@ -167,6 +268,14 @@ parser.add_argument(
     help="Navigation play tasks only: minimum obstacle distance from the episode start in meters.",
 )
 parser.add_argument(
+    "--nav_goal_exclusion_radius",
+    "--nav-goal-exclusion-radius",
+    dest="nav_goal_exclusion_radius",
+    type=float,
+    default=None,
+    help="Navigation play tasks only: minimum obstacle distance from the goal in meters.",
+)
+parser.add_argument(
     "--nav_head_on_progress_range",
     "--nav-head-on-progress-range",
     dest="nav_head_on_progress_range",
@@ -185,6 +294,22 @@ parser.add_argument(
     help="Navigation play tasks only: print env debug every N sim steps. Use 0 to disable.",
 )
 parser.add_argument("--nav_log_env", "--nav-log-env", dest="nav_log_env", type=int, default=0)
+parser.add_argument(
+    "--nav_contact_debug",
+    "--nav-contact-debug",
+    dest="nav_contact_debug",
+    action="store_true",
+    default=False,
+    help="Navigation play tasks only: print obstacle-mask, clearance, and contact diagnostics each step.",
+)
+parser.add_argument(
+    "--nav_contact_debug_steps",
+    "--nav-contact-debug-steps",
+    dest="nav_contact_debug_steps",
+    type=int,
+    default=12,
+    help="Number of steps to print before exiting when --nav_contact_debug is enabled. Default: 12.",
+)
 parser.add_argument(
     "--nav_eval_episodes",
     "--nav-eval-episodes",
@@ -269,6 +394,7 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 import isaaclab.sim as sim_utils
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
@@ -288,6 +414,14 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import go2w.tasks  # noqa: F401
+from go2w.tasks.manager_based.go2w import mdp as go2w_mdp
+from go2w.tasks.manager_based.go2w.go2w_obstacle_env_cfg import OBSTACLE_SIZE, make_play_obstacle_cfg
+from go2w.tasks.manager_based.go2w.mdp.obstacle_geometry import (
+    OBSTACLE_SHAPE_CONE,
+    OBSTACLE_SHAPE_CUBOID,
+    OBSTACLE_SHAPE_CYLINDER,
+    footprint_clearance,
+)
 from go2w.tasks.manager_based.go2w.observation_layout import POLICY_OBS
 
 
@@ -413,6 +547,205 @@ def _override_play_obstacle_count(
     print(f"[INFO] Active play obstacles: {num_obstacles}/{max_available}")
 
 
+def _override_dynamic_navigation_play(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    args_cli: argparse.Namespace,
+):
+    """Add pedestrian-style obstacle motion only for opt-in navigation play."""
+    has_dynamic_params = any(
+        value is not None
+        for value in (
+            args_cli.dynamic_obstacle_speed_range,
+            args_cli.dynamic_obstacle_lateral_speed,
+            args_cli.dynamic_obstacle_longitudinal_extent,
+            args_cli.dynamic_obstacle_lateral_extent,
+            args_cli.dynamic_obstacle_min_separation,
+            args_cli.dynamic_obstacle_speed_change_interval,
+            args_cli.dynamic_obstacle_wander_fraction,
+        )
+    )
+    if not args_cli.dynamic_obstacles:
+        if has_dynamic_params or args_cli.dynamic_obstacle_mixed_motion:
+            raise ValueError("Dynamic obstacle tuning flags require --dynamic_obstacles.")
+        return
+    if not args_cli.dynamic_obstacle_mixed_motion and (
+        args_cli.dynamic_obstacle_speed_change_interval is not None
+        or args_cli.dynamic_obstacle_wander_fraction is not None
+    ):
+        raise ValueError(
+            "--dynamic_obstacle_speed_change_interval and --dynamic_obstacle_wander_fraction "
+            "require --dynamic_obstacle_mixed_motion."
+        )
+
+    events_cfg = getattr(env_cfg, "events", None)
+    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
+    reset_params = getattr(reset_obstacles, "params", None)
+    if reset_params is None or "fixed_scenario_template" not in reset_params:
+        raise ValueError("--dynamic_obstacles requires a navigation play task.")
+
+    speed_range = (
+        tuple(args_cli.dynamic_obstacle_speed_range)
+        if args_cli.dynamic_obstacle_speed_range is not None
+        else DEFAULT_DYNAMIC_OBSTACLE_SPEED_RANGE
+    )
+    if speed_range[0] < 0.0 or speed_range[0] > speed_range[1]:
+        raise ValueError("--dynamic_obstacle_speed_range requires 0 <= MIN <= MAX.")
+    lateral_speed = (
+        args_cli.dynamic_obstacle_lateral_speed
+        if args_cli.dynamic_obstacle_lateral_speed is not None
+        else DEFAULT_DYNAMIC_OBSTACLE_LATERAL_SPEED
+    )
+    longitudinal_extent = (
+        args_cli.dynamic_obstacle_longitudinal_extent
+        if args_cli.dynamic_obstacle_longitudinal_extent is not None
+        else DEFAULT_DYNAMIC_OBSTACLE_LONGITUDINAL_EXTENT
+    )
+    lateral_extent = (
+        args_cli.dynamic_obstacle_lateral_extent
+        if args_cli.dynamic_obstacle_lateral_extent is not None
+        else DEFAULT_DYNAMIC_OBSTACLE_LATERAL_EXTENT
+    )
+    min_separation = (
+        args_cli.dynamic_obstacle_min_separation
+        if args_cli.dynamic_obstacle_min_separation is not None
+        else float(reset_params.get("min_inter_obstacle_dist", 0.7))
+    )
+    if min(lateral_speed, longitudinal_extent, lateral_extent, min_separation) < 0.0:
+        raise ValueError("Dynamic obstacle speed, extents, and separation must be non-negative.")
+    velocity_resample_interval_range = None
+    random_trajectory_fraction = 0.0
+    if args_cli.dynamic_obstacle_mixed_motion:
+        velocity_resample_interval_range = (
+            tuple(args_cli.dynamic_obstacle_speed_change_interval)
+            if args_cli.dynamic_obstacle_speed_change_interval is not None
+            else DEFAULT_DYNAMIC_OBSTACLE_SPEED_CHANGE_INTERVAL
+        )
+        if (
+            velocity_resample_interval_range[0] <= 0.0
+            or velocity_resample_interval_range[0] > velocity_resample_interval_range[1]
+        ):
+            raise ValueError("--dynamic_obstacle_speed_change_interval requires 0 < MIN <= MAX.")
+        random_trajectory_fraction = (
+            args_cli.dynamic_obstacle_wander_fraction
+            if args_cli.dynamic_obstacle_wander_fraction is not None
+            else DEFAULT_DYNAMIC_OBSTACLE_WANDER_FRACTION
+        )
+        if not 0.0 <= random_trajectory_fraction <= 1.0:
+            raise ValueError("--dynamic_obstacle_wander_fraction requires 0 <= FRACTION <= 1.")
+
+    events_cfg.dynamic_play_obstacles = EventTerm(
+        func=go2w_mdp.move_dynamic_play_obstacles,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            "obstacle_names": reset_params.get("obstacle_names", []),
+            "obstacle_z": reset_params.get("obstacle_z", 0.30),
+            "longitudinal_speed_range": speed_range,
+            "lateral_speed_max": lateral_speed,
+            "longitudinal_extent": longitudinal_extent,
+            "lateral_extent": lateral_extent,
+            "min_inter_obstacle_dist": min_separation,
+            "velocity_resample_interval_range": velocity_resample_interval_range,
+            "random_trajectory_fraction": random_trajectory_fraction,
+            "goal_exclusion_radius": float(reset_params.get("goal_exclusion_radius", 0.9)),
+        },
+    )
+    print(
+        "[INFO] Dynamic navigation play obstacles: "
+        f"speed={speed_range}, lateral_speed=+/-{lateral_speed:.2f}, "
+        f"extent=({longitudinal_extent:.2f}, {lateral_extent:.2f}), "
+        f"min_separation={min_separation:.2f}"
+    )
+    if velocity_resample_interval_range is not None:
+        print(
+            "[INFO] Mixed dynamic motion: "
+            f"speed_change_interval={velocity_resample_interval_range}, "
+            f"wander_fraction={random_trajectory_fraction:.2f}"
+        )
+
+
+def _override_random_navigation_play_obstacle_shapes(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    args_cli: argparse.Namespace,
+    env_seed: int,
+):
+    """Replace play obstacle assets with seeded random fixed-height shapes."""
+    if not args_cli.random_obstacle_shapes:
+        if args_cli.random_obstacle_footprint_range is not None:
+            raise ValueError("--random_obstacle_footprint_range requires --random_obstacle_shapes.")
+        return
+
+    events_cfg = getattr(env_cfg, "events", None)
+    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
+    reset_params = getattr(reset_obstacles, "params", None)
+    if reset_params is None or "fixed_scenario_template" not in reset_params:
+        raise ValueError("--random_obstacle_shapes requires a navigation play task.")
+
+    footprint_range = (
+        tuple(args_cli.random_obstacle_footprint_range)
+        if args_cli.random_obstacle_footprint_range is not None
+        else DEFAULT_RANDOM_OBSTACLE_FOOTPRINT_RANGE
+    )
+    if footprint_range[0] <= 0.0 or footprint_range[0] > footprint_range[1]:
+        raise ValueError("--random_obstacle_footprint_range requires 0 < MIN <= MAX.")
+
+    required_separation = (2.0**0.5) * footprint_range[1] + 0.02
+    if (
+        args_cli.dynamic_obstacles
+        and args_cli.dynamic_obstacle_min_separation is not None
+        and args_cli.dynamic_obstacle_min_separation < required_separation
+    ):
+        raise ValueError(
+            "--dynamic_obstacle_min_separation is too small for the random obstacle footprint range. "
+            f"Use at least {required_separation:.2f} m or reduce the footprint MAX."
+        )
+    min_separation = float(reset_params.get("min_inter_obstacle_dist", 0.7))
+    if min_separation < required_separation:
+        reset_params["min_inter_obstacle_dist"] = required_separation
+        print(
+            "[INFO] Raised navigation obstacle spacing for random shapes: "
+            f"{min_separation:.2f} -> {required_separation:.2f} m"
+        )
+
+    obstacle_names = reset_params.get("obstacle_names", [])
+    if not obstacle_names:
+        raise ValueError("--random_obstacle_shapes requires configured obstacle slots.")
+
+    rng = random.Random(env_seed ^ 0x4F425354)
+    shape_counts = {"cuboid": 0, "cylinder": 0, "cone": 0}
+    shape_ids = {
+        "cuboid": OBSTACLE_SHAPE_CUBOID,
+        "cylinder": OBSTACLE_SHAPE_CYLINDER,
+        "cone": OBSTACLE_SHAPE_CONE,
+    }
+    fixed_shape_ids: list[int] = []
+    fixed_widths: list[float] = []
+    fixed_depths: list[float] = []
+    for idx, obstacle_name in enumerate(obstacle_names):
+        shape_kind = rng.choice(tuple(shape_counts))
+        width = rng.uniform(*footprint_range)
+        depth = width if shape_kind in ("cylinder", "cone") else rng.uniform(*footprint_range)
+        setattr(
+            env_cfg.scene,
+            obstacle_name,
+            make_play_obstacle_cfg(obstacle_name, idx, shape_kind, (width, depth)),
+        )
+        shape_counts[shape_kind] += 1
+        fixed_shape_ids.append(shape_ids[shape_kind])
+        fixed_widths.append(width)
+        fixed_depths.append(depth)
+
+    reset_params["fixed_obstacle_shape_ids"] = tuple(fixed_shape_ids)
+    reset_params["fixed_obstacle_widths"] = tuple(fixed_widths)
+    reset_params["fixed_obstacle_depths"] = tuple(fixed_depths)
+
+    print(
+        "[INFO] Random navigation play obstacle shapes: "
+        f"footprint={footprint_range}, height={OBSTACLE_SIZE[2]:.2f}, "
+        f"cuboids={shape_counts['cuboid']}, cylinders={shape_counts['cylinder']}, cones={shape_counts['cone']}"
+    )
+
+
 def _override_play_command_path_spawn(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     command_path_obstacles: int | None,
@@ -493,6 +826,7 @@ def _override_navigation_play_case(
         or args_cli.nav_goal_heading_jitter is not None
         or args_cli.nav_min_inter_obstacle_dist is not None
         or args_cli.nav_start_exclusion_radius is not None
+        or args_cli.nav_goal_exclusion_radius is not None
         or args_cli.nav_head_on_progress_range is not None
         or args_cli.nav_fixed_start
         or args_cli.nav_start_x is not None
@@ -527,6 +861,10 @@ def _override_navigation_play_case(
         reset_params["min_inter_obstacle_dist"] = args_cli.nav_min_inter_obstacle_dist
     if args_cli.nav_start_exclusion_radius is not None:
         reset_params["start_exclusion_radius"] = args_cli.nav_start_exclusion_radius
+    if args_cli.nav_goal_exclusion_radius is not None:
+        if args_cli.nav_goal_exclusion_radius < 0.0:
+            raise ValueError("--nav_goal_exclusion_radius must be non-negative.")
+        reset_params["goal_exclusion_radius"] = args_cli.nav_goal_exclusion_radius
     if args_cli.nav_head_on_progress_range is not None:
         progress_min, progress_max = args_cli.nav_head_on_progress_range
         if not 0.0 <= progress_min <= progress_max <= 1.0:
@@ -561,7 +899,8 @@ def _override_navigation_play_case(
         f"goal_lateral={reset_params.get('fixed_goal_lateral')}, "
         f"goal_heading_jitter={reset_params.get('fixed_goal_heading_jitter')}, "
         f"min_inter_obstacle_dist={reset_params.get('min_inter_obstacle_dist')}, "
-        f"start_exclusion_radius={reset_params.get('start_exclusion_radius')}"
+        f"start_exclusion_radius={reset_params.get('start_exclusion_radius')}, "
+        f"goal_exclusion_radius={reset_params.get('goal_exclusion_radius')}"
     )
 
 
@@ -649,6 +988,8 @@ def _print_navigation_play_log(obs, dones: torch.Tensor, step_count: int, env_in
     group_key = "policy" if isinstance(obs, dict) and "policy" in obs else None
     if group_key is None and isinstance(obs, dict) and "student" in obs:
         group_key = "student"
+    if group_key is None and isinstance(obs, dict) and "student_state" in obs:
+        group_key = "student_state"
     if group_key is None:
         return
     data = obs[group_key]
@@ -657,7 +998,7 @@ def _print_navigation_play_log(obs, dones: torch.Tensor, step_count: int, env_in
     env_index = max(0, min(env_index, data.shape[0] - 1))
     row = data[env_index]
 
-    if row.numel() == 189:
+    if row.numel() in (15, 189):
         base_lin_vel = row[0:3]
         projected_gravity = row[3:6]
         goal_command = row[6:9]
@@ -684,6 +1025,82 @@ def _print_navigation_play_log(obs, dones: torch.Tensor, step_count: int, env_in
         f"goal_cmd=[{_format_vector(goal_command)}] "
         f"base_lin_vel=[{_format_vector(base_lin_vel)}] "
         f"{state_text}"
+    )
+
+
+def _print_nav_contact_debug(
+    base_env, step_count: int, env_index: int, last_hlc_cmd: torch.Tensor | None
+) -> None:
+    """Print geometry and raw contact diagnostics for one navigation environment."""
+    if base_env is None or not hasattr(base_env, "_go2w_scenario_template_id"):
+        return
+    reset_params = base_env.cfg.events.reset_obstacles.params
+    obstacle_names = list(reset_params.get("obstacle_names", []))
+    if not obstacle_names:
+        return
+
+    ei = max(0, min(env_index, base_env.num_envs - 1))
+    robot_xy_all = base_env.scene["robot"].data.root_pos_w[:, :2]
+    positions_all = torch.stack([base_env.scene[name].data.root_pos_w[:, :2] for name in obstacle_names], dim=1)
+    center_distances_all = (positions_all - robot_xy_all.unsqueeze(1)).norm(dim=-1)
+    positions = positions_all[ei]
+    center_distances = center_distances_all[ei]
+    active = base_env._go2w_obstacle_active_mask[ei]
+    robot_safety_radius = float(base_env.cfg.rewards.nav_clearance.params.get("robot_safety_radius", 0.0))
+    clearances = footprint_clearance(
+        base_env,
+        obstacle_names,
+        center_distances_all,
+        robot_safety_radius,
+    )[ei]
+    masked_center = torch.where(active, center_distances, torch.full_like(center_distances, 8.0))
+    masked_clearance = torch.where(active, clearances, torch.full_like(clearances, 8.0))
+    inactive_min_center = torch.where(
+        ~active, center_distances, torch.full_like(center_distances, float("inf"))
+    ).min()
+
+    contact_sensor = base_env.scene.sensors["obstacle_contacts"]
+    contact_force_max = float(
+        contact_sensor.data.net_forces_w_history[ei].norm(dim=-1).max().item()
+    )
+    threshold = float(base_env.cfg.rewards.obstacle_collision.params.get("threshold", 1.0))
+    scenario_id = int(base_env._go2w_scenario_template_id[ei].item())
+    scenario = _NAV_SCENARIO_ID_TO_NAME.get(scenario_id, f"id{scenario_id}")
+    start_pos = base_env._go2w_start_pos_w[ei]
+    start_yaw = base_env._go2w_start_heading_w[ei]
+    goal_pos = base_env._go2w_goal_pos_w[ei]
+    robot_xy = robot_xy_all[ei]
+    raw_action = (
+        last_hlc_cmd[ei] if last_hlc_cmd is not None else torch.zeros(3, device=base_env.device)
+    )
+    executed_action = base_env.action_manager.get_term("llc_cmd").processed_actions[ei]
+    positions_text = (
+        ", ".join(
+            f"{name}:{'A' if bool(active[idx].item()) else 'I'}"
+            f"({positions[idx, 0].item():+.2f},{positions[idx, 1].item():+.2f})"
+            f"/shape={int(base_env._go2w_obstacle_shape_id[ei, idx].item())}"
+            f"/size=({base_env._go2w_obstacle_width[ei, idx].item():.2f},"
+            f"{base_env._go2w_obstacle_depth[ei, idx].item():.2f})"
+            f"/radius={base_env._go2w_obstacle_effective_radius[ei, idx].item():.3f}"
+            for idx, name in enumerate(obstacle_names)
+            if bool(active[idx].item())
+        )
+        if step_count == 0
+        else "see step=0"
+    )
+    print(
+        "[nav-contact-debug] "
+        f"step={step_count} scenario={scenario} active_count={int(active.sum().item())} "
+        f"start=({start_pos[0].item():+.3f},{start_pos[1].item():+.3f},{start_yaw.item():+.3f}) "
+        f"robot=({robot_xy[0].item():+.3f},{robot_xy[1].item():+.3f}) "
+        f"goal=({goal_pos[0].item():+.3f},{goal_pos[1].item():+.3f}) "
+        f"raw_action=({raw_action[0].item():+.3f},{raw_action[1].item():+.3f},{raw_action[2].item():+.3f}) "
+        f"executed_action=({executed_action[0].item():+.3f},{executed_action[1].item():+.3f},{executed_action[2].item():+.3f}) "
+        f"min_center={masked_center.min().item():.4f} "
+        f"min_footprint_clearance={masked_clearance.min().item():.4f} "
+        f"inactive_min_center={inactive_min_center.item():.4f} "
+        f"contact_force_max={contact_force_max:.4f} collision={int(contact_force_max > threshold)} "
+        f"active_positions=[{positions_text}]"
     )
 
 
@@ -763,6 +1180,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Play seed: {env_seed}")
 
     _override_navigation_play_case(env_cfg, args_cli, env_seed)
+    _override_random_navigation_play_obstacle_shapes(env_cfg, args_cli, env_seed)
+    _override_dynamic_navigation_play(env_cfg, args_cli)
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # specify directory for logging experiments
@@ -907,6 +1326,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
     # simulate environment
+    if args_cli.nav_contact_debug and args_cli.nav_contact_debug_steps <= 0:
+        raise ValueError("--nav_contact_debug_steps must be positive when --nav_contact_debug is enabled.")
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
@@ -967,6 +1388,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _print_navigation_play_log(
                 obs, dones, step_count, args_cli.nav_log_env, _base_env, last_hlc_cmd
             )
+        if args_cli.nav_contact_debug:
+            _print_nav_contact_debug(_base_env, step_count, args_cli.nav_log_env, last_hlc_cmd)
+            if step_count + 1 >= args_cli.nav_contact_debug_steps:
+                break
         if args_cli.nav_eval_episodes > 0 and (
             completed_episodes >= args_cli.nav_eval_episodes
             or (num_done > 0 and completed_episodes % max(args_cli.nav_eval_episodes // 4, 1) < num_done)

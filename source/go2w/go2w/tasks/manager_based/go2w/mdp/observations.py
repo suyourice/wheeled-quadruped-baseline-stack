@@ -17,6 +17,17 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
+from .obstacle_geometry import (
+    DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
+    DEFAULT_OBSTACLE_WIDTH,
+    DEFAULT_OBSTACLE_DEPTH,
+    OBSTACLE_SHAPE_CONE,
+    OBSTACLE_SHAPE_CUBOID,
+    OBSTACLE_SHAPE_CYLINDER,
+    obstacle_active_mask,
+    obstacle_risk_radius,
+)
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -47,6 +58,28 @@ def lidar_distances(
     )
     distances = distances.clamp(min=0.05, max=max_distance)
     return 1.0 - distances / max_distance
+
+
+def depth_closeness_image(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    data_type: str = "distance_to_image_plane",
+    min_depth: float = 0.60,
+    max_depth: float = 6.0,
+) -> torch.Tensor:
+    """Return a normalized depth image for the student policy.
+
+    The output keeps the image layout as (N, H, W). Observation history then
+    turns it into (N, T, H, W), which the CNN student treats as T channels.
+    """
+    sensor = env.scene.sensors[sensor_cfg.name]
+    depth = sensor.data.output[data_type]
+    if depth.ndim == 4 and depth.shape[-1] == 1:
+        depth = depth.squeeze(-1)
+
+    depth = torch.nan_to_num(depth, nan=max_depth, posinf=max_depth, neginf=max_depth)
+    depth = depth.clamp(min=min_depth, max=max_depth)
+    return (1.0 - depth / max_depth).clamp(0.0, 1.0)
 
 
 def obstacle_positions_rel(
@@ -130,15 +163,18 @@ def obstacle_polar_depth(
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     num_bins: int = 180,
     max_distance: float = 20.0,
+    robot_safety_radius: float = 0.30,
+    angular_chunk_size: int = 30,
 ) -> torch.Tensor:
     """Convert privileged obstacle positions to a 180-bin polar closeness map.
 
-    Encodes the same format as :func:`lidar_distances` (close=1, far/empty=0)
-    so teacher (uses this) and student (uses lidar_distances) can be trained
-    with direct MSE loss without any bridging transform.
+    Encodes close=1 and far/empty=0. The familiar 0.30 m box keeps the original
+    center-distance encoding; larger or smaller randomized footprints shift the
+    encoded distance by their radius difference from that nominal box.
 
-    Each bin covers 360°/num_bins (default 2°). For each bin, the minimum
-    distance among obstacles whose yaw-frame bearing falls in that bin is used.
+    Each bin covers 360°/num_bins (default 2°). Each obstacle contributes to
+    its center-bearing bin, preserving the teacher observation structure that
+    the baseline PPO setting learned from.
     Inactive obstacles parked at ≫max_distance contribute 0 closeness via
     the clamp and do not pollute occupied bins.
 
@@ -147,6 +183,8 @@ def obstacle_polar_depth(
         robot_cfg: SceneEntityCfg identifying the robot.
         num_bins: Angular resolution (default 180 → 2° per bin).
         max_distance: Normalization distance; obstacles beyond this map to 0.
+        robot_safety_radius: Kept for API compatibility; risk rewards apply it.
+        angular_chunk_size: Kept for API compatibility.
 
     Returns:
         Tensor of shape (num_envs, num_bins) with values in [0, 1].
@@ -168,17 +206,20 @@ def obstacle_polar_depth(
     quat_exp = robot_yaw_quat_w.unsqueeze(1).expand(-1, K, -1).reshape(N * K, 4)
     rel_pos_b_flat = quat_apply_inverse(quat_exp, rel_pos_w_all.reshape(N * K, 3))
     rel_xy = rel_pos_b_flat.reshape(N, K, 3)[:, :, :2]  # (N, K, 2)
-    dists = torch.norm(rel_xy, dim=-1)  # (N, K)
+    center_dists = torch.norm(rel_xy, dim=-1)  # (N, K)
+    active = obstacle_active_mask(env, obstacle_names, center_dists, max_distance)
+    risk_radii = obstacle_risk_radius(env, obstacle_names, center_dists)
+    nominal_radius = DEFAULT_OBSTACLE_EFFECTIVE_RADIUS + float(
+        getattr(env, "_go2w_obstacle_radius_margin", 0.0)
+    )
+    radius_delta = risk_radii - nominal_radius
+    encoded_dists = (center_dists - radius_delta).clamp(min=0.05, max=max_distance)
 
-    # Map bearing angle → bin index [0, num_bins)
     angles = torch.atan2(rel_xy[..., 1], rel_xy[..., 0])  # (N, K), range [-π, π]
     bin_idx = ((angles + torch.pi) / (2.0 * torch.pi) * num_bins).long().clamp(0, num_bins - 1)
-
-    # Start with max_distance in every bin (= no obstacle = closeness 0)
     dist_map = torch.full((env.num_envs, num_bins), max_distance, device=env.device)
-
-    # Scatter minimum distance per bin; inactive obstacles at 1000m stay ≫max_distance
-    dist_map.scatter_reduce_(1, bin_idx, dists, reduce="amin", include_self=True)
+    candidates = torch.where(active, encoded_dists, torch.full_like(encoded_dists, max_distance))
+    dist_map.scatter_reduce_(1, bin_idx, candidates, reduce="amin", include_self=True)
 
     return (1.0 - dist_map / max_distance).clamp(0.0, 1.0)
 
@@ -572,6 +613,148 @@ def _get_obstacle_relative_xy(
     return rel_xy, dists, angles
 
 
+def _quat_yaw_wxyz(quat: torch.Tensor) -> torch.Tensor:
+    """Return yaw angle from a wxyz quaternion tensor."""
+    w, x, y, z = quat.unbind(dim=-1)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return torch.atan2(siny_cosp, cosy_cosp)
+
+
+def obstacle_full_geometry_features(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    num_slots: int = 15,
+    max_distance: float = 8.0,
+    max_footprint_size: float = 1.0,
+    max_area: float = 1.0,
+    max_radius: float = 1.0,
+    robot_safety_radius: float = 0.30,
+) -> torch.Tensor:
+    """Return sorted privileged obstacle geometry for the teacher policy.
+
+    Per obstacle layout (16D):
+      active, rel_x, rel_y, center_dist, bearing_sin, bearing_cos,
+      robot_view_width, robot_view_depth, area, effective_radius, clearance,
+      cuboid, cylinder, cone, relative_yaw_sin, relative_yaw_cos.
+
+    The output is sorted nearest-first and padded with zeros so train and play
+    keep the same observation dimension even when play has many physical slots.
+    """
+    feature_dim = 16
+    if num_slots <= 0 or len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, max(num_slots, 0) * feature_dim, device=env.device)
+
+    robot = env.scene[robot_cfg.name]
+    rel_xy, center_dists, bearings = _get_obstacle_relative_xy(env, obstacle_names, robot_cfg)
+    N, K = center_dists.shape
+    device = env.device
+
+    active = obstacle_active_mask(env, obstacle_names, center_dists, max_distance)
+    sort_dists = torch.where(active, center_dists, torch.full_like(center_dists, max_distance * 10.0))
+    selected_slots = min(K, num_slots)
+    nearest_idx = torch.topk(sort_dists, k=selected_slots, dim=1, largest=False, sorted=True).indices
+
+    def gather_slots(values: torch.Tensor) -> torch.Tensor:
+        if values.ndim == 2:
+            return torch.gather(values, dim=1, index=nearest_idx)
+        index = nearest_idx.unsqueeze(-1).expand(-1, -1, values.shape[-1])
+        return torch.gather(values, dim=1, index=index)
+
+    rel_xy = gather_slots(rel_xy)
+    center_dists = gather_slots(center_dists)
+    bearings = gather_slots(bearings)
+    active = gather_slots(active).float()
+
+    meta_shape = (env.num_envs, len(obstacle_names))
+    if hasattr(env, "_go2w_obstacle_shape_id") and env._go2w_obstacle_shape_id.shape == meta_shape:
+        shape_ids = gather_slots(env._go2w_obstacle_shape_id)
+    else:
+        shape_ids = torch.full((N, selected_slots), OBSTACLE_SHAPE_CUBOID, dtype=torch.long, device=device)
+    if hasattr(env, "_go2w_obstacle_width") and env._go2w_obstacle_width.shape == meta_shape:
+        widths = gather_slots(env._go2w_obstacle_width)
+    else:
+        widths = torch.full((N, selected_slots), DEFAULT_OBSTACLE_WIDTH, device=device)
+    if hasattr(env, "_go2w_obstacle_depth") and env._go2w_obstacle_depth.shape == meta_shape:
+        depths = gather_slots(env._go2w_obstacle_depth)
+    else:
+        depths = torch.full((N, selected_slots), DEFAULT_OBSTACLE_DEPTH, device=device)
+    if hasattr(env, "_go2w_obstacle_effective_radius") and env._go2w_obstacle_effective_radius.shape == meta_shape:
+        effective_radius = gather_slots(env._go2w_obstacle_effective_radius)
+    else:
+        effective_radius = torch.full((N, selected_slots), DEFAULT_OBSTACLE_EFFECTIVE_RADIUS, device=device)
+
+    if hasattr(env, "_go2w_obstacle_yaw") and env._go2w_obstacle_yaw.shape == meta_shape:
+        obstacle_yaw_w = gather_slots(env._go2w_obstacle_yaw)
+    else:
+        obs_quat_all = torch.stack([env.scene[n].data.root_quat_w for n in obstacle_names], dim=1)
+        obstacle_yaw_w = gather_slots(_quat_yaw_wxyz(obs_quat_all.reshape(N * K, 4)).reshape(N, K))
+
+    robot_yaw_w = robot.data.heading_w.unsqueeze(1)
+    rel_yaw = wrap_to_pi(obstacle_yaw_w - robot_yaw_w)
+    abs_cos_yaw = torch.cos(rel_yaw).abs()
+    abs_sin_yaw = torch.sin(rel_yaw).abs()
+    is_cuboid = shape_ids == OBSTACLE_SHAPE_CUBOID
+    is_cylinder = shape_ids == OBSTACLE_SHAPE_CYLINDER
+    is_cone = shape_ids == OBSTACLE_SHAPE_CONE
+
+    cuboid_view_depth = abs_cos_yaw * widths + abs_sin_yaw * depths
+    cuboid_view_width = abs_sin_yaw * widths + abs_cos_yaw * depths
+    robot_view_depth = torch.where(is_cuboid, cuboid_view_depth, depths)
+    robot_view_width = torch.where(is_cuboid, cuboid_view_width, widths)
+
+    bearing_in_obstacle = wrap_to_pi(bearings - rel_yaw)
+    cuboid_support_radius = (
+        torch.cos(bearing_in_obstacle).abs() * widths * 0.5
+        + torch.sin(bearing_in_obstacle).abs() * depths * 0.5
+    )
+    margin = float(getattr(env, "_go2w_obstacle_radius_margin", 0.0))
+    surface_radius = torch.where(is_cuboid, cuboid_support_radius, effective_radius) + margin
+    clearance = center_dists - surface_radius - robot_safety_radius
+
+    cuboid_area = widths * depths
+    round_area = math.pi * (widths * 0.5).square()
+    area = torch.where(is_cuboid, cuboid_area, round_area)
+
+    rel_xy_norm = rel_xy.clamp(min=-max_distance, max=max_distance) / max_distance
+    center_dist_norm = center_dists.clamp(max=max_distance) / max_distance
+    view_width_norm = robot_view_width.clamp(max=max_footprint_size) / max_footprint_size
+    view_depth_norm = robot_view_depth.clamp(max=max_footprint_size) / max_footprint_size
+    area_norm = area.clamp(max=max_area) / max_area
+    effective_radius_norm = effective_radius.clamp(max=max_radius) / max_radius
+    clearance_norm = clearance.clamp(min=-1.0, max=max_distance) / max_distance
+
+    features = torch.stack(
+        [
+            active,
+            rel_xy_norm[..., 0],
+            rel_xy_norm[..., 1],
+            center_dist_norm,
+            bearings.sin(),
+            bearings.cos(),
+            view_width_norm,
+            view_depth_norm,
+            area_norm,
+            effective_radius_norm,
+            clearance_norm,
+            is_cuboid.float(),
+            is_cylinder.float(),
+            is_cone.float(),
+            rel_yaw.sin(),
+            rel_yaw.cos(),
+        ],
+        dim=-1,
+    )
+    features = features * active.unsqueeze(-1)
+
+    if selected_slots < num_slots:
+        pad_shape = (N, num_slots - selected_slots, feature_dim)
+        features = torch.cat([features, torch.zeros(pad_shape, device=device)], dim=1)
+
+    return features.flatten(start_dim=1)
+
+
 def obstacle_navigation_features(
     env: ManagerBasedRLEnv,
     obstacle_names: list[str],
@@ -581,6 +764,8 @@ def obstacle_navigation_features(
     frontal_half_angle_deg: float = 45.0,
     corridor_half_width: float = 0.65,
     min_command_speed: float = 0.05,
+    robot_safety_radius: float = 0.30,
+    reference_slot_count: int = 15,
 ) -> torch.Tensor:
     """Compact privileged navigation geometry features for the nav teacher (16D).
 
@@ -594,15 +779,15 @@ def obstacle_navigation_features(
     LiDAR/depth observations at distillation time.
 
     Feature layout (16D):
-      [0]  nearest_dist_norm     - nearest obstacle dist / max_distance ∈ [0, 1]
+      [0]  nearest_dist_norm     - nearest baseline-compatible obstacle distance / max
       [1]  nearest_sin           - sin(bearing to nearest obstacle)     ∈ [−1, 1]
       [2]  nearest_cos           - cos(bearing to nearest obstacle)     ∈ [−1, 1]
       [3]  frontal_blockage      - density in ±frontal_angle sector     ∈ [0, 1]
       [4]  left_blockage         - density in left 90° sector           ∈ [0, 1]
       [5]  right_blockage        - density in right 90° sector          ∈ [0, 1]
-      [6]  frontal_min_dist_norm - min dist in frontal sector / max     ∈ [0, 1]
-      [7]  left_min_dist_norm    - min dist in left hemisphere / max    ∈ [0, 1]
-      [8]  right_min_dist_norm   - min dist in right hemisphere / max   ∈ [0, 1]
+      [6]  frontal_min_dist_norm - min baseline-compatible distance in frontal sector / max
+      [7]  left_min_dist_norm    - min baseline-compatible distance in left hemisphere / max
+      [8]  right_min_dist_norm   - min baseline-compatible distance in right hemisphere / max
       [9]  preferred_side_hint   - (left_blockage − right_blockage)     ∈ [−1, 1]
                                     positive = right preferred (left more blocked)
                                     negative = left preferred (right more blocked)
@@ -610,33 +795,42 @@ def obstacle_navigation_features(
       [11] gap_width_norm        - frontal gap width / (2×corridor_hw)  ∈ [0, 1]
       [12] goal_path_blockage    - obstacle density along goal direction ∈ [0, 1]
       [13] ttc_proxy             - time-to-collision risk from HLC cmd  ∈ [0, 1]
-      [14] obstacle_count_norm   - active obstacle count / total slots  ∈ [0, 1]
-      [15] rear_clearance        - min dist in rear hemisphere / max    ∈ [0, 1]
+      [14] obstacle_count_norm   - active count / training reference slots
+      [15] rear_clearance        - min baseline-compatible rear distance / max
     """
     if len(obstacle_names) == 0:
         return torch.zeros(env.num_envs, 16, device=env.device)
 
-    rel_xy, dists, angles = _get_obstacle_relative_xy(env, obstacle_names, robot_cfg)
-    N, K = dists.shape
+    rel_xy, center_dists, angles = _get_obstacle_relative_xy(env, obstacle_names, robot_cfg)
+    N, _ = center_dists.shape
     device = env.device
     frontal_rad = math.radians(frontal_half_angle_deg)
 
-    # Active obstacle mask (parked obstacles are at ~1000 m)
-    active = dists < max_distance  # (N, K)
-    dists_c = dists.clamp(max=max_distance)
+    active = obstacle_active_mask(env, obstacle_names, center_dists, max_distance)
+    risk_radii = obstacle_risk_radius(env, obstacle_names, center_dists)
+    nominal_radius = DEFAULT_OBSTACLE_EFFECTIVE_RADIUS + float(
+        getattr(env, "_go2w_obstacle_radius_margin", 0.0)
+    )
+    radius_delta = risk_radii - nominal_radius
+    # Preserve baseline feature values for the familiar 0.30 m box while making
+    # larger randomized footprints appear closer and smaller ones appear farther.
+    feature_dists = (center_dists - radius_delta).clamp(min=0.0, max=max_distance)
 
     # ------- nearest obstacle -------
     big = max_distance * 10.0
-    masked_dists = torch.where(active, dists_c, torch.full_like(dists, big))
-    nearest_vals, nearest_idx = masked_dists.min(dim=1)       # (N,)
+    masked_dists = torch.where(active, feature_dists, torch.full_like(center_dists, big))
+    nearest_vals, nearest_idx = masked_dists.min(dim=1)  # (N,)
     nearest_dist_norm = nearest_vals.clamp(max=max_distance) / max_distance
 
     arange_n = torch.arange(N, device=device)
     nearest_sin = angles[arange_n, nearest_idx].sin()
     nearest_cos = angles[arange_n, nearest_idx].cos()
+    has_active = active.any(dim=1)
+    nearest_sin = torch.where(has_active, nearest_sin, torch.zeros_like(nearest_sin))
+    nearest_cos = torch.where(has_active, nearest_cos, torch.zeros_like(nearest_cos))
 
     # ------- per-obstacle closeness -------
-    closeness = ((1.0 - dists_c / max_distance) * active.float()).clamp(0.0, 1.0)
+    closeness = ((1.0 - feature_dists / max_distance) * active.float()).clamp(0.0, 1.0)
 
     # ------- sector masks -------
     frontal_mask = (angles.abs() < frontal_rad) & active
@@ -644,18 +838,18 @@ def obstacle_navigation_features(
     right_mask   = (angles < -frontal_rad) & (angles >= -math.pi) & active
     rear_mask    = (angles.abs() > math.pi - frontal_rad) & active
 
-    k_norm = 1.0 / max(K, 1)
-    frontal_blockage = (closeness * frontal_mask.float()).sum(dim=1) * k_norm
-    left_blockage    = (closeness * left_mask.float()).sum(dim=1) * k_norm
-    right_blockage   = (closeness * right_mask.float()).sum(dim=1) * k_norm
+    blockage_scale = 1.0 / max(reference_slot_count, 1)
+    frontal_blockage = ((closeness * frontal_mask.float()).sum(dim=1) * blockage_scale).clamp(max=1.0)
+    left_blockage = ((closeness * left_mask.float()).sum(dim=1) * blockage_scale).clamp(max=1.0)
+    right_blockage = ((closeness * right_mask.float()).sum(dim=1) * blockage_scale).clamp(max=1.0)
 
     # ------- min distance per sector -------
     inf_val = max_distance * 2.0
-    fill = torch.full_like(dists, inf_val)
-    frontal_min = torch.where(frontal_mask, dists_c, fill).min(dim=1).values.clamp(max=max_distance)
-    left_min    = torch.where(left_mask,    dists_c, fill).min(dim=1).values.clamp(max=max_distance)
-    right_min   = torch.where(right_mask,   dists_c, fill).min(dim=1).values.clamp(max=max_distance)
-    rear_min    = torch.where(rear_mask,    dists_c, fill).min(dim=1).values.clamp(max=max_distance)
+    fill = torch.full_like(center_dists, inf_val)
+    frontal_min = torch.where(frontal_mask, feature_dists, fill).min(dim=1).values.clamp(max=max_distance)
+    left_min    = torch.where(left_mask,    feature_dists, fill).min(dim=1).values.clamp(max=max_distance)
+    right_min   = torch.where(right_mask,   feature_dists, fill).min(dim=1).values.clamp(max=max_distance)
+    rear_min    = torch.where(rear_mask,    feature_dists, fill).min(dim=1).values.clamp(max=max_distance)
 
     frontal_min_dist_norm = frontal_min / max_distance
     left_min_dist_norm    = left_min    / max_distance
@@ -693,9 +887,20 @@ def obstacle_navigation_features(
     perp_b = torch.stack([-goal_dir_b[:, 1], goal_dir_b[:, 0]], dim=-1)
     goal_lateral = (rel_xy * perp_b.unsqueeze(1)).sum(dim=-1).abs() # (N, K)
     goal_corridor = corridor_half_width * 1.5
-    goal_path_mask = (goal_forward > 0.2) & (goal_forward < 5.0) & (goal_lateral < goal_corridor) & active
-    goal_intrusion = (goal_corridor - goal_lateral).clamp(0.0, goal_corridor) / goal_corridor
-    goal_path_blockage = (closeness * goal_intrusion * goal_path_mask.float()).max(dim=1).values
+    # Keep the baseline corridor meaning for the familiar box and expose only
+    # additional footprint width from larger or smaller randomized assets.
+    goal_corridor_extent = (goal_corridor + radius_delta).clamp(min=1.0e-3)
+    goal_path_mask = (
+        (goal_forward > -radius_delta)
+        & (goal_forward - radius_delta < goal_dist_w.unsqueeze(-1) + 0.3)
+        & (goal_lateral < goal_corridor_extent)
+        & active
+    )
+    goal_intrusion = (
+        (goal_corridor_extent - goal_lateral).clamp(min=0.0) / goal_corridor_extent.clamp(min=1.0e-6)
+    ).clamp(max=1.0)
+    goal_closeness = ((1.0 - center_dists / max_distance) * active.float()).clamp(0.0, 1.0)
+    goal_path_blockage = (goal_closeness * goal_intrusion * goal_path_mask.float()).max(dim=1).values
 
     # ------- TTC proxy from HLC command -------
     # FrozenLLCActionTerm mirrors the HLC velocity into base_velocity.
@@ -709,7 +914,7 @@ def obstacle_navigation_features(
     ttc_proxy = torch.where(moving, ttc_risk, torch.zeros_like(ttc_risk))
 
     # ------- active obstacle count -------
-    obstacle_count_norm = active.float().sum(dim=1) / max(K, 1)
+    obstacle_count_norm = (active.float().sum(dim=1) / max(reference_slot_count, 1)).clamp(max=1.0)
 
     return torch.stack([
         nearest_dist_norm,     # [0]
