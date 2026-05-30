@@ -58,9 +58,11 @@ from isaaclab.envs.mdp import (
 
 # -- Observations (local custom) -----------------------------------------------
 from .observations import (
+    depth_closeness_image,
     goal_position_w,
     lidar_distances,
     local_goal_command_b,
+    obstacle_full_geometry_features,
     obstacle_navigation_features,
     obstacle_polar_depth,
     obstacle_positions_rel,
@@ -95,6 +97,7 @@ from .rewards import (
     nav_grazing_penalty,
     nav_impossible_gap_penalty,
     nav_near_goal_settling_reward,
+    nav_open_path_goal_heading_reward,
     nav_open_path_straightness_reward,
     nav_passable_gap_traversal_reward,
     obstacle_contact_penalty,
