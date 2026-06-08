@@ -14,7 +14,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .navigation_path import set_navigation_path_w, update_navigation_path_waypoint
 from .obstacle_geometry import obstacle_effective_radius, set_obstacle_metadata
+from .structured_corridor import (
+    nearest_polyline_tangent_local,
+    plan_structured_corridor_path,
+    project_polyline_corridor_local,
+    structured_corridor_centerline,
+    structured_corridor_wall_specs,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -214,8 +222,8 @@ def reset_obstacles_curriculum(
 
     Active obstacles are placed randomly within spawn_range, excluding a radius
     around the robot spawn position and around already-placed obstacles.
-    Inactive obstacles are parked 1000 m away so obstacle_positions_rel
-    returns zero for them (beyond the 8 m mask).
+    Inactive obstacles are parked 1000 m away so obstacle observation and
+    reward terms mask them out by distance.
 
     Args:
         obstacle_names: All obstacle scene entity names.
@@ -696,6 +704,7 @@ def move_dynamic_play_obstacles(
     env_ids: torch.Tensor | None,
     obstacle_names: list[str],
     obstacle_z: float,
+    obstacle_indices: list[int] | None = None,
     longitudinal_speed_range: tuple[float, float] = (0.25, 0.70),
     lateral_speed_max: float = 0.12,
     longitudinal_extent: float = 2.0,
@@ -705,6 +714,7 @@ def move_dynamic_play_obstacles(
     velocity_resample_interval_range: tuple[float, float] | None = None,
     random_trajectory_fraction: float = 0.0,
     goal_exclusion_radius: float = 0.9,
+    robot_keepout_radius: float = 1.25,
     start_iteration: int = 0,
     warmup_iterations: int = 0,
     steps_per_iteration: int = 128,
@@ -741,6 +751,11 @@ def move_dynamic_play_obstacles(
     n_envs = env.num_envs
     n_slots = len(obstacle_names)
     device = env.device
+    metadata_indices = None
+    if obstacle_indices is not None:
+        if len(obstacle_indices) != n_slots:
+            raise ValueError("obstacle_indices must have one entry per dynamic obstacle name.")
+        metadata_indices = torch.tensor(obstacle_indices, dtype=torch.long, device=device)
 
     if (
         not hasattr(env, "_go2w_dynamic_obstacle_initialized")
@@ -775,6 +790,34 @@ def move_dynamic_play_obstacles(
         init_ids = env_ids[needs_init]
         init_active = active[needs_init]
         init_dir = corridor_dir[needs_init].unsqueeze(1).expand(-1, n_slots, -1)
+        if (
+            hasattr(env, "_go2w_structured_corridor_centerline_local")
+            and hasattr(env, "_go2w_structured_corridor_start_xy")
+            and hasattr(env, "_go2w_structured_corridor_yaw")
+        ):
+            start_xy = env._go2w_structured_corridor_start_xy[init_ids]
+            corridor_yaw = env._go2w_structured_corridor_yaw[init_ids]
+            cos_yaw = torch.cos(corridor_yaw).unsqueeze(1)
+            sin_yaw = torch.sin(corridor_yaw).unsqueeze(1)
+            local_positions = positions_xy[needs_init] - start_xy.unsqueeze(1)
+            local_positions = torch.stack(
+                (
+                    local_positions[..., 0] * cos_yaw + local_positions[..., 1] * sin_yaw,
+                    -local_positions[..., 0] * sin_yaw + local_positions[..., 1] * cos_yaw,
+                ),
+                dim=-1,
+            )
+            local_tangent = nearest_polyline_tangent_local(
+                local_positions,
+                env._go2w_structured_corridor_centerline_local[init_ids],
+            )
+            init_dir = torch.stack(
+                (
+                    local_tangent[..., 0] * cos_yaw - local_tangent[..., 1] * sin_yaw,
+                    local_tangent[..., 0] * sin_yaw + local_tangent[..., 1] * cos_yaw,
+                ),
+                dim=-1,
+            )
         signs = torch.randint(0, 2, init_active.shape, device=device, dtype=torch.int64).float() * 2.0 - 1.0
         speed_lo, speed_hi = longitudinal_speed_range
         speed = torch.empty(init_active.shape, device=device).uniform_(speed_lo, speed_hi)
@@ -855,7 +898,44 @@ def move_dynamic_play_obstacles(
     proposed = anchor + next_long.unsqueeze(-1) * path_dir + next_lat.unsqueeze(-1) * normal
     proposed = torch.where(active.unsqueeze(-1), proposed, positions_xy)
 
-    goal_xy = env._go2w_goal_pos_w[env_ids, :2]
+    if (
+        hasattr(env, "_go2w_structured_corridor_start_xy")
+        and hasattr(env, "_go2w_structured_corridor_yaw")
+        and hasattr(env, "_go2w_structured_corridor_width")
+        and hasattr(env, "_go2w_structured_corridor_centerline_local")
+    ):
+        start_xy = env._go2w_structured_corridor_start_xy[env_ids]
+        corridor_yaw = env._go2w_structured_corridor_yaw[env_ids]
+        cos_yaw = torch.cos(corridor_yaw).unsqueeze(1)
+        sin_yaw = torch.sin(corridor_yaw).unsqueeze(1)
+        rel = proposed - start_xy.unsqueeze(1)
+        local = torch.stack(
+            (
+                rel[..., 0] * cos_yaw + rel[..., 1] * sin_yaw,
+                -rel[..., 0] * sin_yaw + rel[..., 1] * cos_yaw,
+            ),
+            dim=-1,
+        )
+        projected_local = project_polyline_corridor_local(
+            local,
+            env._go2w_structured_corridor_centerline_local[env_ids],
+            env._go2w_structured_corridor_width[env_ids],
+        )
+        projected_world = torch.stack(
+            (
+                start_xy[:, 0:1] + projected_local[..., 0] * cos_yaw - projected_local[..., 1] * sin_yaw,
+                start_xy[:, 1:2] + projected_local[..., 0] * sin_yaw + projected_local[..., 1] * cos_yaw,
+            ),
+            dim=-1,
+        )
+        proposed = torch.where(active.unsqueeze(-1), projected_world, proposed)
+
+    if hasattr(env, "_go2w_navigation_path_w") and hasattr(env, "_go2w_navigation_path_count"):
+        path_count = env._go2w_navigation_path_count[env_ids].clamp(min=1)
+        final_idx = path_count - 1
+        goal_xy = env._go2w_navigation_path_w[env_ids, final_idx, :2]
+    else:
+        goal_xy = env._go2w_goal_pos_w[env_ids, :2]
     goal_keepout_radius = torch.full(
         (len(env_ids), n_slots),
         max(0.0, goal_exclusion_radius),
@@ -864,25 +944,26 @@ def move_dynamic_play_obstacles(
     )
     if (
         hasattr(env, "_go2w_obstacle_effective_radius")
+        and metadata_indices is not None
+        and env._go2w_obstacle_effective_radius.shape[0] == n_envs
+        and env._go2w_obstacle_effective_radius.shape[1] > int(metadata_indices.max().item())
+    ):
+        margin = float(getattr(env, "_go2w_obstacle_radius_margin", 0.0))
+        goal_keepout_radius = (
+            goal_keepout_radius
+            + env._go2w_obstacle_effective_radius[env_ids][:, metadata_indices]
+            + margin
+        )
+    elif (
+        hasattr(env, "_go2w_obstacle_effective_radius")
         and env._go2w_obstacle_effective_radius.shape == (n_envs, n_slots)
     ):
         margin = float(getattr(env, "_go2w_obstacle_radius_margin", 0.0))
         goal_keepout_radius = goal_keepout_radius + env._go2w_obstacle_effective_radius[env_ids] + margin
 
-    goal_vec = proposed - goal_xy.unsqueeze(1)
-    goal_dist = goal_vec.norm(dim=-1).clamp(min=1.0e-6)
-    fallback_away = -path_dir
-    away_dir = torch.where(
-        goal_dist.unsqueeze(-1) > 1.0e-5,
-        goal_vec / goal_dist.unsqueeze(-1),
-        fallback_away,
-    )
+    goal_dist = (proposed - goal_xy.unsqueeze(1)).norm(dim=-1)
     goal_keepout = active & (goal_dist < goal_keepout_radius)
-    proposed = torch.where(
-        goal_keepout.unsqueeze(-1),
-        goal_xy.unsqueeze(1) + away_dir * goal_keepout_radius.unsqueeze(-1),
-        proposed,
-    )
+    robot_keepout = active & ((proposed - robot_xy.unsqueeze(1)).norm(dim=-1) < max(0.0, robot_keepout_radius))
 
     # Resolve motion slot-by-slot against current or already accepted positions.
     # Rejected obstacles stay in place and reverse direction for the next step.
@@ -897,8 +978,9 @@ def move_dynamic_play_obstacles(
             & others.unsqueeze(0)
         ).any(dim=1)
         conflict &= active[:, slot_idx]
+        conflict |= goal_keepout[:, slot_idx] | robot_keepout[:, slot_idx]
         accepted[:, slot_idx] = torch.where(conflict.unsqueeze(-1), positions_xy[:, slot_idx], candidate)
-        reverse_motion = conflict | goal_keepout[:, slot_idx]
+        reverse_motion = conflict
         long_speed[:, slot_idx] = torch.where(reverse_motion, -long_speed[:, slot_idx], long_speed[:, slot_idx])
         lat_speed[:, slot_idx] = torch.where(reverse_motion, -lat_speed[:, slot_idx], lat_speed[:, slot_idx])
 
@@ -906,7 +988,14 @@ def move_dynamic_play_obstacles(
     env._go2w_dynamic_lat_speed[env_ids] = lat_speed
 
     zero_vel = torch.zeros(len(env_ids), 6, device=device)
-    if hasattr(env, "_go2w_obstacle_yaw") and env._go2w_obstacle_yaw.shape == (n_envs, n_slots):
+    if (
+        hasattr(env, "_go2w_obstacle_yaw")
+        and metadata_indices is not None
+        and env._go2w_obstacle_yaw.shape[0] == n_envs
+        and env._go2w_obstacle_yaw.shape[1] > int(metadata_indices.max().item())
+    ):
+        obstacle_yaws = env._go2w_obstacle_yaw[env_ids][:, metadata_indices]
+    elif hasattr(env, "_go2w_obstacle_yaw") and env._go2w_obstacle_yaw.shape == (n_envs, n_slots):
         obstacle_yaws = env._go2w_obstacle_yaw[env_ids]
     else:
         obstacle_yaws = torch.zeros(len(env_ids), n_slots, device=device)
@@ -917,6 +1006,257 @@ def move_dynamic_play_obstacles(
         pose[:, 3:7] = _yaw_to_quat_wxyz(obstacle_yaws[:, slot_idx])
         env.scene[name].write_root_pose_to_sim(pose, env_ids=env_ids)
         env.scene[name].write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+
+
+def reset_structured_astar_corridor(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    obstacle_names: list[str],
+    fixed_scenario_template: str | None = None,
+    corridor_kind: str | None = None,
+    dynamic_obstacle_names: list[str] | None = None,
+    dynamic_obstacle_indices: list[int] | None = None,
+    dynamic_obstacle_count: int = 6,
+    corridor_width: float = 1.8,
+    leg_length: float = 6.0,
+    corridor_turn_length: float | None = None,
+    wall_thickness: float = 0.20,
+    grid_resolution: float = 0.20,
+    robot_inflation: float = 0.35,
+    lookahead_distance: float = 1.25,
+    waypoint_reach_radius: float = 0.45,
+    obstacle_z: float = 0.30,
+    park_distance: float = 1000.0,
+    min_inter_obstacle_dist: float = 0.75,
+    dynamic_start_exclusion_radius: float = 1.8,
+    goal_exclusion_radius: float = 0.9,
+    dynamic_robot_keepout_radius: float = 1.25,
+    obstacle_radius_margin: float = 0.0,
+    fixed_obstacle_shape_ids: tuple[int, ...] | None = None,
+    fixed_obstacle_widths: tuple[float, ...] | None = None,
+    fixed_obstacle_depths: tuple[float, ...] | None = None,
+    randomize_obstacle_yaw: bool = True,
+    obstacle_yaw_range: tuple[float, float] = (-math.pi, math.pi),
+    clearance_cost_weight: float = 2.0,
+    clearance_cost_sigma: float = 0.4,
+    corner_rounding: bool = False,
+    corner_radius: float = 0.5,
+    adaptive_lookahead: bool = True,
+    lookahead_min: float = 0.6,
+    curvature_scan_horizon: float = 2.5,
+    curvature_threshold: float = 0.3,
+) -> None:
+    """Reset play envs into a known structured corridor with an A* waypoint path."""
+    del dynamic_obstacle_names, dynamic_obstacle_indices
+    if len(obstacle_names) == 0:
+        return
+    _ensure_navigation_goal_buffers(env)
+    structured_kind = (corridor_kind or fixed_scenario_template or "l_corridor").lower()
+    centerline = structured_corridor_centerline(
+        structured_kind,
+        leg_length,
+        corridor_width,
+        corridor_turn_length,
+    )
+    wall_specs = structured_corridor_wall_specs(
+        structured_kind,
+        leg_length,
+        corridor_width,
+        wall_thickness,
+        corridor_turn_length,
+    )
+    if len(obstacle_names) < len(wall_specs):
+        raise ValueError(
+            f"Structured {structured_kind} requires at least {len(wall_specs)} obstacle slots for wall segments."
+        )
+
+    if hasattr(env, "_go2w_goals_reached_episode"):
+        env._go2w_goals_reached_episode[env_ids] = 0.0
+    if hasattr(env, "_go2w_first_goal_reached_episode"):
+        env._go2w_first_goal_reached_episode[env_ids] = False
+    if hasattr(env, "_go2w_min_goal_distance_episode"):
+        env._go2w_min_goal_distance_episode[env_ids] = float("inf")
+    if hasattr(env, "_go2w_had_collision_episode"):
+        env._go2w_had_collision_episode[env_ids] = False
+    if hasattr(env, "_go2w_obstacle_pose_changed_midstep"):
+        env._go2w_obstacle_pose_changed_midstep[env_ids] = False
+    if hasattr(env, "_go2w_ignore_obstacle_contact_history_steps"):
+        env._go2w_ignore_obstacle_contact_history_steps[env_ids] = 0
+    if hasattr(env, "_go2w_dynamic_obstacle_initialized"):
+        env._go2w_dynamic_obstacle_initialized[env_ids] = False
+
+    n = len(env_ids)
+    k = len(obstacle_names)
+    device = env.device
+    robot = env.scene["robot"]
+    start_pos_w = robot.data.root_pos_w[env_ids, :3].clone()
+    start_heading_w = robot.data.heading_w[env_ids].clone()
+    yaw = _quat_yaw_wxyz(robot.data.root_quat_w[env_ids])
+    cos_yaw = torch.cos(yaw)
+    sin_yaw = torch.sin(yaw)
+
+    env._go2w_start_pos_w[env_ids] = start_pos_w
+    env._go2w_start_heading_w[env_ids] = start_heading_w
+    env._go2w_gap_passable[env_ids] = False
+    env._go2w_scenario_template_id[env_ids] = _NAV_RANDOM_FALLBACK_SCENARIO_ID
+    env._go2w_initial_scenario_template_id[env_ids] = _NAV_RANDOM_FALLBACK_SCENARIO_ID
+    if (
+        not hasattr(env, "_go2w_structured_corridor_start_xy")
+        or env._go2w_structured_corridor_start_xy.shape != (env.num_envs, 2)
+    ):
+        env._go2w_structured_corridor_start_xy = torch.zeros(env.num_envs, 2, device=device)
+        env._go2w_structured_corridor_yaw = torch.zeros(env.num_envs, device=device)
+        env._go2w_structured_corridor_leg_length = torch.zeros(env.num_envs, device=device)
+        env._go2w_structured_corridor_width = torch.zeros(env.num_envs, device=device)
+        env._go2w_structured_corridor_waypoint_clearance = torch.zeros(env.num_envs, device=device)
+    if not hasattr(env, "_go2w_structured_corridor_waypoint_clearance"):
+        env._go2w_structured_corridor_waypoint_clearance = torch.zeros(env.num_envs, device=device)
+    centerline_count = len(centerline)
+    if (
+        not hasattr(env, "_go2w_structured_corridor_centerline_local")
+        or env._go2w_structured_corridor_centerline_local.shape != (env.num_envs, centerline_count, 2)
+    ):
+        env._go2w_structured_corridor_centerline_local = torch.zeros(
+            env.num_envs, centerline_count, 2, device=device
+        )
+    env._go2w_structured_corridor_start_xy[env_ids] = start_pos_w[:, :2]
+    env._go2w_structured_corridor_yaw[env_ids] = yaw
+    env._go2w_structured_corridor_leg_length[env_ids] = leg_length
+    env._go2w_structured_corridor_width[env_ids] = corridor_width
+    env._go2w_structured_corridor_waypoint_clearance[env_ids] = robot_inflation
+    centerline_tensor = torch.tensor(centerline, dtype=start_pos_w.dtype, device=device)
+    env._go2w_structured_corridor_centerline_local[env_ids] = centerline_tensor.unsqueeze(0).expand(n, -1, -1)
+
+    local_path = plan_structured_corridor_path(
+        structured_kind,
+        leg_length,
+        corridor_width,
+        robot_inflation,
+        grid_resolution,
+        corridor_turn_length,
+        clearance_cost_weight=clearance_cost_weight,
+        clearance_cost_sigma=clearance_cost_sigma,
+        corner_rounding=corner_rounding,
+        corner_radius=corner_radius,
+    )
+    path_count = len(local_path)
+    path_local = torch.tensor(local_path, dtype=start_pos_w.dtype, device=device)
+    dx = path_local[:, 0].unsqueeze(0)
+    dy = path_local[:, 1].unsqueeze(0)
+    path_w = torch.zeros(n, path_count, 3, dtype=start_pos_w.dtype, device=device)
+    path_w[:, :, 0] = start_pos_w[:, 0:1] + dx * cos_yaw.unsqueeze(1) - dy * sin_yaw.unsqueeze(1)
+    path_w[:, :, 1] = start_pos_w[:, 1:2] + dx * sin_yaw.unsqueeze(1) + dy * cos_yaw.unsqueeze(1)
+    path_w[:, :, 2] = start_pos_w[:, 2:3]
+    env._go2w_navigation_path_direct_goal = True
+    set_navigation_path_w(env, env_ids, path_w)
+
+    wall_count = len(wall_specs)
+    dynamic_count = max(0, min(dynamic_obstacle_count, k - wall_count))
+    active_mask = torch.zeros(n, k, dtype=torch.bool, device=device)
+    active_mask[:, : wall_count + dynamic_count] = True
+    obstacle_yaws = torch.zeros(n, k, device=device)
+
+    parked_world = start_pos_w.clone()
+    parked_world[:, 0] += park_distance
+    parked_positions = _separated_parked_positions(parked_world, k)
+    positions = parked_positions.clone()
+
+    for slot_idx, (local_x, local_y, local_yaw, _, _) in enumerate(wall_specs):
+        wx = start_pos_w[:, 0] + local_x * cos_yaw - local_y * sin_yaw
+        wy = start_pos_w[:, 1] + local_x * sin_yaw + local_y * cos_yaw
+        positions[:, slot_idx, 0] = wx
+        positions[:, slot_idx, 1] = wy
+        positions[:, slot_idx, 2] = obstacle_z
+        obstacle_yaws[:, slot_idx] = yaw + local_yaw
+
+    # Spawn dynamic obstacles along the structured centerline, with lateral jitter inside the corridor.
+    placed_dynamic: list[tuple[float, float]] = []
+    rng = random
+    half_width = corridor_width * 0.5
+    segments = list(zip(centerline[:-1], centerline[1:]))
+    segment_lengths = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in segments]
+    total_length = max(sum(segment_lengths), 1.0e-6)
+    lateral_margin = min(0.45, max(0.05, half_width - 0.10))
+    lateral_limit = max(0.05, half_width - lateral_margin)
+    goal_local_x, goal_local_y = local_path[-1]
+
+    def sample_corridor_local_point() -> tuple[float, float]:
+        s = rng.uniform(0.0, total_length)
+        for (a, b), length in zip(segments, segment_lengths):
+            if s <= length:
+                t = 0.0 if length <= 1.0e-6 else s / length
+                x = a[0] + (b[0] - a[0]) * t
+                y = a[1] + (b[1] - a[1]) * t
+                ux = 0.0 if length <= 1.0e-6 else (b[0] - a[0]) / length
+                uy = 0.0 if length <= 1.0e-6 else (b[1] - a[1]) / length
+                lateral = rng.uniform(-lateral_limit, lateral_limit)
+                return x - uy * lateral, y + ux * lateral
+            s -= length
+        return centerline[-1]
+
+    for dyn_idx in range(dynamic_count):
+        slot_idx = wall_count + dyn_idx
+        chosen = None
+        for _ in range(80):
+            local_x, local_y = sample_corridor_local_point()
+            if math.hypot(local_x, local_y) < dynamic_start_exclusion_radius:
+                continue
+            if math.hypot(local_x - goal_local_x, local_y - goal_local_y) < goal_exclusion_radius:
+                continue
+            if any(math.hypot(local_x - px, local_y - py) < min_inter_obstacle_dist for px, py in placed_dynamic):
+                continue
+            chosen = (local_x, local_y)
+            placed_dynamic.append(chosen)
+            break
+        if chosen is None:
+            chosen = (leg_length * 0.5, 0.0)
+        local_x, local_y = chosen
+        positions[:, slot_idx, 0] = start_pos_w[:, 0] + local_x * cos_yaw - local_y * sin_yaw
+        positions[:, slot_idx, 1] = start_pos_w[:, 1] + local_x * sin_yaw + local_y * cos_yaw
+        positions[:, slot_idx, 2] = obstacle_z
+        if randomize_obstacle_yaw:
+            obstacle_yaws[:, slot_idx] = torch.empty(n, device=device).uniform_(*obstacle_yaw_range)
+
+    set_obstacle_metadata(
+        env,
+        env_ids,
+        obstacle_names,
+        active_mask,
+        obstacle_radius_margin=obstacle_radius_margin,
+        fixed_obstacle_shape_ids=fixed_obstacle_shape_ids,
+        fixed_obstacle_widths=fixed_obstacle_widths,
+        fixed_obstacle_depths=fixed_obstacle_depths,
+        obstacle_yaws=obstacle_yaws,
+    )
+
+    zero_vel = torch.zeros(n, 6, device=device)
+    for slot_idx, name in enumerate(obstacle_names):
+        pose = torch.zeros(n, 7, device=device)
+        pose[:, :3] = positions[:, slot_idx]
+        pose[:, 3:7] = _yaw_to_quat_wxyz(obstacle_yaws[:, slot_idx])
+        env.scene[name].write_root_pose_to_sim(pose, env_ids=env_ids)
+        env.scene[name].write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+
+    env._nav_resample_on_goal = functools.partial(
+        update_navigation_path_waypoint,
+        env,
+        lookahead_distance=lookahead_distance,
+        waypoint_reach_radius=waypoint_reach_radius,
+        adaptive_lookahead=adaptive_lookahead,
+        lookahead_min=lookahead_min,
+        curvature_scan_horizon=curvature_scan_horizon,
+        curvature_threshold=curvature_threshold,
+    )
+    update_navigation_path_waypoint(
+        env,
+        env_ids,
+        lookahead_distance=lookahead_distance,
+        waypoint_reach_radius=waypoint_reach_radius,
+        adaptive_lookahead=adaptive_lookahead,
+        lookahead_min=lookahead_min,
+        curvature_scan_horizon=curvature_scan_horizon,
+        curvature_threshold=curvature_threshold,
+    )
 
 
 def reset_navigation_goals_and_obstacles(
@@ -990,9 +1330,6 @@ def reset_navigation_goals_and_obstacles(
     The sampled start/goal are stored on the env so observation, reward, and
     termination helpers can derive a local goal command every step.
     """
-    if len(obstacle_names) == 0:
-        return
-
     _ensure_navigation_goal_buffers(env)
     if hasattr(env, "_go2w_goals_reached_episode"):
         env._go2w_goals_reached_episode[env_ids] = 0.0
@@ -1074,6 +1411,9 @@ def reset_navigation_goals_and_obstacles(
 
     env._go2w_goal_pos_w[env_ids] = goal_pos_w
     env._go2w_goal_heading_w[env_ids] = goal_heading_w
+
+    if len(obstacle_names) == 0:
+        return
 
     goal_local_xy = (goal_pos_w[:, :2] - env_origins[:, :2]).cpu().tolist()
 

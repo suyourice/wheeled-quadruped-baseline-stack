@@ -203,26 +203,6 @@ def _curriculum_scale(
     return max(min((env.common_step_counter - start_steps) / warmup_steps, 1.0), 0.0)
 
 
-def joint_deviation_l1_curriculum(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    start_steps: int = 0,
-    warmup_steps: int = 0,
-    start_iteration: int | None = None,
-    warmup_iterations: int | None = None,
-    steps_per_iteration: int = 128,
-) -> torch.Tensor:
-    """Joint deviation from the default pose with an optional curriculum scale."""
-    asset = env.scene[asset_cfg.name]
-    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
-    default_joint_pos = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
-    return _curriculum_scale(
-        env, start_steps, warmup_steps, start_iteration, warmup_iterations, steps_per_iteration
-    ) * torch.sum(
-        torch.abs(joint_pos - default_joint_pos), dim=1
-    )
-
-
 def joint_deviation_l1_command_gated(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -447,14 +427,27 @@ def obstacle_contact_termination(
     return torch.any(max_forces > threshold, dim=1)
 
 
-def goal_distance_tanh_reward(
+def navigation_path_final_goal_reached(
     env: ManagerBasedRLEnv,
-    std: float = 1.5,
+    position_threshold: float = 0.70,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Reward being close to the sampled local-navigation goal."""
-    goal_distance, _ = _goal_command_from_buffers(env, asset_cfg)
-    return 1.0 - torch.tanh(goal_distance / max(std, 1.0e-6))
+    """Terminate when the robot reaches the final waypoint of a stored navigation path."""
+    if not hasattr(env, "_go2w_navigation_path_w") or not hasattr(env, "_go2w_navigation_path_count"):
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+
+    robot = env.scene[asset_cfg.name]
+    path_count = env._go2w_navigation_path_count.clamp(min=1)
+    final_idx = path_count - 1
+    row_idx = torch.arange(env.num_envs, device=env.device)
+    final_xy = env._go2w_navigation_path_w[row_idx, final_idx, :2]
+    final_distance = (robot.data.root_pos_w[:, :2] - final_xy).norm(dim=-1)
+
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    env.extras["log"]["structured_final_goal_distance_mean"] = final_distance.mean()
+    env.extras["log"]["structured_final_goal_reached_rate"] = (final_distance <= position_threshold).float().mean()
+    return final_distance <= position_threshold
 
 
 def goal_heading_tanh_reward(
@@ -465,28 +458,6 @@ def goal_heading_tanh_reward(
     """Reward aligning the robot heading with the sampled goal heading."""
     _, heading_error = _goal_command_from_buffers(env, asset_cfg)
     return 1.0 - torch.tanh(heading_error / max(std, 1.0e-6))
-
-
-def goal_reached_bonus(
-    env: ManagerBasedRLEnv,
-    position_threshold: float = 0.35,
-    heading_threshold: float = 0.6,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Binary success bonus when the robot reaches the local-navigation goal."""
-    goal_distance, heading_error = _goal_command_from_buffers(env, asset_cfg)
-    return ((goal_distance <= position_threshold) & (heading_error <= heading_threshold)).float()
-
-
-def goal_reached_termination(
-    env: ManagerBasedRLEnv,
-    position_threshold: float = 0.35,
-    heading_threshold: float = 0.6,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Terminate successful local-navigation episodes once the goal is reached."""
-    goal_distance, heading_error = _goal_command_from_buffers(env, asset_cfg)
-    return (goal_distance <= position_threshold) & (heading_error <= heading_threshold)
 
 
 def _resample_goal_positions_only(
@@ -570,6 +541,19 @@ def goal_reached_and_resample(
         )
 
     goal_distance, heading_error = _goal_command_from_buffers(env, asset_cfg)
+    path_direct_goal = (
+        bool(getattr(env, "_go2w_navigation_path_direct_goal", False))
+        and hasattr(env, "_go2w_navigation_path_w")
+        and hasattr(env, "_go2w_navigation_path_count")
+    )
+    if path_direct_goal:
+        robot = env.scene[asset_cfg.name]
+        path_count = env._go2w_navigation_path_count.clamp(min=1)
+        final_idx = path_count - 1
+        row_idx = torch.arange(env.num_envs, device=env.device)
+        final_xy = env._go2w_navigation_path_w[row_idx, final_idx, :2]
+        goal_distance = (robot.data.root_pos_w[:, :2] - final_xy).norm(dim=-1)
+        heading_error = torch.zeros_like(goal_distance)
     reset_mask = env.episode_length_buf == 0
     env._go2w_first_goal_reached_episode[reset_mask] = False
     env._go2w_min_goal_distance_episode[reset_mask] = goal_distance[reset_mask]
@@ -579,7 +563,13 @@ def goal_reached_and_resample(
 
     position_candidate = goal_distance <= position_threshold
     heading_candidate = heading_error <= heading_threshold
-    reached = position_candidate & heading_candidate
+    if path_direct_goal:
+        # Structured path following updates intermediate waypoints separately.
+        # This reward/resample hook should only consider the final stored path goal,
+        # otherwise reaching a local waypoint mutates path state during reward eval.
+        reached = position_candidate
+    else:
+        reached = position_candidate & heading_candidate
     first_reached = reached & (env._go2w_goals_reached_episode <= 0.0)
     env._go2w_first_goal_reached_episode |= first_reached
 
@@ -1065,42 +1055,6 @@ def nav_frontal_blocked_lateral_escape_reward(
     )
     env.extras["log"]["goal_path_blockage_mean"] = goal_path_blockage.mean()
     return reward
-
-
-def nav_backward_escape_reward(
-    env: ManagerBasedRLEnv,
-    obstacle_names: list[str],
-    frontal_half_angle_deg: float = 45.0,
-    min_blockage_for_reward: float = 0.35,
-    max_distance: float = 8.0,
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Reward backward motion when the frontal corridor is heavily blocked.
-
-    Only activates when frontal_blockage > min_blockage_for_reward (default 0.35,
-    higher than the lateral escape threshold) so backward escape is only
-    encouraged when the front is substantially closed off.
-
-    Returns a value in [0, 1]. Zero when not blocked or robot is moving forward.
-    """
-    if len(obstacle_names) == 0:
-        return torch.zeros(env.num_envs, device=env.device)
-
-    frontal_blockage, _, _, vel_yaw, _, _, _ = (
-        _compute_nav_frontal_geometry(env, obstacle_names, robot_cfg, frontal_half_angle_deg, max_distance)
-    )
-
-    blockage_gate = (
-        (frontal_blockage - min_blockage_for_reward)
-        / (1.0 - min_blockage_for_reward + 1.0e-6)
-    ).clamp(0.0, 1.0)
-
-    if "log" not in env.extras:
-        env.extras["log"] = {}
-    env.extras["log"]["backward_escape_activation_rate"] = (blockage_gate > 0.05).float().mean()
-
-    # vx in robot yaw frame: negative means moving backward
-    return blockage_gate * (-vel_yaw[:, 0]).clamp(0.0, 1.0)
 
 
 def nav_open_path_straightness_reward(

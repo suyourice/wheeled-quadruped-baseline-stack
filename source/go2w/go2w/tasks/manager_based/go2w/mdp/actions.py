@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Sequence
 
 import torch
@@ -18,6 +19,29 @@ from isaaclab.utils import configclass
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+def _nav_debug_enabled() -> bool:
+    return os.environ.get("GO2W_NAV_DEBUG", "").lower() in ("1", "true", "yes", "on")
+
+
+def _nav_debug_interval() -> int:
+    try:
+        return max(1, int(os.environ.get("GO2W_NAV_DEBUG_INTERVAL", "20")))
+    except ValueError:
+        return 20
+
+
+def _nav_debug_env_id() -> int:
+    try:
+        return int(os.environ.get("GO2W_NAV_DEBUG_ENV", "0"))
+    except ValueError:
+        return 0
+
+
+def _fmt_xy(xy: torch.Tensor) -> str:
+    vals = xy.detach().cpu().tolist()
+    return f"({float(vals[0]):+.2f},{float(vals[1]):+.2f})"
 
 
 class FrozenLLCActionTerm(ActionTerm):
@@ -93,6 +117,30 @@ class FrozenLLCActionTerm(ActionTerm):
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
         self._processed_actions[:] = actions.clamp(-2.0, 2.0)
+        if _nav_debug_enabled():
+            step = int(getattr(self._env, "common_step_counter", 0))
+            debug_interval = _nav_debug_interval()
+            backward = self._processed_actions[:, 0] < -0.05
+            should_print = (step % debug_interval == 0) or (
+                step % max(1, debug_interval // 4) == 0 and bool(backward.any().item())
+            )
+            if should_print:
+                row = _nav_debug_env_id()
+                if row < 0 or row >= self._num_envs:
+                    row = 0
+                if backward.any():
+                    row = int(backward.nonzero(as_tuple=False).flatten()[0].item())
+                print(
+                    "[GO2W_HLC_ACTION] "
+                    f"step={step} env={row} "
+                    f"raw=({float(self._raw_actions[row, 0].item()):+.2f},"
+                    f"{float(self._raw_actions[row, 1].item()):+.2f},"
+                    f"{float(self._raw_actions[row, 2].item()):+.2f}) "
+                    f"cmd=({float(self._processed_actions[row, 0].item()):+.2f},"
+                    f"{float(self._processed_actions[row, 1].item()):+.2f},"
+                    f"{float(self._processed_actions[row, 2].item()):+.2f}) "
+                    f"robot={_fmt_xy(self._asset.data.root_pos_w[row, :2])}"
+                )
         llc_obs = self._build_llc_obs(self._processed_actions)
 
         with torch.no_grad():
