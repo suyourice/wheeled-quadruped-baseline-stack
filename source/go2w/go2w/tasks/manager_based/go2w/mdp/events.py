@@ -1330,9 +1330,6 @@ def reset_navigation_goals_and_obstacles(
     The sampled start/goal are stored on the env so observation, reward, and
     termination helpers can derive a local goal command every step.
     """
-    if len(obstacle_names) == 0:
-        return
-
     _ensure_navigation_goal_buffers(env)
     if hasattr(env, "_go2w_goals_reached_episode"):
         env._go2w_goals_reached_episode[env_ids] = 0.0
@@ -1414,6 +1411,9 @@ def reset_navigation_goals_and_obstacles(
 
     env._go2w_goal_pos_w[env_ids] = goal_pos_w
     env._go2w_goal_heading_w[env_ids] = goal_heading_w
+
+    if len(obstacle_names) == 0:
+        return
 
     goal_local_xy = (goal_pos_w[:, :2] - env_origins[:, :2]).cpu().tolist()
 
