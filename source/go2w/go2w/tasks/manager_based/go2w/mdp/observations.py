@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,6 +31,29 @@ from .obstacle_geometry import (
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+def _nav_debug_enabled() -> bool:
+    return os.environ.get("GO2W_NAV_DEBUG", "").lower() in ("1", "true", "yes", "on")
+
+
+def _nav_debug_interval() -> int:
+    try:
+        return max(1, int(os.environ.get("GO2W_NAV_DEBUG_INTERVAL", "20")))
+    except ValueError:
+        return 20
+
+
+def _nav_debug_env_id() -> int:
+    try:
+        return int(os.environ.get("GO2W_NAV_DEBUG_ENV", "0"))
+    except ValueError:
+        return 0
+
+
+def _fmt_xy(xy: torch.Tensor) -> str:
+    vals = xy.detach().cpu().tolist()
+    return f"({float(vals[0]):+.2f},{float(vals[1]):+.2f})"
 
 
 def lidar_distances(
@@ -80,81 +104,6 @@ def depth_closeness_image(
     depth = torch.nan_to_num(depth, nan=max_depth, posinf=max_depth, neginf=max_depth)
     depth = depth.clamp(min=min_depth, max=max_depth)
     return (1.0 - depth / max_depth).clamp(0.0, 1.0)
-
-
-def obstacle_positions_rel(
-    env: ManagerBasedRLEnv,
-    obstacle_names: list[str],
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    max_distance: float | None = None,
-    normalize: bool = False,
-    zero_beyond_max_distance: bool = True,
-    num_closest: int | None = None,
-) -> torch.Tensor:
-    """Obstacle positions relative to the robot base in the robot's local frame.
-
-    Returns a flattened tensor containing (x, y) relative positions for each
-    obstacle. If num_closest is set, the output is sorted by current distance
-    every call and padded with zeros when fewer candidates exist.
-
-    Args:
-        obstacle_names: List of scene entity names for each obstacle.
-        robot_cfg: SceneEntityCfg for the robot.
-        max_distance: Optional clipping/masking radius in meters.
-        normalize: If True, divide relative positions by max_distance.
-        zero_beyond_max_distance: If True, obstacles beyond max_distance return zero.
-        num_closest: Optional fixed number of closest obstacles to return.
-    """
-    if len(obstacle_names) == 0:
-        k = 0 if num_closest is None else num_closest
-        return torch.zeros(env.num_envs, k * 2, device=env.device)
-
-    robot = env.scene[robot_cfg.name]
-    robot_pos_w = robot.data.root_pos_w[:, :3]  # (N, 3)
-    robot_quat_w = robot.data.root_quat_w        # (N, 4)
-
-    # Stack all obstacle positions and apply quat_apply_inverse in one batched
-    # call instead of K separate calls.
-    obs_pos_all = torch.stack(
-        [env.scene[n].data.root_pos_w[:, :3] for n in obstacle_names], dim=1
-    )  # (N, K, 3)
-    rel_pos_w_all = obs_pos_all - robot_pos_w.unsqueeze(1)  # (N, K, 3)
-    N, K = rel_pos_w_all.shape[:2]
-    quat_exp = robot_quat_w.unsqueeze(1).expand(-1, K, -1).reshape(N * K, 4)
-    rel_pos_b_flat = quat_apply_inverse(quat_exp, rel_pos_w_all.reshape(N * K, 3))
-    rel_positions = rel_pos_b_flat.reshape(N, K, 3)[:, :, :2]  # (N, K, 2)
-    dists = torch.norm(rel_positions, dim=-1)
-
-    if num_closest is not None:
-        k = min(num_closest, rel_positions.shape[1])
-        closest_idx = torch.topk(dists, k=k, dim=1, largest=False, sorted=True).indices
-        gather_idx = closest_idx.unsqueeze(-1).expand(-1, -1, 2)
-        rel_positions = torch.gather(rel_positions, dim=1, index=gather_idx)
-        dists = torch.gather(dists, dim=1, index=closest_idx)
-
-        if k < num_closest:
-            pad_shape = (rel_positions.shape[0], num_closest - k, 2)
-            rel_positions = torch.cat(
-                [rel_positions, torch.zeros(pad_shape, device=rel_positions.device, dtype=rel_positions.dtype)],
-                dim=1,
-            )
-            dists = torch.cat(
-                [dists, torch.full((dists.shape[0], num_closest - k), float("inf"), device=dists.device)],
-                dim=1,
-            )
-
-    if max_distance is not None:
-        rel_positions = rel_positions.clamp(min=-max_distance, max=max_distance)
-        if zero_beyond_max_distance:
-            rel_positions = torch.where(
-                dists.unsqueeze(-1) <= max_distance,
-                rel_positions,
-                torch.zeros_like(rel_positions),
-            )
-        if normalize:
-            rel_positions = rel_positions / max_distance
-
-    return rel_positions.flatten(start_dim=1)  # (N, num_obstacles * 2)
 
 
 def obstacle_polar_depth(
@@ -224,15 +173,6 @@ def obstacle_polar_depth(
     return (1.0 - dist_map / max_distance).clamp(0.0, 1.0)
 
 
-def root_position_w(
-    env: ManagerBasedRLEnv,
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Return the robot root position in world coordinates for debug logging."""
-    robot = env.scene[robot_cfg.name]
-    return robot.data.root_pos_w[:, :3]
-
-
 def _ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
     """Create goal-navigation buffers on the env the first time they are requested."""
     if not hasattr(env, "_go2w_goal_pos_w"):
@@ -279,6 +219,9 @@ def _compute_navigation_waypoint_world(
     goal_pos_w = env._go2w_goal_pos_w
     goal_heading_w = env._go2w_goal_heading_w
     root_pos_w = robot.data.root_pos_w[:, :3]
+
+    if bool(getattr(env, "_go2w_navigation_path_direct_goal", False)) and hasattr(env, "_go2w_navigation_path_w"):
+        return goal_pos_w.clone(), goal_heading_w.clone()
 
     path_vec_w = goal_pos_w[:, :2] - start_pos_w[:, :2]
     path_len = torch.norm(path_vec_w, dim=1, keepdim=True).clamp(min=1.0e-6)
@@ -467,7 +410,7 @@ def local_goal_command_b(
     local_planner_max_blend: float = 1.0,
     command_min_forward: float = 0.45,
     command_max_lateral: float = 0.85,
-    command_max_heading: float = 0.9,
+    command_max_heading: float = 0.6,
 ) -> torch.Tensor:
     """Return the current rolling local-waypoint command in the robot yaw frame.
 
@@ -476,9 +419,8 @@ def local_goal_command_b(
 
     It starts from the sampled world-frame start/goal task buffers, then the
     lightweight local planner can move the waypoint sideways when the straight
-    LiDAR corridor is blocked. The final observation is shaped to stay
-    forward-biased so the frozen locomotion controller is not driven by mostly
-    lateral or backward local subgoals.
+    LiDAR corridor is blocked. Path-following mode preserves the signed local
+    target position so the policy can distinguish "ahead" from "behind".
     """
     robot = env.scene[robot_cfg.name]
     waypoint_pos_w, waypoint_heading_w = _compute_navigation_waypoint_world(
@@ -500,13 +442,33 @@ def local_goal_command_b(
         local_planner_max_blend=local_planner_max_blend,
     )
 
+    _ensure_navigation_goal_buffers(env)
+    remaining_goal_distance = torch.norm(env._go2w_goal_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=1)
+    path_mode = bool(getattr(env, "_go2w_navigation_path_direct_goal", False)) and hasattr(
+        env, "_go2w_navigation_path_w"
+    )
+    if path_mode and hasattr(env, "_go2w_navigation_path_final_distance"):
+        remaining_goal_distance = env._go2w_navigation_path_final_distance
+        # In path-following mode only snap to final-goal heading/direction when the
+        # waypoint tracker has already advanced to the last path segment.  Without
+        # this gate the robot would commit to pointing at a potentially obstacle-
+        # blocked final waypoint as soon as it enters the 1 m snap radius, even
+        # while earlier corners still need to be navigated.
+        if (
+            hasattr(env, "_go2w_navigation_path_target_index")
+            and hasattr(env, "_go2w_navigation_path_count")
+        ):
+            final_idx = (env._go2w_navigation_path_count - 1).clamp(min=0)
+            at_final_waypoint = env._go2w_navigation_path_target_index >= final_idx
+            near_goal = at_final_waypoint & (remaining_goal_distance <= goal_snap_distance)
+        else:
+            near_goal = remaining_goal_distance <= goal_snap_distance
+    else:
+        near_goal = remaining_goal_distance <= goal_snap_distance
+
     target_vec_w = waypoint_pos_w - robot.data.root_pos_w[:, :3]
     target_vec_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), target_vec_w)
     heading_b = wrap_to_pi(waypoint_heading_w - robot.data.heading_w)
-
-    _ensure_navigation_goal_buffers(env)
-    remaining_goal_distance = torch.norm(env._go2w_goal_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=1)
-    near_goal = remaining_goal_distance <= goal_snap_distance
 
     raw_xy_b = target_vec_b[:, :2]
     command_x = torch.where(
@@ -515,63 +477,57 @@ def local_goal_command_b(
         raw_xy_b[:, 0].clamp(min=command_min_forward, max=lookahead_distance),
     )
     command_y = raw_xy_b[:, 1].clamp(min=-command_max_lateral, max=command_max_lateral)
-    shaped_heading = torch.atan2(raw_xy_b[:, 1], raw_xy_b[:, 0])
-    command_heading = torch.where(near_goal, heading_b, shaped_heading)
-    command_heading = command_heading.clamp(min=-command_max_heading, max=command_max_heading)
+    bearing = torch.atan2(raw_xy_b[:, 1], raw_xy_b[:, 0])
+    raw_heading = torch.where(near_goal, heading_b, bearing)
+    command_heading = raw_heading.clamp(min=-command_max_heading, max=command_max_heading)
 
-    return torch.stack((command_x, command_y, command_heading), dim=-1)
+    command = torch.stack((command_x, command_y, command_heading), dim=-1)
+    if _nav_debug_enabled():
+        step = int(getattr(env, "common_step_counter", 0))
+        backward_raw = raw_xy_b[:, 0] < -0.05
+        backward_cmd = command[:, 0] < -0.05
+        debug_interval = _nav_debug_interval()
+        event_interval = max(1, debug_interval // 4)
+        should_print = (
+            (step % debug_interval == 0)
+            or (
+                step % event_interval == 0
+                and (bool(backward_raw.any().item()) or bool(backward_cmd.any().item()))
+            )
+        )
+        if should_print:
+            debug_env = _nav_debug_env_id()
+            row = debug_env if 0 <= debug_env < env.num_envs else 0
+            problem_rows = (backward_raw | backward_cmd).nonzero(as_tuple=False).flatten()
+            if problem_rows.numel() > 0:
+                row = int(problem_rows[0].item())
+            target_idx = -1
+            nearest_idx = -1
+            final_idx = -1
+            final_dist = float("nan")
+            if (
+                hasattr(env, "_go2w_navigation_path_target_index")
+                and hasattr(env, "_go2w_navigation_path_nearest_index")
+                and hasattr(env, "_go2w_navigation_path_count")
+            ):
+                target_idx = int(env._go2w_navigation_path_target_index[row].item())
+                nearest_idx = int(env._go2w_navigation_path_nearest_index[row].item())
+                final_idx = int((env._go2w_navigation_path_count[row] - 1).clamp(min=0).item())
+            if hasattr(env, "_go2w_navigation_path_final_distance"):
+                final_dist = float(env._go2w_navigation_path_final_distance[row].item())
+            print(
+                "[GO2W_GOAL_CMD] "
+                f"step={step} env={row} nearest={nearest_idx} target={target_idx} final={final_idx} "
+                f"final_dist={final_dist:.2f} near_goal={bool(near_goal[row].item())} "
+                f"raw_b={_fmt_xy(raw_xy_b[row])} cmd=({float(command[row, 0].item()):+.2f},"
+                f"{float(command[row, 1].item()):+.2f},{float(command[row, 2].item()):+.2f}) "
+                f"heading_raw={float(raw_heading[row].item()):+.2f} "
+                f"heading_clipped={float(command_heading[row].item()):+.2f} "
+                f"heading_b={float(heading_b[row].item()):+.2f} path_mode={path_mode} "
+                f"robot={_fmt_xy(robot.data.root_pos_w[row, :2])} waypoint={_fmt_xy(waypoint_pos_w[row, :2])}"
+            )
 
-
-def goal_position_w(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the sampled navigation goal in world coordinates."""
-    _ensure_navigation_goal_buffers(env)
-    return env._go2w_goal_pos_w
-
-
-def waypoint_position_w(
-    env: ManagerBasedRLEnv,
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("lidar"),
-    lookahead_distance: float = 1.25,
-    goal_snap_distance: float = 1.0,
-    use_lidar_refinement: bool = True,
-    lidar_max_distance: float = 20.0,
-    local_planner_forward_padding: float = 0.35,
-    local_planner_corridor_half_width: float = 0.65,
-    local_planner_candidate_offsets: tuple[float, ...] = (0.0, 0.55, -0.55, 0.9, -0.9),
-    local_planner_min_forward_distance: float = 0.1,
-    local_planner_min_hit_height: float = -0.15,
-    local_planner_activation_threshold: float = 0.12,
-    local_planner_lateral_penalty: float = 0.08,
-    local_planner_min_improvement: float = 0.03,
-    local_planner_max_blend: float = 1.0,
-) -> torch.Tensor:
-    """Return the current rolling local waypoint in world coordinates."""
-    waypoint_pos_w, _ = _compute_navigation_waypoint_world(
-        env,
-        robot_cfg=robot_cfg,
-        sensor_cfg=sensor_cfg,
-        lookahead_distance=lookahead_distance,
-        goal_snap_distance=goal_snap_distance,
-        use_lidar_refinement=use_lidar_refinement,
-        lidar_max_distance=lidar_max_distance,
-        local_planner_forward_padding=local_planner_forward_padding,
-        local_planner_corridor_half_width=local_planner_corridor_half_width,
-        local_planner_candidate_offsets=local_planner_candidate_offsets,
-        local_planner_min_forward_distance=local_planner_min_forward_distance,
-        local_planner_min_hit_height=local_planner_min_hit_height,
-        local_planner_activation_threshold=local_planner_activation_threshold,
-        local_planner_lateral_penalty=local_planner_lateral_penalty,
-        local_planner_min_improvement=local_planner_min_improvement,
-        local_planner_max_blend=local_planner_max_blend,
-    )
-    return waypoint_pos_w
-
-
-def start_position_w(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the sampled episode start pose origin in world coordinates."""
-    _ensure_navigation_goal_buffers(env)
-    return env._go2w_start_pos_w
+    return command
 
 
 # =============================================================================
