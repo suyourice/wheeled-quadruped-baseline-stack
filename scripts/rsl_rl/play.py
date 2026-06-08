@@ -486,6 +486,17 @@ parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument(
+    "--play_name",
+    "--play-name",
+    dest="play_name",
+    type=str,
+    default=None,
+    help=(
+        "Name for this play run. Creates logs/nav_play/<name>/ and saves "
+        "nav_debug.log, depth_camera.mp4 (if --depth_video), and nav_debug_env0.png automatically."
+    ),
+)
+parser.add_argument(
     "--depth_video",
     "--depth-video",
     dest="depth_video",
@@ -568,7 +579,25 @@ installed_version = metadata.version("rsl-rl-lib")
 from collections import defaultdict
 import copy
 import os
+import subprocess
 import time
+
+
+class _TeeStream:
+    """Mirrors writes to multiple streams (stdout + file)."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._streams[0], name)
 
 import gymnasium as gym
 import torch
@@ -1833,6 +1862,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
         )
 
+    # play output directory setup
+    _out_dir: str | None = None
+    _out_log_file = None
+    if args_cli.play_name:
+        _out_dir = os.path.abspath(os.path.join("logs", "nav_play", args_cli.play_name))
+        os.makedirs(_out_dir, exist_ok=True)
+        _out_log_file = open(os.path.join(_out_dir, "nav_debug.log"), "w", buffering=1)
+        sys.stdout = _TeeStream(sys.__stdout__, _out_log_file)
+        os.environ.setdefault("GO2W_NAV_DEBUG", "1")
+        print(f"[INFO] Play output dir: {_out_dir}")
+
     # depth video writer setup
     _depth_video_frames: list = []
     if args_cli.depth_video:
@@ -1845,11 +1885,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 f"scale={args_cli.depth_video_scale}x -> "
                 f"{128 * args_cli.depth_video_scale}x{72 * args_cli.depth_video_scale} MP4"
             )
+            pass
 
     # simulate environment
     if args_cli.nav_contact_debug and args_cli.nav_contact_debug_steps <= 0:
         raise ValueError("--nav_contact_debug_steps must be positive when --nav_contact_debug is enabled.")
-    while simulation_app.is_running():
+    import signal as _signal
+    _play_interrupted = False
+
+    def _handle_sigint(sig, frame):
+        nonlocal _play_interrupted
+        _play_interrupted = True
+        print("\n[INFO] Interrupt received — finishing current step and saving outputs ...")
+
+    _signal.signal(_signal.SIGINT, _handle_sigint)
+
+    while simulation_app.is_running() and not _play_interrupted:
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
@@ -2022,13 +2073,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
-    # Save depth video if frames were collected.
+    # Save depth video.
     if args_cli.depth_video and _depth_video_frames:
-        import imageio
-        import numpy as np
-        _depth_video_path = os.path.join(log_dir, "depth_camera.mp4")
-        imageio.mimwrite(_depth_video_path, _depth_video_frames, fps=int(1.0 / dt), quality=8)
+        import imageio as _imageio
+        _save_dir = _out_dir if _out_dir else log_dir
+        _depth_video_path = os.path.join(_save_dir, "depth_camera.mp4")
+        _imageio.mimwrite(_depth_video_path, _depth_video_frames, fps=int(1.0 / dt), quality=8)
         print(f"[INFO] Depth video saved: {_depth_video_path}  ({len(_depth_video_frames)} frames)")
+
+    # Auto-generate nav debug plot when --play_name is set.
+    if _out_dir is not None and args_cli.structured_env != "none":
+        _nav_log = os.path.join(_out_dir, "nav_debug.log")
+        if _out_log_file is not None:
+            _out_log_file.flush()
+        _plot_cmd = [
+            sys.executable, "scripts/plot_nav_debug.py", _nav_log,
+            "--corridor", args_cli.structured_env,
+            "--leg_length", str(args_cli.corridor_leg_length),
+            "--corridor_width", str(args_cli.corridor_width),
+            "--alpha", str(args_cli.astar_clearance_cost_weight),
+            "--output_dir", _out_dir,
+        ]
+        print(f"[INFO] Generating nav debug plot ...")
+        sys.stdout.flush()
+        result = subprocess.run(_plot_cmd, capture_output=True, text=True)
+        if result.stdout:
+            print(result.stdout.strip())
+        if result.returncode != 0 and result.stderr:
+            print(f"[WARN] plot_nav_debug: {result.stderr.strip()}")
+
+    if _out_log_file is not None:
+        sys.stdout = sys.__stdout__
+        _out_log_file.close()
 
     # close the simulator
     env.close()
