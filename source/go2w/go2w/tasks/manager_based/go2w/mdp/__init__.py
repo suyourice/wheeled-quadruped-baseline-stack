@@ -16,6 +16,19 @@ from isaaclab.envs.mdp import (
 )
 from .actions import FrozenLLCActionTermCfg
 
+# -- Planning ------------------------------------------------------------------
+from .astar import (
+    GridMap2D,
+    plan_astar_path,
+)
+from .navigation_path import (
+    set_navigation_path_w,
+    update_navigation_path_waypoint,
+)
+from .structured_corridor import (
+    structured_corridor_wall_specs,
+)
+
 # -- Commands ------------------------------------------------------------------
 from isaaclab.envs.mdp import (
     UniformVelocityCommandCfg,
@@ -59,17 +72,12 @@ from isaaclab.envs.mdp import (
 # -- Observations (local custom) -----------------------------------------------
 from .observations import (
     depth_closeness_image,
-    goal_position_w,
     lidar_distances,
     local_goal_command_b,
     obstacle_full_geometry_features,
     obstacle_navigation_features,
     obstacle_polar_depth,
-    obstacle_positions_rel,
     prev_hlc_actions,
-    root_position_w,
-    start_position_w,
-    waypoint_position_w,
 )
 
 # -- Events (local custom) -----------------------------------------------------
@@ -77,20 +85,17 @@ from .events import (
     move_dynamic_play_obstacles,
     reset_navigation_goals_and_obstacles,
     reset_obstacles_curriculum,
+    reset_structured_astar_corridor,
     update_locomotion_curriculum,
 )
 
 # -- Rewards (local custom) ----------------------------------------------------
 from .rewards import (
     base_height_l2,
-    goal_distance_tanh_reward,
     goal_heading_tanh_reward,
     goal_progress_dense,
     goal_reached_and_resample,
-    goal_reached_bonus,
-    goal_reached_termination,
     joint_deviation_l1_command_gated,
-    joint_deviation_l1_curriculum,
     nav_clearance_penalty,
     nav_dense_recovery_reward,
     nav_frontal_blocked_lateral_escape_reward,
@@ -100,6 +105,7 @@ from .rewards import (
     nav_open_path_goal_heading_reward,
     nav_open_path_straightness_reward,
     nav_passable_gap_traversal_reward,
+    navigation_path_final_goal_reached,
     obstacle_contact_penalty,
     obstacle_contact_termination,
     obstacle_nav_ttc_penalty,
