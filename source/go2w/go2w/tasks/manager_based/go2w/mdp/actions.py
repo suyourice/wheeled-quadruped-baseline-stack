@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Sequence
 
 import torch
@@ -17,31 +16,10 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import ActionTerm, ActionTermCfg
 from isaaclab.utils import configclass
 
+from .debug_utils import fmt_xy, nav_debug_enabled, nav_debug_env_id, nav_debug_interval
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
-
-
-def _nav_debug_enabled() -> bool:
-    return os.environ.get("GO2W_NAV_DEBUG", "").lower() in ("1", "true", "yes", "on")
-
-
-def _nav_debug_interval() -> int:
-    try:
-        return max(1, int(os.environ.get("GO2W_NAV_DEBUG_INTERVAL", "20")))
-    except ValueError:
-        return 20
-
-
-def _nav_debug_env_id() -> int:
-    try:
-        return int(os.environ.get("GO2W_NAV_DEBUG_ENV", "0"))
-    except ValueError:
-        return 0
-
-
-def _fmt_xy(xy: torch.Tensor) -> str:
-    vals = xy.detach().cpu().tolist()
-    return f"({float(vals[0]):+.2f},{float(vals[1]):+.2f})"
 
 
 class FrozenLLCActionTerm(ActionTerm):
@@ -72,6 +50,7 @@ class FrozenLLCActionTerm(ActionTerm):
     _SCALE_WHEEL: float = 28.0
     _SCALE_HIP: float = 0.35
     _SCALE_STANCE: float = 0.35
+    _CMD_CLAMP: float = 2.0  # matches fast-flat LLC training command range ±2.0 m/s
 
     def __init__(self, cfg: FrozenLLCActionTermCfg, env: ManagerBasedRLEnv) -> None:
         super().__init__(cfg, env)
@@ -116,16 +95,16 @@ class FrozenLLCActionTerm(ActionTerm):
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
-        self._processed_actions[:] = actions.clamp(-2.0, 2.0)
-        if _nav_debug_enabled():
+        self._processed_actions[:] = actions.clamp(-self._CMD_CLAMP, self._CMD_CLAMP)
+        if nav_debug_enabled():
             step = int(getattr(self._env, "common_step_counter", 0))
-            debug_interval = _nav_debug_interval()
+            debug_interval = nav_debug_interval()
             backward = self._processed_actions[:, 0] < -0.05
             should_print = (step % debug_interval == 0) or (
                 step % max(1, debug_interval // 4) == 0 and bool(backward.any().item())
             )
             if should_print:
-                row = _nav_debug_env_id()
+                row = nav_debug_env_id()
                 if row < 0 or row >= self._num_envs:
                     row = 0
                 if backward.any():
@@ -139,7 +118,7 @@ class FrozenLLCActionTerm(ActionTerm):
                     f"cmd=({float(self._processed_actions[row, 0].item()):+.2f},"
                     f"{float(self._processed_actions[row, 1].item()):+.2f},"
                     f"{float(self._processed_actions[row, 2].item()):+.2f}) "
-                    f"robot={_fmt_xy(self._asset.data.root_pos_w[row, :2])}"
+                    f"robot={fmt_xy(self._asset.data.root_pos_w[row, :2])}"
                 )
         llc_obs = self._build_llc_obs(self._processed_actions)
 
@@ -167,6 +146,8 @@ class FrozenLLCActionTerm(ActionTerm):
         self._asset.set_joint_position_target(stance_pos, joint_ids=self._stance_ids)
 
     def reset(self, env_ids: Sequence[int] | torch.Tensor | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
         self._llc_last_action[env_ids] = 0.0
         self._llc_action[env_ids] = 0.0
 

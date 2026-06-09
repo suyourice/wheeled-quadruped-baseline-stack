@@ -8,16 +8,16 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
+from .debug_utils import fmt_xy, nav_debug_enabled, nav_debug_env_id, nav_debug_interval
+from .events import ensure_navigation_goal_buffers, quat_yaw_wxyz
 from .obstacle_geometry import (
     DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
     DEFAULT_OBSTACLE_WIDTH,
@@ -31,29 +31,6 @@ from .obstacle_geometry import (
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
-
-
-def _nav_debug_enabled() -> bool:
-    return os.environ.get("GO2W_NAV_DEBUG", "").lower() in ("1", "true", "yes", "on")
-
-
-def _nav_debug_interval() -> int:
-    try:
-        return max(1, int(os.environ.get("GO2W_NAV_DEBUG_INTERVAL", "20")))
-    except ValueError:
-        return 20
-
-
-def _nav_debug_env_id() -> int:
-    try:
-        return int(os.environ.get("GO2W_NAV_DEBUG_ENV", "0"))
-    except ValueError:
-        return 0
-
-
-def _fmt_xy(xy: torch.Tensor) -> str:
-    vals = xy.detach().cpu().tolist()
-    return f"({float(vals[0]):+.2f},{float(vals[1]):+.2f})"
 
 
 def lidar_distances(
@@ -173,17 +150,6 @@ def obstacle_polar_depth(
     return (1.0 - dist_map / max_distance).clamp(0.0, 1.0)
 
 
-def _ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
-    """Create goal-navigation buffers on the env the first time they are requested."""
-    if not hasattr(env, "_go2w_goal_pos_w"):
-        env._go2w_goal_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
-        env._go2w_goal_heading_w = torch.zeros(env.num_envs, device=env.device)
-        env._go2w_start_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
-        env._go2w_start_heading_w = torch.zeros(env.num_envs, device=env.device)
-    if not hasattr(env, "_go2w_scenario_template_id"):
-        env._go2w_scenario_template_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-
-
 def _compute_navigation_waypoint_world(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -212,7 +178,7 @@ def _compute_navigation_waypoint_world(
     occupancy. Close to the end, the waypoint snaps to the true goal pose so
     heading alignment is still learned.
     """
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     robot = env.scene[robot_cfg.name]
 
     start_pos_w = env._go2w_start_pos_w
@@ -442,7 +408,7 @@ def local_goal_command_b(
         local_planner_max_blend=local_planner_max_blend,
     )
 
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     remaining_goal_distance = torch.norm(env._go2w_goal_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=1)
     path_mode = bool(getattr(env, "_go2w_navigation_path_direct_goal", False)) and hasattr(
         env, "_go2w_navigation_path_w"
@@ -482,11 +448,11 @@ def local_goal_command_b(
     command_heading = raw_heading.clamp(min=-command_max_heading, max=command_max_heading)
 
     command = torch.stack((command_x, command_y, command_heading), dim=-1)
-    if _nav_debug_enabled():
+    if nav_debug_enabled():
         step = int(getattr(env, "common_step_counter", 0))
         backward_raw = raw_xy_b[:, 0] < -0.05
         backward_cmd = command[:, 0] < -0.05
-        debug_interval = _nav_debug_interval()
+        debug_interval = nav_debug_interval()
         event_interval = max(1, debug_interval // 4)
         should_print = (
             (step % debug_interval == 0)
@@ -496,7 +462,7 @@ def local_goal_command_b(
             )
         )
         if should_print:
-            debug_env = _nav_debug_env_id()
+            debug_env = nav_debug_env_id()
             row = debug_env if 0 <= debug_env < env.num_envs else 0
             problem_rows = (backward_raw | backward_cmd).nonzero(as_tuple=False).flatten()
             if problem_rows.numel() > 0:
@@ -519,12 +485,12 @@ def local_goal_command_b(
                 "[GO2W_GOAL_CMD] "
                 f"step={step} env={row} nearest={nearest_idx} target={target_idx} final={final_idx} "
                 f"final_dist={final_dist:.2f} near_goal={bool(near_goal[row].item())} "
-                f"raw_b={_fmt_xy(raw_xy_b[row])} cmd=({float(command[row, 0].item()):+.2f},"
+                f"raw_b={fmt_xy(raw_xy_b[row])} cmd=({float(command[row, 0].item()):+.2f},"
                 f"{float(command[row, 1].item()):+.2f},{float(command[row, 2].item()):+.2f}) "
                 f"heading_raw={float(raw_heading[row].item()):+.2f} "
                 f"heading_clipped={float(command_heading[row].item()):+.2f} "
                 f"heading_b={float(heading_b[row].item()):+.2f} path_mode={path_mode} "
-                f"robot={_fmt_xy(robot.data.root_pos_w[row, :2])} waypoint={_fmt_xy(waypoint_pos_w[row, :2])}"
+                f"robot={fmt_xy(robot.data.root_pos_w[row, :2])} waypoint={fmt_xy(waypoint_pos_w[row, :2])}"
             )
 
     return command
@@ -567,14 +533,6 @@ def _get_obstacle_relative_xy(
     dists = torch.norm(rel_xy, dim=-1)                    # (N, K)
     angles = torch.atan2(rel_xy[..., 1], rel_xy[..., 0])  # (N, K) ∈ (−π, π]
     return rel_xy, dists, angles
-
-
-def _quat_yaw_wxyz(quat: torch.Tensor) -> torch.Tensor:
-    """Return yaw angle from a wxyz quaternion tensor."""
-    w, x, y, z = quat.unbind(dim=-1)
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return torch.atan2(siny_cosp, cosy_cosp)
 
 
 def obstacle_full_geometry_features(
@@ -645,7 +603,7 @@ def obstacle_full_geometry_features(
         obstacle_yaw_w = gather_slots(env._go2w_obstacle_yaw)
     else:
         obs_quat_all = torch.stack([env.scene[n].data.root_quat_w for n in obstacle_names], dim=1)
-        obstacle_yaw_w = gather_slots(_quat_yaw_wxyz(obs_quat_all.reshape(N * K, 4)).reshape(N, K))
+        obstacle_yaw_w = gather_slots(quat_yaw_wxyz(obs_quat_all.reshape(N * K, 4)).reshape(N, K))
 
     robot_yaw_w = robot.data.heading_w.unsqueeze(1)
     rel_yaw = wrap_to_pi(obstacle_yaw_w - robot_yaw_w)
@@ -824,7 +782,7 @@ def obstacle_navigation_features(
     gap_width_norm = (frontal_min / (corridor_half_width * 2.0)).clamp(0.0, 1.0)
 
     # ------- goal path blockage -------
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     robot = env.scene[robot_cfg.name]
     robot_pos_2d = robot.data.root_pos_w[:, :2]
     goal_dir_w = env._go2w_goal_pos_w[:, :2] - robot_pos_2d    # (N, 2) world frame

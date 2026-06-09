@@ -25,18 +25,31 @@ class ObsSlice:
         return slice(self.start, self.stop)
 
 
+# LLC (fast-flat) policy obs - 60D.
+# Reconstructed in FrozenLLCActionTerm._build_llc_obs; matches Go2wEnvCfg.PolicyCfg.
 POLICY_OBS = {
-    "base_lin_vel": ObsSlice(0, 3),
-    "base_ang_vel": ObsSlice(3, 6),
-    "projected_gravity": ObsSlice(6, 9),
-    "goal_command": ObsSlice(9, 12),
-    "joint_pos": ObsSlice(12, 28),
-    "joint_vel": ObsSlice(28, 44),
-    "actions": ObsSlice(44, 60),
+    "base_lin_vel":     ObsSlice(0,  3),   # mdp.base_lin_vel
+    "base_ang_vel":     ObsSlice(3,  6),   # mdp.base_ang_vel
+    "projected_gravity": ObsSlice(6,  9),  # mdp.projected_gravity
+    "goal_command":     ObsSlice(9,  12),  # velocity command injected by HLC
+    "joint_pos":        ObsSlice(12, 28),  # mdp.joint_pos_rel (relative to default)
+    "joint_vel":        ObsSlice(28, 44),  # mdp.joint_vel
+    "actions":          ObsSlice(44, 60),  # raw LLC MLP output from previous step
 }
 
-GOAL_COMMAND = POLICY_OBS["goal_command"]
-GOAL_COMMAND_START = GOAL_COMMAND.start
-GOAL_COMMAND_DIM = GOAL_COMMAND.dim
-PRIVILEGED_OBSTACLE_START = POLICY_OBS["actions"].stop
+# HLC teacher policy obs - 451D.
+# Defined in NavTeacherObsCfg.PolicyCfg (go2w_obstacle_env_cfg.py).
+HLC_TEACHER_OBS = {
+    "proprio":           ObsSlice(0,   9),    # base_lin_vel(3) + projected_gravity(3) + goal_command(3)
+    "polar_depth":       ObsSlice(9,   189),  # mdp.obstacle_polar_depth (180 bins)
+    "nav_features":      ObsSlice(189, 205),  # mdp.obstacle_navigation_features (16D)
+    "full_geometry":     ObsSlice(205, 445),  # mdp.obstacle_full_geometry_features (15 slots x 16D)
+    "prev_actions":      ObsSlice(445, 451),  # mdp.prev_hlc_actions (2 frames x 3D)
+}
 
+# HLC student obs - 189D.
+# Defined in NavRLDistillObsCfg.StudentCfg (go2w_obstacle_env_cfg.py).
+HLC_STUDENT_OBS = {
+    "proprio":      ObsSlice(0,   9),    # base_lin_vel(3) + projected_gravity(3) + goal_command(3)
+    "lidar_scan":   ObsSlice(9,   189),  # mdp.lidar_distances (180 bins)
+}

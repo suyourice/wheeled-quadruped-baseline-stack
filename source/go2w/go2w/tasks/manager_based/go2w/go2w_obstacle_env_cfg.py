@@ -31,7 +31,6 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCameraCfg, MultiMeshRayCasterCfg
 from isaaclab.sensors.ray_caster import patterns
 from isaaclab.utils import configclass
@@ -116,7 +115,6 @@ CURRICULUM_SPEED_WARMUP_ITERATIONS = 800
 NAV_CURRICULUM_COLLISION_START_ITERATION = 0
 OBSTACLE_MIN_SPAWN_DISTANCE_INITIAL = 2.2
 OBSTACLE_MIN_SPAWN_DISTANCE_FROM_ROBOT = 1.2
-OBSTACLE_WHEEL_VEL_SCALE = 28.0
 OBSTACLE_LIN_VEL_X = (-2.0, 2.0)
 OBSTACLE_LIN_VEL_Y = (-2.0, 2.0)
 OBSTACLE_ANG_VEL_Z = (-2.0, 2.0)
@@ -187,7 +185,6 @@ NAV_CURRICULUM_PHASE_SCHEDULE = {
     ),
 }
 
-NAV_GOAL_DISTANCE_STD = 1.2
 NAV_GOAL_HEADING_STD = 0.8
 NAV_GOAL_SUCCESS_POSITION_THRESHOLD = 0.35
 NAV_GOAL_SUCCESS_HEADING_THRESHOLD = 0.6
@@ -781,6 +778,38 @@ def _retarget_nav_rewards_to_play_obstacles(rewards: NavTeacherRewardsCfg) -> No
         getattr(rewards, reward_name).params["obstacle_names"] = PLAY_OBSTACLE_NAMES
 
 
+def _configure_play_common(cfg) -> None:
+    """Apply play-mode settings shared by all PLAY environment configs."""
+    cfg.scene.num_envs = 16
+    cfg.scene.env_spacing = 5.0
+    cfg.events.push_robot = None
+    cfg.events.add_base_mass = None
+    _retarget_nav_rewards_to_play_obstacles(cfg.rewards)
+    cfg.commands.base_velocity.debug_vis = True
+    cfg.events.reset_obstacles.params = {
+        **_NAV_RESET_PARAMS_BASE,
+        "obstacle_names": PLAY_OBSTACLE_NAMES,
+        "min_obstacles": PLAY_NUM_OBSTACLES,
+        "max_obstacles": PLAY_NUM_OBSTACLES,
+        "empty_env_fraction": 0.0,
+        "min_inter_obstacle_dist": PLAY_MIN_INTER_OBSTACLE_DIST,
+        "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+        "fixed_obstacle_shape_ids": PLAY_OBSTACLE_SHAPE_IDS,
+        "fixed_obstacle_widths": PLAY_OBSTACLE_WIDTHS,
+        "fixed_obstacle_depths": PLAY_OBSTACLE_DEPTHS,
+        "randomize_physical_obstacle_slots": True,
+        "physical_slot_randomization_start_iteration": 0,
+        "physical_slot_randomization_warmup_iterations": 0,
+    }
+
+
+def _configure_play_obstacle_obs(obs_group) -> None:
+    """Redirect privileged obstacle obs to the smaller PLAY obstacle set."""
+    obs_group.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+    obs_group.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+    obs_group.obstacle_full_geometry.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+
+
 # =============================================================================
 # Observations
 # =============================================================================
@@ -1090,33 +1119,9 @@ class Go2wNavTeacherEnvCfg_PLAY(Go2wNavTeacherEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.scene.num_envs = 16
-        self.scene.env_spacing = 5.0
-        self.events.push_robot = None
-        self.events.add_base_mass = None
+        _configure_play_common(self)
         self.observations.policy.enable_corruption = False
-        self.observations.policy.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.observations.policy.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.observations.policy.obstacle_full_geometry.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        _retarget_nav_rewards_to_play_obstacles(self.rewards)
-        # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
-        self.commands.base_velocity.debug_vis = True
-
-        self.events.reset_obstacles.params = {
-            **_NAV_RESET_PARAMS_BASE,
-            "obstacle_names": PLAY_OBSTACLE_NAMES,
-            "min_obstacles": PLAY_NUM_OBSTACLES,
-            "max_obstacles": PLAY_NUM_OBSTACLES,
-            "empty_env_fraction": 0.0,
-            "min_inter_obstacle_dist": PLAY_MIN_INTER_OBSTACLE_DIST,
-            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
-            "fixed_obstacle_shape_ids": PLAY_OBSTACLE_SHAPE_IDS,
-            "fixed_obstacle_widths": PLAY_OBSTACLE_WIDTHS,
-            "fixed_obstacle_depths": PLAY_OBSTACLE_DEPTHS,
-            "randomize_physical_obstacle_slots": True,
-            "physical_slot_randomization_start_iteration": 0,
-            "physical_slot_randomization_warmup_iterations": 0,
-        }
+        _configure_play_obstacle_obs(self.observations.policy)
 
 
 @configclass
@@ -1158,33 +1163,9 @@ class Go2wNavRLDistillEnvCfg_PLAY(Go2wNavRLDistillEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.scene.num_envs = 16
-        self.scene.env_spacing = 5.0
-        self.events.push_robot = None
-        self.events.add_base_mass = None
+        _configure_play_common(self)
         self.observations.student.enable_corruption = False
-        self.observations.teacher.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.observations.teacher.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.observations.teacher.obstacle_full_geometry.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        _retarget_nav_rewards_to_play_obstacles(self.rewards)
-        # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
-        self.commands.base_velocity.debug_vis = True
-
-        self.events.reset_obstacles.params = {
-            **_NAV_RESET_PARAMS_BASE,
-            "obstacle_names": PLAY_OBSTACLE_NAMES,
-            "min_obstacles": PLAY_NUM_OBSTACLES,
-            "max_obstacles": PLAY_NUM_OBSTACLES,
-            "empty_env_fraction": 0.0,
-            "min_inter_obstacle_dist": PLAY_MIN_INTER_OBSTACLE_DIST,
-            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
-            "fixed_obstacle_shape_ids": PLAY_OBSTACLE_SHAPE_IDS,
-            "fixed_obstacle_widths": PLAY_OBSTACLE_WIDTHS,
-            "fixed_obstacle_depths": PLAY_OBSTACLE_DEPTHS,
-            "randomize_physical_obstacle_slots": True,
-            "physical_slot_randomization_start_iteration": 0,
-            "physical_slot_randomization_warmup_iterations": 0,
-        }
+        _configure_play_obstacle_obs(self.observations.teacher)
 
 
 @configclass
@@ -1243,32 +1224,8 @@ class Go2wNavDepthRLDistillEnvCfg_PLAY(Go2wNavDepthRLDistillEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.scene.num_envs = 16
-        self.scene.env_spacing = 5.0
-        self.events.push_robot = None
-        self.events.add_base_mass = None
+        _configure_play_common(self)
         self.events.depth_distill_dynamic_obstacles = None
         self.observations.student_state.enable_corruption = False
         self.observations.student_depth.enable_corruption = False
-        self.observations.teacher.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.observations.teacher.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        self.observations.teacher.obstacle_full_geometry.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
-        _retarget_nav_rewards_to_play_obstacles(self.rewards)
-        # Show velocity arrows driven by the HLC output (synced in FrozenLLCActionTerm).
-        self.commands.base_velocity.debug_vis = True
-
-        self.events.reset_obstacles.params = {
-            **_NAV_RESET_PARAMS_BASE,
-            "obstacle_names": PLAY_OBSTACLE_NAMES,
-            "min_obstacles": PLAY_NUM_OBSTACLES,
-            "max_obstacles": PLAY_NUM_OBSTACLES,
-            "empty_env_fraction": 0.0,
-            "min_inter_obstacle_dist": PLAY_MIN_INTER_OBSTACLE_DIST,
-            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
-            "fixed_obstacle_shape_ids": PLAY_OBSTACLE_SHAPE_IDS,
-            "fixed_obstacle_widths": PLAY_OBSTACLE_WIDTHS,
-            "fixed_obstacle_depths": PLAY_OBSTACLE_DEPTHS,
-            "randomize_physical_obstacle_slots": True,
-            "physical_slot_randomization_start_iteration": 0,
-            "physical_slot_randomization_warmup_iterations": 0,
-        }
+        _configure_play_obstacle_obs(self.observations.teacher)

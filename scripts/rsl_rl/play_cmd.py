@@ -50,6 +50,7 @@ import sys
 from isaaclab.app import AppLauncher
 
 import cli_args  # isort: skip
+from checkpoint_utils import configure_frozen_llc_action, load_teacher_locomotion_checkpoint  # isort: skip
 
 DEFAULT_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
 DEFAULT_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
@@ -124,13 +125,6 @@ parser.add_argument(
     default=None,
     help="Flat locomotion checkpoint used to initialize the frozen LLC in --teacher_steering mode.",
 )
-parser.add_argument(
-    "--teacher_debug_interval",
-    type=int,
-    default=120,
-    help="Simulation steps between teacher debug prints in --teacher_steering mode.",
-)
-
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -166,77 +160,6 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import go2w.tasks  # noqa: F401
 
 installed_version = metadata.version("rsl-rl-lib")
-
-
-def _find_state_dict(ckpt: dict, candidates: tuple[str, ...], label: str) -> tuple[str, dict]:
-    """Return the first matching state dict from a checkpoint."""
-    for key in candidates:
-        if key in ckpt and isinstance(ckpt[key], dict):
-            return key, ckpt[key]
-    raise ValueError(f"No {label} state dict found. Keys found: {list(ckpt.keys())}")
-
-
-def _load_padded_state_dict(model, src_sd: dict, device: str, label: str, strip_distribution: bool = False) -> None:
-    """Load a state dict, zero-padding first-layer inputs when obs dims grow."""
-    src_sd = {k: v.to(device) for k, v in src_sd.items()}
-    if strip_distribution:
-        src_sd = {k: v for k, v in src_sd.items() if not k.startswith("distribution.")}
-
-    current_sd = model.state_dict()
-    new_sd = {}
-    for key, tgt in current_sd.items():
-        if key not in src_sd:
-            new_sd[key] = tgt
-            continue
-
-        src = src_sd[key]
-        if src.shape == tgt.shape:
-            new_sd[key] = src
-        elif len(src.shape) == 2 and src.shape[0] == tgt.shape[0] and src.shape[1] < tgt.shape[1]:
-            n_pad = tgt.shape[1] - src.shape[1]
-            pad = torch.zeros(src.shape[0], n_pad, dtype=src.dtype, device=device)
-            new_sd[key] = torch.cat([src, pad], dim=1)
-            print(f"[INFO] Zero-padded {label} '{key}': {tuple(src.shape)} -> {tuple(new_sd[key].shape)}")
-        else:
-            print(
-                f"[WARN] Shape mismatch in {label} '{key}': "
-                f"src={tuple(src.shape)}, tgt={tuple(tgt.shape)}; keeping current init"
-            )
-            new_sd[key] = tgt
-
-    model.load_state_dict(new_sd)
-
-
-def _load_teacher_locomotion_checkpoint(teacher, ckpt_path: str, device: str) -> None:
-    """Initialize the teacher frozen LLC from a flat locomotion checkpoint."""
-    teacher_target = getattr(teacher, "frozen_actor", None)
-    if teacher_target is None:
-        raise ValueError("Teacher-steering mode requires a teacher with a frozen_actor.")
-
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    actor_key, actor_sd = _find_state_dict(
-        ckpt,
-        ("actor_state_dict", "model_state_dict", "policy_state_dict"),
-        "actor",
-    )
-    _load_padded_state_dict(teacher_target, actor_sd, device, "teacher frozen actor", strip_distribution=True)
-    print(f"[INFO] Loaded teacher frozen LLC from '{actor_key}' in: {ckpt_path}")
-
-
-def _configure_frozen_llc_action(env_cfg, ckpt_path: str | None) -> bool:
-    """Inject the fast-flat LLC checkpoint into HLC action configs before env creation."""
-    actions_cfg = getattr(env_cfg, "actions", None)
-    llc_cmd_cfg = getattr(actions_cfg, "llc_cmd", None)
-    if llc_cmd_cfg is None:
-        return False
-    if not ckpt_path:
-        raise ValueError(
-            f"Task '{args_cli.task}' uses FrozenLLCActionTerm and requires --locomotion_checkpoint "
-            "before gym.make() so the frozen fast-flat LLC can be loaded."
-        )
-    llc_cmd_cfg.llc_checkpoint_path = ckpt_path
-    print(f"[INFO] Frozen LLC checkpoint injected into action term: {ckpt_path}")
-    return True
 
 
 def _override_play_obstacle_count(env_cfg, num_obstacles):
@@ -341,58 +264,8 @@ def _build_teacher_policy(env, obs, agent_cfg, device: str):
     teacher = teacher_class(obs, {"teacher": ["teacher"]}, "teacher", env.num_actions, **teacher_cfg_dict)
     teacher = teacher.to(device)
     teacher.eval()
-    _load_teacher_locomotion_checkpoint(teacher, args_cli.locomotion_checkpoint, device)
+    load_teacher_locomotion_checkpoint(teacher, args_cli.locomotion_checkpoint, device)
     return teacher
-
-
-def _compute_teacher_debug_line(obs, teacher, env_index: int = 0) -> str:
-    """Summarize the teacher command correction and nearest obstacle geometry."""
-    teacher_obs = obs["teacher"]
-    obstacle_positions = teacher_obs[
-        :, teacher.obstacle_obs_start : teacher.obstacle_obs_start + teacher.obstacle_obs_dim
-    ].view(teacher_obs.shape[0], -1, 2)
-    obstacle_positions = obstacle_positions * teacher.obstacle_max_distance
-
-    command = teacher.last_base_command
-    cmd_xy = command[:, :2]
-    cmd_speed = cmd_xy.norm(dim=1)
-
-    cmd_dir = torch.zeros_like(cmd_xy)
-    moving = cmd_speed > teacher.min_command_speed
-    cmd_dir[moving] = cmd_xy[moving] / cmd_speed[moving].unsqueeze(1)
-    cmd_dir[~moving, 0] = 1.0
-
-    obs_x = obstacle_positions[..., 0]
-    obs_y = obstacle_positions[..., 1]
-    valid = obstacle_positions.abs().sum(dim=-1) > 1.0e-6
-    distance = torch.sqrt(torch.clamp(obs_x.square() + obs_y.square(), min=1.0e-6))
-    forward = (obstacle_positions * cmd_dir.unsqueeze(1)).sum(dim=-1)
-    lateral = cmd_dir[:, 0].unsqueeze(1) * obs_y - cmd_dir[:, 1].unsqueeze(1) * obs_x
-
-    valid_distance = torch.where(valid, distance, torch.full_like(distance, float("inf")))
-    closest_idx = torch.argmin(valid_distance, dim=1)
-    batch_indices = torch.arange(valid_distance.shape[0], device=valid_distance.device)
-    closest_dist = valid_distance[batch_indices, closest_idx]
-    closest_forward = forward[batch_indices, closest_idx]
-    closest_lateral = lateral[batch_indices, closest_idx]
-
-    base_cmd = teacher.last_base_command[env_index]
-    guide_cmd = teacher.last_guidance_command[env_index]
-    delta_cmd = teacher.last_delta_command[env_index]
-    adjusted_cmd = teacher.last_adjusted_command[env_index]
-    gap_width = teacher.last_gap_width[env_index]
-    gap_turn_need = teacher.last_gap_turn_need[env_index]
-    gap_blocked = teacher.last_gap_blocked[env_index]
-    turn_side = teacher.last_turn_side[env_index]
-    return (
-        f"[TEACHER] env={env_index} "
-        f"base=({base_cmd[0]:+.2f},{base_cmd[1]:+.2f},{base_cmd[2]:+.2f}) "
-        f"guide=({guide_cmd[0]:+.2f},{guide_cmd[1]:+.2f},{guide_cmd[2]:+.2f}) "
-        f"delta=(vx {delta_cmd[0]:+.2f}, vy {delta_cmd[1]:+.2f}, yaw {delta_cmd[2]:+.2f}) "
-        f"adj=({adjusted_cmd[0]:+.2f},{adjusted_cmd[1]:+.2f},{adjusted_cmd[2]:+.2f}) "
-        f"closest=(dist {closest_dist[env_index]:.2f} m, fwd {closest_forward[env_index]:+.2f}, lat {closest_lateral[env_index]:+.2f}) "
-        f"gap=(w {gap_width:.2f}, turn {gap_turn_need:.2f}, blocked {gap_blocked:.2f}, commit {turn_side:+.0f})"
-    )
 
 
 def _resolve_play_seed(args_cli, default_seed: int | None) -> int:
@@ -460,7 +333,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         log_dir = os.path.dirname(resume_path)
         env_cfg.log_dir = log_dir
 
-    _configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint)
+    configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint, args_cli.task)
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -489,8 +362,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             obs, _, dones, _ = env.step(actions)
             if teacher is not None:
                 teacher.reset(dones.bool())
-                if args_cli.teacher_debug_interval > 0 and step_count % args_cli.teacher_debug_interval == 0:
-                    print(_compute_teacher_debug_line(obs, teacher, env_index=0))
             elif version.parse(installed_version) >= version.parse("4.0.0"):
                 policy.reset(dones)
         step_count += 1

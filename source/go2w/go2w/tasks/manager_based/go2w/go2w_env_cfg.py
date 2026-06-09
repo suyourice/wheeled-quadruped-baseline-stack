@@ -411,11 +411,9 @@ class Go2wEnvCfg_PLAY(Go2wEnvCfg):
 # =============================================================================
 # 2 m/s flat locomotion pre-training (obstacle-env compatible architecture)
 # =============================================================================
-# Action split (wheel=24 / hip=0.5 / stance=0.3) and reward weights are
+# Action split (wheel=28 / hip=0.35 / stance=0.35) and reward weights are
 # identical to obstacle env so the checkpoint transfers directly via
-# --locomotion_checkpoint in train.py.  First layer of the network is padded
-# 60D->90D with zeros; the extra 30D obstacle obs weights learn from scratch
-# once obstacles are introduced in obstacle env.
+# --locomotion_checkpoint in train.py.
 
 
 @configclass

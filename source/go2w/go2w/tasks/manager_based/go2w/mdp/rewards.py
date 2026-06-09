@@ -21,6 +21,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
+from .events import ensure_navigation_goal_buffers
 from .obstacle_geometry import (
     DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
     footprint_clearance,
@@ -32,37 +33,12 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-def _ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
-    """Create goal-navigation buffers on demand for reward/termination helpers."""
-    if not hasattr(env, "_go2w_goal_pos_w"):
-        env._go2w_goal_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
-        env._go2w_goal_heading_w = torch.zeros(env.num_envs, device=env.device)
-        env._go2w_start_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
-        env._go2w_start_heading_w = torch.zeros(env.num_envs, device=env.device)
-    if not hasattr(env, "_go2w_scenario_template_id"):
-        env._go2w_scenario_template_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-    if not hasattr(env, "_go2w_initial_scenario_template_id"):
-        env._go2w_initial_scenario_template_id = env._go2w_scenario_template_id.clone()
-    # Passable narrow-gap metadata (mirrors events._ensure_navigation_goal_buffers).
-    if not hasattr(env, "_go2w_gap_center_w"):
-        env._go2w_gap_center_w = torch.zeros(env.num_envs, 2, device=env.device)
-        env._go2w_gap_dir_w = torch.zeros(env.num_envs, 2, device=env.device)
-        env._go2w_gap_half_width = torch.zeros(env.num_envs, device=env.device)
-        env._go2w_gap_passable = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    if not hasattr(env, "_go2w_gap_free_half_width"):
-        env._go2w_gap_free_half_width = torch.zeros(env.num_envs, device=env.device)
-    if not hasattr(env, "_go2w_gap_center_tolerance"):
-        env._go2w_gap_center_tolerance = torch.zeros(env.num_envs, device=env.device)
-    if not hasattr(env, "_go2w_stuck_counter"):
-        env._go2w_stuck_counter = torch.zeros(env.num_envs, device=env.device)
-
-
 def _goal_command_from_buffers(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return goal distance and heading error from the sampled task buffers."""
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     asset = env.scene[asset_cfg.name]
     goal_vec_w = env._go2w_goal_pos_w - asset.data.root_pos_w[:, :3]
     goal_vec_b = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), goal_vec_w)
@@ -240,7 +216,7 @@ def goal_progress_dense(
     Returns a value in [-1, 1]: +1 when moving toward the goal at speed >= clip,
     -1 when moving directly away. Zero when stationary or perpendicular.
     """
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     asset = env.scene[asset_cfg.name]
     goal_vec_w = env._go2w_goal_pos_w[:, :2] - asset.data.root_pos_w[:, :2]
     goal_dist = goal_vec_w.norm(dim=-1).clamp(min=0.01)
@@ -474,7 +450,7 @@ def _resample_goal_positions_only(
     Obstacles are NOT moved — only the goal buffer is updated so the
     episode can continue toward a fresh target without a full reset.
     """
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     robot = env.scene[asset_cfg.name]
 
     curr_pos_w = robot.data.root_pos_w[env_ids, :3].clone()
@@ -850,7 +826,7 @@ def _compute_goal_path_blockage(
     if cached is not None:
         return cached
 
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     robot = env.scene[robot_cfg.name]
     robot_yaw_quat = yaw_quat(robot.data.root_quat_w)
 
@@ -1086,7 +1062,7 @@ def nav_open_path_straightness_reward(
     x = ((open_blockage_threshold - goal_path_blockage) / max(open_blockage_threshold, 1.0e-6)).clamp(0.0, 1.0)
     open_gate = x * x * (3.0 - 2.0 * x)
 
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     robot = env.scene[robot_cfg.name]
     robot_yaw_quat = yaw_quat(robot.data.root_quat_w)
 
@@ -1142,7 +1118,7 @@ def nav_open_path_goal_heading_reward(
     x = ((open_blockage_threshold - goal_path_blockage) / max(open_blockage_threshold, 1.0e-6)).clamp(0.0, 1.0)
     open_gate = x * x * (3.0 - 2.0 * x)
 
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     robot = env.scene[robot_cfg.name]
     goal_vec_w = env._go2w_goal_pos_w[:, :2] - robot.data.root_pos_w[:, :2]
     goal_dist = goal_vec_w.norm(dim=-1)
@@ -1177,7 +1153,7 @@ def nav_near_goal_settling_reward(
 
     nav tasks zero out base_velocity commands, so command_manager is not used.
     """
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     robot = env.scene[asset_cfg.name]
 
     goal_dist = (env._go2w_goal_pos_w[:, :2] - robot.data.root_pos_w[:, :2]).norm(dim=-1)
@@ -1319,9 +1295,6 @@ def nav_passable_gap_traversal_reward(
     env.extras["log"]["passable_gap_activation_rate"] = active.mean()
     env.extras["log"]["passable_gap_alignment_error"] = (lateral_err * active).sum() / denom
     env.extras["log"]["passable_gap_progress_mean"] = (forward_vel.clamp(min=0.0) * active).sum() / denom
-    env.extras["log"]["passable_gap_stop_rate"] = (
-        ((speed < stop_speed).float()) * active
-    ).sum() / denom
     env.extras["log"]["frozen_despite_passable_rate"] = (
         (speed < stop_speed).float() * active
     ).sum() / denom
@@ -1370,7 +1343,7 @@ def nav_dense_recovery_reward(
     if len(obstacle_names) == 0:
         return torch.zeros(env.num_envs, device=env.device)
 
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
 
     frontal_blockage, left_blockage, right_blockage, vel_yaw, _, _, _ = (
         _compute_nav_frontal_geometry(env, obstacle_names, robot_cfg, frontal_half_angle_deg, max_distance)

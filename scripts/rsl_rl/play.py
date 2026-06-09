@@ -15,6 +15,7 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+from checkpoint_utils import configure_frozen_llc_action, load_teacher_locomotion_checkpoint  # isort: skip
 
 DEFAULT_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
 DEFAULT_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
@@ -644,76 +645,6 @@ from go2w.tasks.manager_based.go2w.mdp.obstacle_geometry import (
 from go2w.tasks.manager_based.go2w.observation_layout import POLICY_OBS
 
 
-def _find_state_dict(ckpt: dict, candidates: tuple[str, ...], label: str) -> tuple[str, dict]:
-    """Return the first matching state dict from a checkpoint."""
-    for key in candidates:
-        if key in ckpt and isinstance(ckpt[key], dict):
-            return key, ckpt[key]
-    raise ValueError(f"No {label} state dict found. Keys found: {list(ckpt.keys())}")
-
-
-def _load_padded_state_dict(model, src_sd: dict, device: str, label: str, strip_distribution: bool = False) -> None:
-    """Load a state dict, zero-padding first-layer inputs when obs dims grow."""
-    src_sd = {key: value.to(device) for key, value in src_sd.items()}
-    if strip_distribution:
-        src_sd = {key: value for key, value in src_sd.items() if not key.startswith("distribution.")}
-
-    current_sd = model.state_dict()
-    new_sd = {}
-    for key, target in current_sd.items():
-        if key not in src_sd:
-            new_sd[key] = target
-            continue
-
-        source = src_sd[key]
-        if source.shape == target.shape:
-            new_sd[key] = source
-        elif len(source.shape) == 2 and source.shape[0] == target.shape[0] and source.shape[1] < target.shape[1]:
-            pad = torch.zeros(source.shape[0], target.shape[1] - source.shape[1], dtype=source.dtype, device=device)
-            new_sd[key] = torch.cat([source, pad], dim=1)
-            print(f"[INFO] Zero-padded {label} '{key}': {tuple(source.shape)} -> {tuple(new_sd[key].shape)}")
-        else:
-            print(
-                f"[WARN] Shape mismatch in {label} '{key}': "
-                f"src={tuple(source.shape)}, tgt={tuple(target.shape)}; keeping current init"
-            )
-            new_sd[key] = target
-
-    model.load_state_dict(new_sd)
-
-
-def _load_teacher_locomotion_checkpoint(teacher, ckpt_path: str, device: str) -> None:
-    """Initialize the teacher frozen LLC from a flat locomotion checkpoint."""
-    frozen_actor = getattr(teacher, "frozen_actor", None)
-    if frozen_actor is None:
-        raise ValueError("--teacher_steering requires a teacher with a frozen_actor.")
-
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    actor_key, actor_sd = _find_state_dict(
-        ckpt,
-        ("actor_state_dict", "model_state_dict", "policy_state_dict"),
-        "actor",
-    )
-    _load_padded_state_dict(frozen_actor, actor_sd, device, "teacher frozen actor", strip_distribution=True)
-    print(f"[INFO] Loaded teacher frozen LLC from '{actor_key}' in: {ckpt_path}")
-
-
-def _configure_frozen_llc_action(env_cfg, ckpt_path: str | None) -> bool:
-    """Inject the fast-flat LLC checkpoint into HLC action configs before env creation."""
-    actions_cfg = getattr(env_cfg, "actions", None)
-    llc_cmd_cfg = getattr(actions_cfg, "llc_cmd", None)
-    if llc_cmd_cfg is None:
-        return False
-    if not ckpt_path:
-        raise ValueError(
-            f"Task '{args_cli.task}' uses FrozenLLCActionTerm and requires --locomotion_checkpoint "
-            "before gym.make() so the frozen fast-flat LLC can be loaded."
-        )
-    llc_cmd_cfg.llc_checkpoint_path = ckpt_path
-    print(f"[INFO] Frozen LLC checkpoint injected into action term: {ckpt_path}")
-    return True
-
-
 def _build_teacher_policy(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
     """Instantiate the rule-based navigation teacher for direct play/evaluation."""
     teacher_cfg = getattr(agent_cfg, "teacher", None)
@@ -729,7 +660,7 @@ def _build_teacher_policy(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
     teacher = teacher_class(obs, {"teacher": ["teacher"]}, "teacher", env.num_actions, **teacher_cfg_dict)
     teacher = teacher.to(device)
     teacher.eval()
-    _load_teacher_locomotion_checkpoint(teacher, args_cli.locomotion_checkpoint, device)
+    load_teacher_locomotion_checkpoint(teacher, args_cli.locomotion_checkpoint, device)
     return teacher
 
 
@@ -1692,7 +1623,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
-    _configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint)
+    configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint, args_cli.task)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -1812,7 +1743,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _nav_final_goal_marker = None
     _nav_start_marker = None
     _nav_path_marker = None
-    if hasattr(_base_env, "_go2w_goal_pos_w"):
+    _nav_has_goal_markers = hasattr(_base_env, "_go2w_goal_pos_w") and hasattr(_base_env, "_go2w_start_pos_w")
+    _nav_has_astar_markers = (
+        args_cli.structured_env != "none"
+        and not args_cli.no_astar
+        and hasattr(_base_env, "_go2w_navigation_path_w")
+        and hasattr(_base_env, "_go2w_navigation_path_count")
+    )
+    if _nav_has_goal_markers:
         _nav_goal_marker = VisualizationMarkers(
             VisualizationMarkersCfg(
                 prim_path="/Visuals/NavGoalMarker",
@@ -1820,32 +1758,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "sphere": sim_utils.SphereCfg(
                         radius=0.30,
                         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.9, 0.1)),
-                    ),
-                },
-            )
-        )
-        _nav_final_goal_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/NavFinalGoalMarker",
-                markers={
-                    "sphere": sim_utils.SphereCfg(
-                        radius=0.22,
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.05, 0.02)),
-                    ),
-                },
-            )
-        )
-        _nav_path_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/NavPathMarker",
-                markers={
-                    "line": sim_utils.CylinderCfg(
-                        radius=0.025,
-                        height=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(1.0, 0.9, 0.0),
-                            roughness=1.0,
-                        ),
                     ),
                 },
             )
@@ -1861,6 +1773,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 },
             )
         )
+        if _nav_has_astar_markers:
+            _nav_final_goal_marker = VisualizationMarkers(
+                VisualizationMarkersCfg(
+                    prim_path="/Visuals/NavFinalGoalMarker",
+                    markers={
+                        "sphere": sim_utils.SphereCfg(
+                            radius=0.22,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.05, 0.02)),
+                        ),
+                    },
+                )
+            )
+            _nav_path_marker = VisualizationMarkers(
+                VisualizationMarkersCfg(
+                    prim_path="/Visuals/NavPathMarker",
+                    markers={
+                        "line": sim_utils.CylinderCfg(
+                            radius=0.025,
+                            height=1.0,
+                            visual_material=sim_utils.PreviewSurfaceCfg(
+                                diffuse_color=(1.0, 0.9, 0.0),
+                                roughness=1.0,
+                            ),
+                        ),
+                    },
+                )
+            )
 
     # play output directory setup
     _out_dir: str | None = None
@@ -1964,11 +1903,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             goal_pos = _base_env._go2w_goal_pos_w.clone()
             goal_pos[:, 2] += 0.35
             _nav_goal_marker.visualize(translations=goal_pos)
-            if (
-                _nav_final_goal_marker is not None
-                and hasattr(_base_env, "_go2w_navigation_path_w")
-                and hasattr(_base_env, "_go2w_navigation_path_count")
-            ):
+            if _nav_final_goal_marker is not None:
                 final_idx = (_base_env._go2w_navigation_path_count - 1).clamp(min=0)
                 row_idx = torch.arange(_base_env.num_envs, device=_base_env._go2w_navigation_path_w.device)
                 final_goal_pos = _base_env._go2w_navigation_path_w[row_idx, final_idx, :3].clone()
@@ -1976,7 +1911,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 _nav_final_goal_marker.visualize(translations=final_goal_pos)
             start_pos = _base_env._go2w_start_pos_w.clone()
             start_pos[:, 2] += 0.35
-            _nav_start_marker.visualize(translations=start_pos)
+            if _nav_start_marker is not None:
+                _nav_start_marker.visualize(translations=start_pos)
             if _nav_path_marker is not None:
                 path_markers = _get_nav_path_line_markers(_base_env, args_cli.nav_log_env)
                 if path_markers is not None:

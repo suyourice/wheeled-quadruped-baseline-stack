@@ -39,8 +39,6 @@ from isaaclab.envs.mdp import (
 from isaaclab.envs.mdp import (
     base_ang_vel,
     base_lin_vel,
-    base_pos_z,
-    body_incoming_wrench,
     joint_pos_rel,
     joint_vel_rel,
     last_action,

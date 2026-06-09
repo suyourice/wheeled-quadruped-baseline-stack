@@ -89,7 +89,7 @@ def update_locomotion_curriculum(
                                   lerp(ang_vel_z_initial[1], ang_vel_z_final[1]))
 
 
-def _quat_yaw_wxyz(quat: torch.Tensor) -> torch.Tensor:
+def quat_yaw_wxyz(quat: torch.Tensor) -> torch.Tensor:
     """Return yaw angle from a wxyz quaternion tensor."""
     w, x, y, z = quat.unbind(dim=-1)
     siny_cosp = 2.0 * (w * z + x * y)
@@ -97,7 +97,7 @@ def _quat_yaw_wxyz(quat: torch.Tensor) -> torch.Tensor:
     return torch.atan2(siny_cosp, cosy_cosp)
 
 
-def _yaw_to_quat_wxyz(yaw: torch.Tensor) -> torch.Tensor:
+def yaw_to_quat_wxyz(yaw: torch.Tensor) -> torch.Tensor:
     """Return a wxyz quaternion for a planar yaw angle tensor."""
     half_yaw = yaw * 0.5
     quat = torch.zeros(*yaw.shape, 4, device=yaw.device, dtype=yaw.dtype)
@@ -106,7 +106,7 @@ def _yaw_to_quat_wxyz(yaw: torch.Tensor) -> torch.Tensor:
     return quat
 
 
-def _ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
+def ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
     """Create persistent start/goal buffers used by the navigation-distill task."""
     if not hasattr(env, "_go2w_goal_pos_w"):
         env._go2w_goal_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
@@ -316,7 +316,7 @@ def reset_obstacles_curriculum(
             command_xy = env.command_manager.get_command(command_name)[env_ids, :2]
         command_speed = command_xy.norm(dim=1)
         command_dir_body = command_xy / command_speed.clamp(min=1.0e-6).unsqueeze(1)
-        yaw = _quat_yaw_wxyz(robot.data.root_quat_w[env_ids])
+        yaw = quat_yaw_wxyz(robot.data.root_quat_w[env_ids])
         cos_yaw = torch.cos(yaw)
         sin_yaw = torch.sin(yaw)
         body_x_world = torch.stack([cos_yaw, sin_yaw], dim=-1)
@@ -360,7 +360,7 @@ def reset_obstacles_curriculum(
                     cy = torch.where(command_path_ok, path_xy[:, 1], rand_y)
                 elif use_near_field:
                     radius = torch.empty(n, device=device).uniform_(*near_field_radius_range)
-                    angle = torch.empty(n, device=device).uniform_(-3.141592653589793, 3.141592653589793)
+                    angle = torch.empty(n, device=device).uniform_(-math.pi, math.pi)
                     cx = robot_local_pos[:, 0] + radius * torch.cos(angle)
                     cy = robot_local_pos[:, 1] + radius * torch.sin(angle)
                 else:
@@ -414,7 +414,7 @@ def reset_obstacles_curriculum(
                         cy = torch.where(command_path_ok, path_xy[:, 1], rand_y)
                     elif use_near_field:
                         radius = torch.empty(n, device=device).uniform_(*near_field_radius_range)
-                        angle = torch.empty(n, device=device).uniform_(-3.141592653589793, 3.141592653589793)
+                        angle = torch.empty(n, device=device).uniform_(-math.pi, math.pi)
                         cx = robot_local_pos[:, 0] + radius * torch.cos(angle)
                         cy = robot_local_pos[:, 1] + radius * torch.sin(angle)
                     else:
@@ -476,7 +476,7 @@ def reset_obstacles_curriculum(
         # Pose: [x, y, z, qw, qx, qy, qz]
         pose = torch.zeros(n, 7, device=device)
         pose[:, :3] = world_pos
-        pose[:, 3:7] = _yaw_to_quat_wxyz(yaw)
+        pose[:, 3:7] = yaw_to_quat_wxyz(yaw)
 
         obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
         obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
@@ -534,7 +534,7 @@ def _resample_nav_on_goal_reached(
     operations instead of Python for-loops, avoiding CPU bottlenecks when many
     envs reach the goal simultaneously.
     """
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     robot = env.scene["robot"]
     n = len(env_ids)
     device = env.device
@@ -677,7 +677,7 @@ def _resample_nav_on_goal_reached(
     for slot_idx, name in enumerate(obstacle_names):
         obstacle = env.scene[name]
         pose_buf[:, :3] = physical_positions[:, slot_idx]
-        pose_buf[:, 3:7] = _yaw_to_quat_wxyz(physical_yaws[:, slot_idx])
+        pose_buf[:, 3:7] = yaw_to_quat_wxyz(physical_yaws[:, slot_idx])
         obstacle.write_root_pose_to_sim(pose_buf.clone(), env_ids=env_ids)
         obstacle.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
 
@@ -747,7 +747,7 @@ def move_dynamic_play_obstacles(
     )
     lateral_speed_max *= speed_scale
 
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     n_envs = env.num_envs
     n_slots = len(obstacle_names)
     device = env.device
@@ -1003,7 +1003,7 @@ def move_dynamic_play_obstacles(
         pose = torch.zeros(len(env_ids), 7, device=device)
         pose[:, :2] = accepted[:, slot_idx]
         pose[:, 2] = obstacle_z
-        pose[:, 3:7] = _yaw_to_quat_wxyz(obstacle_yaws[:, slot_idx])
+        pose[:, 3:7] = yaw_to_quat_wxyz(obstacle_yaws[:, slot_idx])
         env.scene[name].write_root_pose_to_sim(pose, env_ids=env_ids)
         env.scene[name].write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
 
@@ -1050,7 +1050,7 @@ def reset_structured_astar_corridor(
     del dynamic_obstacle_names, dynamic_obstacle_indices
     if len(obstacle_names) == 0:
         return
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     structured_kind = (corridor_kind or fixed_scenario_template or "l_corridor").lower()
     centerline = structured_corridor_centerline(
         structured_kind,
@@ -1091,7 +1091,7 @@ def reset_structured_astar_corridor(
     robot = env.scene["robot"]
     start_pos_w = robot.data.root_pos_w[env_ids, :3].clone()
     start_heading_w = robot.data.heading_w[env_ids].clone()
-    yaw = _quat_yaw_wxyz(robot.data.root_quat_w[env_ids])
+    yaw = quat_yaw_wxyz(robot.data.root_quat_w[env_ids])
     cos_yaw = torch.cos(yaw)
     sin_yaw = torch.sin(yaw)
 
@@ -1233,7 +1233,7 @@ def reset_structured_astar_corridor(
     for slot_idx, name in enumerate(obstacle_names):
         pose = torch.zeros(n, 7, device=device)
         pose[:, :3] = positions[:, slot_idx]
-        pose[:, 3:7] = _yaw_to_quat_wxyz(obstacle_yaws[:, slot_idx])
+        pose[:, 3:7] = yaw_to_quat_wxyz(obstacle_yaws[:, slot_idx])
         env.scene[name].write_root_pose_to_sim(pose, env_ids=env_ids)
         env.scene[name].write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
 
@@ -1330,7 +1330,7 @@ def reset_navigation_goals_and_obstacles(
     The sampled start/goal are stored on the env so observation, reward, and
     termination helpers can derive a local goal command every step.
     """
-    _ensure_navigation_goal_buffers(env)
+    ensure_navigation_goal_buffers(env)
     if hasattr(env, "_go2w_goals_reached_episode"):
         env._go2w_goals_reached_episode[env_ids] = 0.0
     if hasattr(env, "_go2w_first_goal_reached_episode"):
@@ -1364,7 +1364,7 @@ def reset_navigation_goals_and_obstacles(
     robot = env.scene["robot"]
     start_pos_w = robot.data.root_pos_w[env_ids, :3].clone()
     start_heading_w = robot.data.heading_w[env_ids].clone()
-    yaw = _quat_yaw_wxyz(robot.data.root_quat_w[env_ids])
+    yaw = quat_yaw_wxyz(robot.data.root_quat_w[env_ids])
 
     env._go2w_start_pos_w[env_ids] = start_pos_w
     env._go2w_start_heading_w[env_ids] = start_heading_w
@@ -1803,21 +1803,31 @@ def reset_navigation_goals_and_obstacles(
         dim=1,
     )
     logical_positions = torch.stack(world_positions_per_slot, dim=1)
-    randomize_slot_mask = _physical_slot_randomization_mask(
-        env,
-        n,
-        randomize_physical_obstacle_slots,
-        physical_slot_randomization_start_iteration,
-        physical_slot_randomization_warmup_iterations,
-        steps_per_iteration,
-        device,
+    randomize_slot_mask = (
+        False
+        if fixed_layout_seed is not None
+        else _physical_slot_randomization_mask(
+            env,
+            n,
+            randomize_physical_obstacle_slots,
+            physical_slot_randomization_start_iteration,
+            physical_slot_randomization_warmup_iterations,
+            steps_per_iteration,
+            device,
+        )
     )
     physical_positions, active_mask, logical_to_physical = _assign_logical_positions_to_physical_slots(
         logical_positions, logical_active_mask, parked_positions, randomize_slot_mask
     )
     logical_yaws = torch.zeros(n, len(obstacle_names), device=device)
     if randomize_obstacle_yaw:
-        sampled_yaws = torch.empty(n, len(obstacle_names), device=device).uniform_(*obstacle_yaw_range)
+        if fixed_layout_seed is not None:
+            sampled_yaws = torch.empty_like(logical_yaws)
+            for env_idx in range(n):
+                for slot_idx in range(len(obstacle_names)):
+                    sampled_yaws[env_idx, slot_idx] = _rng.uniform(*obstacle_yaw_range)
+        else:
+            sampled_yaws = torch.empty(n, len(obstacle_names), device=device).uniform_(*obstacle_yaw_range)
         logical_yaws = torch.where(logical_active_mask, sampled_yaws, logical_yaws)
     physical_yaws = torch.zeros_like(logical_yaws)
     physical_yaws.scatter_(1, logical_to_physical, logical_yaws)
@@ -1854,7 +1864,7 @@ def reset_navigation_goals_and_obstacles(
         obstacle = env.scene[name]
         pose = torch.zeros(n, 7, device=device)
         pose[:, :3] = world_positions_per_slot[slot_idx]
-        pose[:, 3:7] = _yaw_to_quat_wxyz(physical_yaws[:, slot_idx])
+        pose[:, 3:7] = yaw_to_quat_wxyz(physical_yaws[:, slot_idx])
         obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
         obstacle.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
 

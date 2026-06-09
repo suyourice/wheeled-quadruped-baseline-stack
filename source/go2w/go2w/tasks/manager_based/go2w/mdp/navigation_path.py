@@ -8,40 +8,15 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import TYPE_CHECKING
 
 import torch
+from isaaclab.utils.math import wrap_to_pi
+
+from .debug_utils import fmt_xy, nav_debug_enabled, nav_debug_env_id, nav_debug_interval
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
-
-
-def _nav_debug_enabled() -> bool:
-    return os.environ.get("GO2W_NAV_DEBUG", "").lower() in ("1", "true", "yes", "on")
-
-
-def _nav_debug_interval() -> int:
-    try:
-        return max(1, int(os.environ.get("GO2W_NAV_DEBUG_INTERVAL", "20")))
-    except ValueError:
-        return 20
-
-
-def _nav_debug_env_id() -> int:
-    try:
-        return int(os.environ.get("GO2W_NAV_DEBUG_ENV", "0"))
-    except ValueError:
-        return 0
-
-
-def _fmt_xy(xy: torch.Tensor) -> str:
-    vals = xy.detach().cpu().tolist()
-    return f"({float(vals[0]):+.2f},{float(vals[1]):+.2f})"
-
-
-def _wrap_pi(angle: torch.Tensor) -> torch.Tensor:
-    return torch.atan2(torch.sin(angle), torch.cos(angle))
 
 
 def _ensure_path_buffers(
@@ -66,12 +41,6 @@ def _ensure_path_buffers(
         env._go2w_navigation_path_progress_s = torch.zeros(env.num_envs, dtype=path_w.dtype, device=env.device)
         env._go2w_navigation_path_target_s = torch.zeros(env.num_envs, dtype=path_w.dtype, device=env.device)
 
-    for name in (
-        "_go2w_navigation_path_progress_s",
-        "_go2w_navigation_path_target_s",
-    ):
-        if not hasattr(env, name):
-            setattr(env, name, torch.zeros(env.num_envs, dtype=path_w.dtype, device=env.device))
 
 
 def set_navigation_path_w(
@@ -313,16 +282,16 @@ def update_navigation_path_waypoint(
         env._go2w_navigation_path_progress_s[env_id] = progress_s
         env._go2w_navigation_path_target_s[env_id] = target_s
 
-        if _nav_debug_enabled():
+        if nav_debug_enabled():
             step = int(getattr(env, "common_step_counter", 0))
-            debug_env = _nav_debug_env_id()
+            debug_env = nav_debug_env_id()
             goal_vec = target[:2] - robot_xy
             target_forward_b = (
                 torch.cos(heading_all[env_id]) * goal_vec[0]
                 + torch.sin(heading_all[env_id]) * goal_vec[1]
             )
             should_print = (
-                step % _nav_debug_interval() == 0
+                step % nav_debug_interval() == 0
                 or (
                     env_id == debug_env
                     and (
@@ -333,7 +302,7 @@ def update_navigation_path_waypoint(
                 )
             )
             if should_print:
-                heading_error_b = _wrap_pi(segment_heading - heading_all[env_id])
+                heading_error_b = wrap_to_pi(segment_heading - heading_all[env_id])
                 print(
                     "[GO2W_NAV_PATH] "
                     f"step={step} env={env_id} "
@@ -344,5 +313,5 @@ def update_navigation_path_waypoint(
                     f"lookahead={effective_lookahead:.2f} curvature={max_angle:.2f} "
                     f"target_fwd_b={float(target_forward_b.item()):+.2f} "
                     f"path_head_b={float(heading_error_b.item()):+.2f} "
-                    f"robot={_fmt_xy(robot_xy)} target={_fmt_xy(target[:2])} final={_fmt_xy(final[:2])}"
+                    f"robot={fmt_xy(robot_xy)} target={fmt_xy(target[:2])} final={fmt_xy(final[:2])}"
                 )

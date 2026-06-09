@@ -11,10 +11,7 @@ import math
 
 import torch
 
-from .astar import GridMap2D, plan_astar_path
-
-
-WorldPoint = tuple[float, float]
+from .astar import GridMap2D, WorldPoint, plan_astar_path
 
 
 def _bezier_arc(
@@ -152,25 +149,6 @@ def structured_corridor_centerline(
             (leg_length, 2.0 * step),
         )
     raise ValueError(f"Unsupported structured corridor kind: {corridor_kind!r}.")
-
-
-def densify_polyline(points: tuple[WorldPoint, ...], spacing: float = 0.35) -> list[WorldPoint]:
-    """Return evenly spaced points along a polyline."""
-    if len(points) < 2:
-        return list(points)
-    spacing = max(spacing, 1.0e-3)
-    dense: list[WorldPoint] = [points[0]]
-    for a, b in zip(points[:-1], points[1:]):
-        dx = b[0] - a[0]
-        dy = b[1] - a[1]
-        length = math.hypot(dx, dy)
-        if length <= 1.0e-6:
-            continue
-        steps = max(1, int(math.ceil(length / spacing)))
-        for step in range(1, steps + 1):
-            t = step / steps
-            dense.append((a[0] + dx * t, a[1] + dy * t))
-    return dense
 
 
 def _corridor_wall_specs_from_centerline(

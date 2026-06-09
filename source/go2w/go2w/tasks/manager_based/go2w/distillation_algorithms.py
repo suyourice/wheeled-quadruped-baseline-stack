@@ -12,6 +12,8 @@ import torch.nn as nn
 
 from rsl_rl.algorithms.distillation import Distillation
 
+from .observation_layout import HLC_TEACHER_OBS
+
 
 class SimpleActionDistillation(Distillation):
     """Action-imitation distillation with configurable loss weight.
@@ -46,13 +48,12 @@ class SimpleActionDistillation(Distillation):
             return weights, risk
 
         teacher_obs = observations["teacher"]
-        if teacher_obs.ndim != 2 or teacher_obs.shape[-1] < 445:
+        if teacher_obs.ndim != 2 or teacher_obs.shape[-1] < HLC_TEACHER_OBS["full_geometry"].stop:
             return weights, risk
 
-        nav_start = 9 + 180
-        full_start = nav_start + 16
-        full_end = full_start + 15 * 16
-        full_geometry = teacher_obs[:, full_start:full_end].reshape(-1, 15, 16)
+        nav_start = HLC_TEACHER_OBS["nav_features"].start    # 189
+        full_geom = HLC_TEACHER_OBS["full_geometry"]
+        full_geometry = teacher_obs[:, full_geom.as_slice()].reshape(-1, 15, 16)
 
         active = full_geometry[..., 0] > 0.5
         clearance = full_geometry[..., 10] * 8.0
@@ -61,6 +62,7 @@ class SimpleActionDistillation(Distillation):
         min_clearance = torch.where(active, clearance, clearance_fill).min(dim=1).values
         clearance_risk = ((safe_clearance - min_clearance) / max(safe_clearance, 1.0e-6)).clamp(0.0, 1.0)
 
+        # nav_features sub-indices: [3]=frontal_blockage, [12]=goal_path_blockage, [13]=ttc_proxy
         frontal_blockage = teacher_obs[:, nav_start + 3].clamp(0.0, 1.0)
         goal_path_blockage = teacher_obs[:, nav_start + 12].clamp(0.0, 1.0)
         ttc_risk = teacher_obs[:, nav_start + 13].clamp(0.0, 1.0)
