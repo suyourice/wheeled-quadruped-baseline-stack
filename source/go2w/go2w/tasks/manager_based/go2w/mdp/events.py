@@ -21,6 +21,7 @@ from .structured_corridor import (
     plan_structured_corridor_path,
     project_polyline_corridor_local,
     structured_corridor_centerline,
+    structured_corridor_extra_polylines,
     structured_corridor_wall_specs,
 )
 
@@ -103,6 +104,45 @@ def yaw_to_quat_wxyz(yaw: torch.Tensor) -> torch.Tensor:
     quat = torch.zeros(*yaw.shape, 4, device=yaw.device, dtype=yaw.dtype)
     quat[..., 0] = torch.cos(half_yaw)
     quat[..., 3] = torch.sin(half_yaw)
+    return quat
+
+
+def yaw_pitch_to_quat_wxyz(yaw: torch.Tensor, pitch: torch.Tensor) -> torch.Tensor:
+    """Return a wxyz quaternion for Rz(yaw) * Ry(pitch)."""
+    half_yaw = yaw * 0.5
+    half_pitch = pitch * 0.5
+    cz = torch.cos(half_yaw)
+    sz = torch.sin(half_yaw)
+    cp = torch.cos(half_pitch)
+    sp = torch.sin(half_pitch)
+    quat = torch.zeros(*yaw.shape, 4, device=yaw.device, dtype=yaw.dtype)
+    quat[..., 0] = cz * cp
+    quat[..., 1] = -sz * sp
+    quat[..., 2] = cz * sp
+    quat[..., 3] = sz * cp
+    return quat
+
+
+def yaw_pitch_roll_to_quat_wxyz(
+    yaw: torch.Tensor,
+    pitch: torch.Tensor,
+    roll: torch.Tensor,
+) -> torch.Tensor:
+    """Return a wxyz quaternion for Rz(yaw) * Ry(pitch) * Rx(roll).
+
+    Used for the ramp hump: with pitch=0 and roll=−π/2 the cylinder axis (Z)
+    is rotated to point perpendicular to the corridor, creating a symmetric
+    speed-hump profile where both entry and exit ends are at ground level.
+    """
+    hz, hp, hr = yaw * 0.5, pitch * 0.5, roll * 0.5
+    cz, sz = torch.cos(hz), torch.sin(hz)
+    cp, sp = torch.cos(hp), torch.sin(hp)
+    cr, sr = torch.cos(hr), torch.sin(hr)
+    quat = torch.zeros(*yaw.shape, 4, device=yaw.device, dtype=yaw.dtype)
+    quat[..., 0] = cz * cp * cr + sz * sp * sr
+    quat[..., 1] = cz * cp * sr - sz * sp * cr
+    quat[..., 2] = cz * sp * cr + sz * cp * sr
+    quat[..., 3] = -cz * sp * sr + sz * cp * cr
     return quat
 
 
@@ -697,6 +737,8 @@ def _resample_nav_on_goal_reached(
     # freshly placed obstacles rather than continuing old anchor trajectories.
     if hasattr(env, "_go2w_dynamic_obstacle_initialized"):
         env._go2w_dynamic_obstacle_initialized[env_ids] = False
+    if hasattr(env, "_go2w_hospital_dynamic_initialized"):
+        env._go2w_hospital_dynamic_initialized[env_ids] = False
 
 
 def move_dynamic_play_obstacles(
@@ -1035,6 +1077,14 @@ def reset_structured_astar_corridor(
     fixed_obstacle_shape_ids: tuple[int, ...] | None = None,
     fixed_obstacle_widths: tuple[float, ...] | None = None,
     fixed_obstacle_depths: tuple[float, ...] | None = None,
+    fixed_obstacle_center_zs: tuple[float, ...] | None = None,
+    obstacle_labels: tuple[str, ...] | list[str] | None = None,
+    fixed_obstacle_local_poses: tuple[tuple[int, float, float, float], ...] | None = None,
+    robot_start_local_xy: tuple[float, float] = (0.0, 0.0),
+    ramp_asset_name: str | None = None,
+    ramp_local_pose: tuple[float, ...] | None = None,
+    ramp_b_asset_name: str | None = None,
+    ramp_b_local_pose: tuple[float, ...] | None = None,
     randomize_obstacle_yaw: bool = True,
     obstacle_yaw_range: tuple[float, float] = (-math.pi, math.pi),
     clearance_cost_weight: float = 2.0,
@@ -1047,7 +1097,7 @@ def reset_structured_astar_corridor(
     curvature_threshold: float = 0.3,
 ) -> None:
     """Reset play envs into a known structured corridor with an A* waypoint path."""
-    del dynamic_obstacle_names, dynamic_obstacle_indices
+    del dynamic_obstacle_names, dynamic_obstacle_indices, obstacle_labels
     if len(obstacle_names) == 0:
         return
     ensure_navigation_goal_buffers(env)
@@ -1094,6 +1144,18 @@ def reset_structured_astar_corridor(
     yaw = quat_yaw_wxyz(robot.data.root_quat_w[env_ids])
     cos_yaw = torch.cos(yaw)
     sin_yaw = torch.sin(yaw)
+    robot_start_local = torch.tensor(robot_start_local_xy, dtype=start_pos_w.dtype, device=device)
+    layout_origin_xy = torch.zeros(n, 2, dtype=start_pos_w.dtype, device=device)
+    layout_origin_xy[:, 0] = (
+        start_pos_w[:, 0]
+        - robot_start_local[0] * cos_yaw
+        + robot_start_local[1] * sin_yaw
+    )
+    layout_origin_xy[:, 1] = (
+        start_pos_w[:, 1]
+        - robot_start_local[0] * sin_yaw
+        - robot_start_local[1] * cos_yaw
+    )
 
     env._go2w_start_pos_w[env_ids] = start_pos_w
     env._go2w_start_heading_w[env_ids] = start_heading_w
@@ -1119,13 +1181,33 @@ def reset_structured_astar_corridor(
         env._go2w_structured_corridor_centerline_local = torch.zeros(
             env.num_envs, centerline_count, 2, device=device
         )
-    env._go2w_structured_corridor_start_xy[env_ids] = start_pos_w[:, :2]
+    env._go2w_structured_corridor_start_xy[env_ids] = layout_origin_xy
     env._go2w_structured_corridor_yaw[env_ids] = yaw
     env._go2w_structured_corridor_leg_length[env_ids] = leg_length
     env._go2w_structured_corridor_width[env_ids] = corridor_width
     env._go2w_structured_corridor_waypoint_clearance[env_ids] = robot_inflation
     centerline_tensor = torch.tensor(centerline, dtype=start_pos_w.dtype, device=device)
     env._go2w_structured_corridor_centerline_local[env_ids] = centerline_tensor.unsqueeze(0).expand(n, -1, -1)
+    extra_polylines = structured_corridor_extra_polylines(structured_kind, leg_length, corridor_width)
+    if (
+        not hasattr(env, "_go2w_structured_corridor_extra_polyline_count")
+        or env._go2w_structured_corridor_extra_polyline_count.shape != (env.num_envs,)
+    ):
+        env._go2w_structured_corridor_extra_polyline_count = torch.zeros(
+            env.num_envs, dtype=torch.long, device=device
+        )
+    env._go2w_structured_corridor_extra_polyline_count[env_ids] = len(extra_polylines)
+    if len(extra_polylines) > 0:
+        extra_tensor = torch.tensor(extra_polylines, dtype=start_pos_w.dtype, device=device)
+        if (
+            not hasattr(env, "_go2w_structured_corridor_extra_polylines_local")
+            or env._go2w_structured_corridor_extra_polylines_local.shape
+            != (env.num_envs, len(extra_polylines), extra_tensor.shape[1], 2)
+        ):
+            env._go2w_structured_corridor_extra_polylines_local = torch.zeros(
+                env.num_envs, len(extra_polylines), extra_tensor.shape[1], 2, dtype=start_pos_w.dtype, device=device
+            )
+        env._go2w_structured_corridor_extra_polylines_local[env_ids] = extra_tensor.unsqueeze(0).expand(n, -1, -1, -1)
 
     local_path = plan_structured_corridor_path(
         structured_kind,
@@ -1144,8 +1226,8 @@ def reset_structured_astar_corridor(
     dx = path_local[:, 0].unsqueeze(0)
     dy = path_local[:, 1].unsqueeze(0)
     path_w = torch.zeros(n, path_count, 3, dtype=start_pos_w.dtype, device=device)
-    path_w[:, :, 0] = start_pos_w[:, 0:1] + dx * cos_yaw.unsqueeze(1) - dy * sin_yaw.unsqueeze(1)
-    path_w[:, :, 1] = start_pos_w[:, 1:2] + dx * sin_yaw.unsqueeze(1) + dy * cos_yaw.unsqueeze(1)
+    path_w[:, :, 0] = layout_origin_xy[:, 0:1] + dx * cos_yaw.unsqueeze(1) - dy * sin_yaw.unsqueeze(1)
+    path_w[:, :, 1] = layout_origin_xy[:, 1:2] + dx * sin_yaw.unsqueeze(1) + dy * cos_yaw.unsqueeze(1)
     path_w[:, :, 2] = start_pos_w[:, 2:3]
     env._go2w_navigation_path_direct_goal = True
     set_navigation_path_w(env, env_ids, path_w)
@@ -1155,6 +1237,24 @@ def reset_structured_astar_corridor(
     active_mask = torch.zeros(n, k, dtype=torch.bool, device=device)
     active_mask[:, : wall_count + dynamic_count] = True
     obstacle_yaws = torch.zeros(n, k, device=device)
+    slot_radii = torch.full((k,), 0.25, dtype=start_pos_w.dtype, device=device)
+    if fixed_obstacle_center_zs is not None:
+        if len(fixed_obstacle_center_zs) != k:
+            raise ValueError("Fixed obstacle center z table must contain one value per obstacle slot.")
+        center_z_values = torch.tensor(fixed_obstacle_center_zs, dtype=start_pos_w.dtype, device=device)
+    else:
+        center_z_values = torch.full((k,), obstacle_z, dtype=start_pos_w.dtype, device=device)
+    if (
+        fixed_obstacle_shape_ids is not None
+        and fixed_obstacle_widths is not None
+        and fixed_obstacle_depths is not None
+    ):
+        shape_ids_t = torch.tensor(fixed_obstacle_shape_ids, dtype=torch.long, device=device)
+        widths_t = torch.tensor(fixed_obstacle_widths, dtype=start_pos_w.dtype, device=device)
+        depths_t = torch.tensor(fixed_obstacle_depths, dtype=start_pos_w.dtype, device=device)
+        cuboid_r = torch.sqrt((widths_t * 0.5).square() + (depths_t * 0.5).square())
+        round_r = torch.maximum(widths_t, depths_t) * 0.5
+        slot_radii = torch.where(shape_ids_t == 0, cuboid_r, round_r)
 
     parked_world = start_pos_w.clone()
     parked_world[:, 0] += park_distance
@@ -1162,26 +1262,27 @@ def reset_structured_astar_corridor(
     positions = parked_positions.clone()
 
     for slot_idx, (local_x, local_y, local_yaw, _, _) in enumerate(wall_specs):
-        wx = start_pos_w[:, 0] + local_x * cos_yaw - local_y * sin_yaw
-        wy = start_pos_w[:, 1] + local_x * sin_yaw + local_y * cos_yaw
+        wx = layout_origin_xy[:, 0] + local_x * cos_yaw - local_y * sin_yaw
+        wy = layout_origin_xy[:, 1] + local_x * sin_yaw + local_y * cos_yaw
         positions[:, slot_idx, 0] = wx
         positions[:, slot_idx, 1] = wy
-        positions[:, slot_idx, 2] = obstacle_z
+        positions[:, slot_idx, 2] = center_z_values[slot_idx]
         obstacle_yaws[:, slot_idx] = yaw + local_yaw
 
-    # Spawn dynamic obstacles along the structured centerline, with lateral jitter inside the corridor.
+    # Spawn dynamic obstacles along all corridor segments (nav path + dead-end branches).
     placed_dynamic: list[tuple[float, float]] = []
     rng = random
     half_width = corridor_width * 0.5
-    segments = list(zip(centerline[:-1], centerline[1:]))
+    all_centerlines = (centerline,) + extra_polylines
+    segments = [seg for cl in all_centerlines for seg in zip(cl[:-1], cl[1:])]
     segment_lengths = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in segments]
     total_length = max(sum(segment_lengths), 1.0e-6)
-    lateral_margin = min(0.45, max(0.05, half_width - 0.10))
-    lateral_limit = max(0.05, half_width - lateral_margin)
     goal_local_x, goal_local_y = local_path[-1]
 
-    def sample_corridor_local_point() -> tuple[float, float]:
+    def sample_corridor_local_point(slot_idx: int) -> tuple[float, float]:
         s = rng.uniform(0.0, total_length)
+        slot_radius = float(slot_radii[slot_idx].item())
+        lateral_limit = max(0.05, half_width - slot_radius - 0.15)
         for (a, b), length in zip(segments, segment_lengths):
             if s <= length:
                 t = 0.0 if length <= 1.0e-6 else s / length
@@ -1198,7 +1299,7 @@ def reset_structured_astar_corridor(
         slot_idx = wall_count + dyn_idx
         chosen = None
         for _ in range(80):
-            local_x, local_y = sample_corridor_local_point()
+            local_x, local_y = sample_corridor_local_point(slot_idx)
             if math.hypot(local_x, local_y) < dynamic_start_exclusion_radius:
                 continue
             if math.hypot(local_x - goal_local_x, local_y - goal_local_y) < goal_exclusion_radius:
@@ -1211,11 +1312,21 @@ def reset_structured_astar_corridor(
         if chosen is None:
             chosen = (leg_length * 0.5, 0.0)
         local_x, local_y = chosen
-        positions[:, slot_idx, 0] = start_pos_w[:, 0] + local_x * cos_yaw - local_y * sin_yaw
-        positions[:, slot_idx, 1] = start_pos_w[:, 1] + local_x * sin_yaw + local_y * cos_yaw
-        positions[:, slot_idx, 2] = obstacle_z
+        positions[:, slot_idx, 0] = layout_origin_xy[:, 0] + local_x * cos_yaw - local_y * sin_yaw
+        positions[:, slot_idx, 1] = layout_origin_xy[:, 1] + local_x * sin_yaw + local_y * cos_yaw
+        positions[:, slot_idx, 2] = center_z_values[slot_idx]
         if randomize_obstacle_yaw:
             obstacle_yaws[:, slot_idx] = torch.empty(n, device=device).uniform_(*obstacle_yaw_range)
+
+    if fixed_obstacle_local_poses is not None:
+        for slot_idx, local_x, local_y, local_yaw in fixed_obstacle_local_poses:
+            if slot_idx < 0 or slot_idx >= k:
+                raise ValueError(f"Fixed obstacle local pose slot {slot_idx} is outside the obstacle table.")
+            positions[:, slot_idx, 0] = layout_origin_xy[:, 0] + local_x * cos_yaw - local_y * sin_yaw
+            positions[:, slot_idx, 1] = layout_origin_xy[:, 1] + local_x * sin_yaw + local_y * cos_yaw
+            positions[:, slot_idx, 2] = center_z_values[slot_idx]
+            obstacle_yaws[:, slot_idx] = yaw + local_yaw
+            active_mask[:, slot_idx] = True
 
     set_obstacle_metadata(
         env,
@@ -1228,6 +1339,8 @@ def reset_structured_astar_corridor(
         fixed_obstacle_depths=fixed_obstacle_depths,
         obstacle_yaws=obstacle_yaws,
     )
+    if hasattr(env, "_go2w_hospital_dynamic_initialized"):
+        env._go2w_hospital_dynamic_initialized[env_ids] = False
 
     zero_vel = torch.zeros(n, 6, device=device)
     for slot_idx, name in enumerate(obstacle_names):
@@ -1236,6 +1349,49 @@ def reset_structured_astar_corridor(
         pose[:, 3:7] = yaw_to_quat_wxyz(obstacle_yaws[:, slot_idx])
         env.scene[name].write_root_pose_to_sim(pose, env_ids=env_ids)
         env.scene[name].write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+
+    if ramp_asset_name is not None:
+        ramp = env.scene[ramp_asset_name]
+        pose = torch.zeros(n, 7, device=device)
+        if ramp_local_pose is None:
+            pose[:, 0] = start_pos_w[:, 0] + park_distance
+            pose[:, 1] = start_pos_w[:, 1] + park_distance
+            pose[:, 2] = 0.20
+            pose[:, 3] = 1.0
+        else:
+            # ramp_local_pose is (x, y, yaw, pitch, z) or (x, y, yaw, pitch, z, roll).
+            ramp_pose_ext = tuple(ramp_local_pose) + (0.0,) if len(ramp_local_pose) == 5 else tuple(ramp_local_pose)
+            local_x, local_y, local_yaw, local_pitch, local_z, local_roll = ramp_pose_ext
+            pose[:, 0] = layout_origin_xy[:, 0] + local_x * cos_yaw - local_y * sin_yaw
+            pose[:, 1] = layout_origin_xy[:, 1] + local_x * sin_yaw + local_y * cos_yaw
+            pose[:, 2] = local_z
+            dtype_r = start_pos_w.dtype
+            pitch_t = torch.full((n,), local_pitch, dtype=dtype_r, device=device)
+            roll_t = torch.full((n,), local_roll, dtype=dtype_r, device=device)
+            pose[:, 3:7] = yaw_pitch_roll_to_quat_wxyz(yaw + local_yaw, pitch_t, roll_t)
+        ramp.write_root_pose_to_sim(pose, env_ids=env_ids)
+        ramp.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+
+    if ramp_b_asset_name is not None:
+        ramp_b = env.scene[ramp_b_asset_name]
+        pose = torch.zeros(n, 7, device=device)
+        if ramp_b_local_pose is None:
+            pose[:, 0] = start_pos_w[:, 0] + park_distance
+            pose[:, 1] = start_pos_w[:, 1] + park_distance + 5.0
+            pose[:, 2] = 0.20
+            pose[:, 3] = 1.0
+        else:
+            ramp_b_pose_ext = tuple(ramp_b_local_pose) + (0.0,) if len(ramp_b_local_pose) == 5 else tuple(ramp_b_local_pose)
+            local_x, local_y, local_yaw, local_pitch, local_z, local_roll = ramp_b_pose_ext
+            pose[:, 0] = layout_origin_xy[:, 0] + local_x * cos_yaw - local_y * sin_yaw
+            pose[:, 1] = layout_origin_xy[:, 1] + local_x * sin_yaw + local_y * cos_yaw
+            pose[:, 2] = local_z
+            dtype_r = start_pos_w.dtype
+            pitch_t = torch.full((n,), local_pitch, dtype=dtype_r, device=device)
+            roll_t = torch.full((n,), local_roll, dtype=dtype_r, device=device)
+            pose[:, 3:7] = yaw_pitch_roll_to_quat_wxyz(yaw + local_yaw, pitch_t, roll_t)
+        ramp_b.write_root_pose_to_sim(pose, env_ids=env_ids)
+        ramp_b.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
 
     env._nav_resample_on_goal = functools.partial(
         update_navigation_path_waypoint,

@@ -24,6 +24,7 @@ from .astar import (
 from .navigation_path import (
     set_navigation_path_w,
     update_navigation_path_waypoint,
+    update_navigation_path_waypoint_event,
 )
 from .structured_corridor import (
     structured_corridor_wall_specs,

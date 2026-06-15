@@ -118,11 +118,17 @@ def l_corridor_wall_specs(
 ) -> tuple[tuple[float, float, float, float, float], ...]:
     """Return wall specs as (x, y, yaw, length, thickness) in corridor-local frame."""
     half_width = corridor_width * 0.5
+    outer = leg_length + half_width  # distance from origin to outer corner
+    inner = leg_length - half_width  # distance from origin to inner corner
     return (
-        (leg_length * 0.5, -half_width - wall_thickness * 0.5, 0.0, leg_length + wall_thickness, wall_thickness),
-        ((leg_length - half_width) * 0.5, half_width + wall_thickness * 0.5, 0.0, leg_length - half_width, wall_thickness),
-        (leg_length - half_width - wall_thickness * 0.5, (leg_length + half_width) * 0.5, math.pi * 0.5, leg_length - half_width, wall_thickness),
-        (leg_length + half_width + wall_thickness * 0.5, leg_length * 0.5, math.pi * 0.5, leg_length + wall_thickness, wall_thickness),
+        # bottom of horizontal leg — extended to outer corner
+        (outer * 0.5, -half_width - wall_thickness * 0.5, 0.0, outer + wall_thickness, wall_thickness),
+        # top of horizontal leg — stops at inner corner
+        (inner * 0.5, half_width + wall_thickness * 0.5, 0.0, inner, wall_thickness),
+        # left of vertical leg — starts at inner corner
+        (inner - wall_thickness * 0.5, (leg_length + half_width) * 0.5, math.pi * 0.5, inner, wall_thickness),
+        # right of vertical leg — extended to outer corner
+        (leg_length + half_width + wall_thickness * 0.5, inner * 0.5, math.pi * 0.5, outer + wall_thickness, wall_thickness),
     )
 
 
@@ -138,6 +144,22 @@ def structured_corridor_centerline(
     kind = corridor_kind.lower()
     if kind == "l_corridor":
         return ((0.0, 0.0), (leg_length, 0.0), (leg_length, leg_length))
+    if kind == "t_corridor":
+        # Left-end start → junction → branch tip (right arm is physical dead-end, not traversed).
+        return ((0.0, 0.0), (leg_length, 0.0), (leg_length, leg_length))
+    if kind == "hospital_ward":
+        # Start at main-corridor left end, navigate through 2 T-junctions, goal at branch-2 tip.
+        return ((0.0, 0.0), (2.0 * leg_length, 0.0), (2.0 * leg_length, leg_length))
+    if kind == "hospital_floor":
+        # Entrance/reception -> main corridor -> ward branch -> connector -> elevator alcove.
+        return (
+            (0.0, 0.0),
+            (leg_length, 0.0),
+            (2.0 * leg_length, 0.0),
+            (2.0 * leg_length, leg_length),
+            (3.95 * leg_length, leg_length),
+            (3.95 * leg_length, 1.22 * leg_length),
+        )
     if kind == "serpentine_corridor":
         step = turn_length if turn_length is not None else max(corridor_width * 1.7, leg_length * 0.38)
         return (
@@ -192,6 +214,171 @@ def _line_wall_spec(a: WorldPoint, b: WorldPoint, wall_thickness: float) -> tupl
     )
 
 
+def t_corridor_wall_specs(
+    leg_length: float,
+    corridor_width: float,
+    wall_thickness: float,
+) -> tuple[tuple[float, float, float, float, float], ...]:
+    """T-junction: main corridor (x: 0→2L, y: ±hw) + branch (x: L±hw, y: 0→L+hw).
+
+    Robot navigates left-end → junction → branch tip.  The right arm (L→2L) is a
+    physical dead-end enclosed by walls but not traversed.  Left entrance is open
+    (no end cap) so the robot does not spawn inside a wall.  7 wall segments.
+    """
+    hw = corridor_width * 0.5
+    jx = leg_length
+    ml = 2.0 * leg_length
+    wt = wall_thickness
+    return (
+        _line_wall_spec((-wt * 0.5, -hw), (ml + wt * 0.5, -hw), wt),       # main bottom (full)
+        _line_wall_spec((-wt * 0.5, hw), (jx - hw, hw), wt),               # main top, left of branch
+        _line_wall_spec((jx + hw, hw), (ml + wt * 0.5, hw), wt),           # main top, right of branch
+        _line_wall_spec((ml, -hw), (ml, hw), wt),                          # right end cap
+        _line_wall_spec((jx - hw, hw), (jx - hw, hw + leg_length), wt),    # branch left wall
+        _line_wall_spec((jx + hw, hw), (jx + hw, hw + leg_length), wt),    # branch right wall
+        _line_wall_spec((jx - hw, hw + leg_length), (jx + hw, hw + leg_length), wt),  # branch top cap
+    )
+
+
+def hospital_ward_wall_specs(
+    leg_length: float,
+    corridor_width: float,
+    wall_thickness: float,
+) -> tuple[tuple[float, float, float, float, float], ...]:
+    """Hospital ward: long main corridor (x: 0→3L) with two side branches.
+
+    Branch 1 at x=L (dead-end), branch 2 at x=2L (goal arm).  Robot navigates
+    from the left end of the main corridor through two T-junctions into branch 2.
+    Left entrance is open (no end cap) so the robot does not spawn inside a wall.
+    11 wall segments.
+    """
+    hw = corridor_width * 0.5
+    B1 = leg_length          # branch 1 junction x
+    B2 = 2.0 * leg_length   # branch 2 junction x
+    BL = leg_length          # branch depth
+    ml = 3.0 * leg_length   # total main length
+    wt = wall_thickness
+    return (
+        _line_wall_spec((-wt * 0.5, -hw), (ml + wt * 0.5, -hw), wt),         # main bottom (full)
+        _line_wall_spec((-wt * 0.5, hw), (B1 - hw, hw), wt),                 # main top, left of B1
+        _line_wall_spec((B1 + hw, hw), (B2 - hw, hw), wt),                   # main top, between B1 and B2
+        _line_wall_spec((B2 + hw, hw), (ml + wt * 0.5, hw), wt),             # main top, right of B2
+        _line_wall_spec((ml, -hw), (ml, hw), wt),                            # right end cap
+        _line_wall_spec((B1 - hw, hw), (B1 - hw, hw + BL), wt),             # B1 left wall
+        _line_wall_spec((B1 + hw, hw), (B1 + hw, hw + BL), wt),             # B1 right wall
+        _line_wall_spec((B1 - hw, hw + BL), (B1 + hw, hw + BL), wt),        # B1 top cap
+        _line_wall_spec((B2 - hw, hw), (B2 - hw, hw + BL), wt),             # B2 left wall
+        _line_wall_spec((B2 + hw, hw), (B2 + hw, hw + BL), wt),             # B2 right wall
+        _line_wall_spec((B2 - hw, hw + BL), (B2 + hw, hw + BL), wt),        # B2 top cap
+    )
+
+
+def _subtract_intervals(
+    base: tuple[float, float],
+    blockers: list[tuple[float, float]],
+    eps: float = 1.0e-6,
+) -> list[tuple[float, float]]:
+    """Subtract 1-D blocking intervals from a base interval."""
+    segments = [base]
+    for block_start, block_end in blockers:
+        if block_end <= block_start + eps:
+            continue
+        next_segments: list[tuple[float, float]] = []
+        for seg_start, seg_end in segments:
+            overlap_start = max(seg_start, block_start)
+            overlap_end = min(seg_end, block_end)
+            if overlap_end <= overlap_start + eps:
+                next_segments.append((seg_start, seg_end))
+                continue
+            if seg_start < overlap_start - eps:
+                next_segments.append((seg_start, overlap_start))
+            if overlap_end < seg_end - eps:
+                next_segments.append((overlap_end, seg_end))
+        segments = next_segments
+    return segments
+
+
+def _rect_union_wall_specs(
+    rects: tuple[tuple[float, float, float, float], ...],
+    wall_thickness: float,
+) -> tuple[tuple[float, float, float, float, float], ...]:
+    """Return boundary wall specs for a union of axis-aligned rectangles.
+
+    Rectangles are ``(xmin, xmax, ymin, ymax)`` in local coordinates. Edges
+    covered by another rectangle interior are removed, which keeps T-junctions
+    and room/bay openings passable instead of creating internal blocking walls.
+    """
+    eps = 1.0e-6
+    horizontal: dict[float, list[tuple[float, float]]] = {}
+    vertical: dict[float, list[tuple[float, float]]] = {}
+
+    def _add_h(y: float, x0: float, x1: float) -> None:
+        if x1 > x0 + eps:
+            horizontal.setdefault(round(y, 6), []).append((x0, x1))
+
+    def _add_v(x: float, y0: float, y1: float) -> None:
+        if y1 > y0 + eps:
+            vertical.setdefault(round(x, 6), []).append((y0, y1))
+
+    for idx, (xmin, xmax, ymin, ymax) in enumerate(rects):
+        for y in (ymin, ymax):
+            blockers: list[tuple[float, float]] = []
+            for j, (oxmin, oxmax, oymin, oymax) in enumerate(rects):
+                if j == idx:
+                    continue
+                if oymin + eps < y < oymax - eps:
+                    overlap = (max(xmin, oxmin), min(xmax, oxmax))
+                    if overlap[1] > overlap[0] + eps:
+                        blockers.append(overlap)
+            for x0, x1 in _subtract_intervals((xmin, xmax), blockers, eps):
+                _add_h(y, x0, x1)
+
+        for x in (xmin, xmax):
+            blockers = []
+            for j, (oxmin, oxmax, oymin, oymax) in enumerate(rects):
+                if j == idx:
+                    continue
+                if oxmin + eps < x < oxmax - eps:
+                    overlap = (max(ymin, oymin), min(ymax, oymax))
+                    if overlap[1] > overlap[0] + eps:
+                        blockers.append(overlap)
+            for y0, y1 in _subtract_intervals((ymin, ymax), blockers, eps):
+                _add_v(x, y0, y1)
+
+    specs: list[tuple[float, float, float, float, float]] = []
+    min_len = max(0.35, wall_thickness * 2.0)
+    for y, intervals in horizontal.items():
+        for x0, x1 in sorted(intervals):
+            if x1 - x0 >= min_len:
+                specs.append(_line_wall_spec((x0, y), (x1, y), wall_thickness))
+    for x, intervals in vertical.items():
+        for y0, y1 in sorted(intervals):
+            if y1 - y0 >= min_len:
+                specs.append(_line_wall_spec((x, y0), (x, y1), wall_thickness))
+    return tuple(specs)
+
+
+def hospital_floor_wall_specs(
+    leg_length: float,
+    corridor_width: float,
+    wall_thickness: float,
+) -> tuple[tuple[float, float, float, float, float], ...]:
+    """Combined hospital floor boundary: main hall, bays, ward branch, connector."""
+    hw = corridor_width * 0.5
+    L = leg_length
+    rects = (
+        (0.0, 2.0 * L, -hw, hw),                       # entrance/main corridor
+        (2.0 * L - hw, 2.0 * L + hw, 0.0, L),           # ward branch
+        (2.0 * L, 4.2 * L, L - hw, L + hw),             # long service/ramp connector
+        (0.45 * L, 1.05 * L, -0.65 * L, 0.0),           # reception + waiting bay
+        (1.65 * L, 2.35 * L, -0.70 * L, 0.0),           # emergency/service bay
+        (2.55 * L, 2.95 * L, L, 1.45 * L),              # room doorway spur
+        (2.40 * L, 4.08 * L, 0.58 * L, L),              # imaging/ramp/pharmacy clinical bay
+        (3.70 * L, 4.15 * L, L, 1.38 * L),              # elevator/exit alcove
+    )
+    return _rect_union_wall_specs(rects, wall_thickness)
+
+
 def serpentine_corridor_wall_specs(
     leg_length: float,
     corridor_width: float,
@@ -237,6 +424,12 @@ def structured_corridor_wall_specs(
     kind = corridor_kind.lower()
     if kind == "l_corridor":
         return l_corridor_wall_specs(leg_length, corridor_width, wall_thickness)
+    if kind == "t_corridor":
+        return t_corridor_wall_specs(leg_length, corridor_width, wall_thickness)
+    if kind == "hospital_ward":
+        return hospital_ward_wall_specs(leg_length, corridor_width, wall_thickness)
+    if kind == "hospital_floor":
+        return hospital_floor_wall_specs(leg_length, corridor_width, wall_thickness)
     if kind == "serpentine_corridor":
         return serpentine_corridor_wall_specs(leg_length, corridor_width, wall_thickness, turn_length)
     centerline = structured_corridor_centerline(corridor_kind, leg_length, corridor_width, turn_length)
@@ -257,27 +450,21 @@ def _distance_to_segment(x: float, y: float, a: WorldPoint, b: WorldPoint) -> fl
     return math.hypot(x - px, y - py)
 
 
-def _polyline_corridor_is_free(
-    x: float,
-    y: float,
-    centerline: tuple[WorldPoint, ...],
-    corridor_width: float,
-    robot_inflation: float,
-) -> bool:
-    """Return whether a point lies inside the inflated polyline corridor."""
-    half_width = max(0.05, corridor_width * 0.5 - robot_inflation)
-    return any(_distance_to_segment(x, y, a, b) <= half_width for a, b in zip(centerline[:-1], centerline[1:]))
-
-
 def build_polyline_corridor_grid(
     centerline: tuple[WorldPoint, ...],
     corridor_width: float,
     robot_inflation: float,
     grid_resolution: float,
+    extra_free_polylines: tuple[tuple[WorldPoint, ...], ...] = (),
 ) -> tuple[GridMap2D, WorldPoint, WorldPoint]:
-    """Build an occupancy grid around any polyline corridor."""
-    xs = [p[0] for p in centerline]
-    ys = [p[1] for p in centerline]
+    """Build an occupancy grid around any polyline corridor.
+
+    ``extra_free_polylines`` marks additional corridor branches as free space
+    (e.g. dead-end arms in hospital_ward) without changing start/goal placement.
+    """
+    all_polylines = (centerline,) + extra_free_polylines
+    xs = [p[0] for poly in all_polylines for p in poly]
+    ys = [p[1] for poly in all_polylines for p in poly]
     margin = corridor_width
     x_min = min(xs) - margin
     y_min = min(ys) - margin
@@ -286,14 +473,21 @@ def build_polyline_corridor_grid(
     nx = int(math.ceil((x_max - x_min) / grid_resolution)) + 1
     ny = int(math.ceil((y_max - y_min) / grid_resolution)) + 1
 
+    half_width = max(0.05, corridor_width * 0.5 - robot_inflation)
+
+    def _is_free(x: float, y: float) -> bool:
+        return any(
+            _distance_to_segment(x, y, a, b) <= half_width
+            for poly in all_polylines
+            for a, b in zip(poly[:-1], poly[1:])
+        )
+
     free_grid = [[False for _ in range(ny)] for _ in range(nx)]
     for gx in range(nx):
         for gy in range(ny):
             x = x_min + gx * grid_resolution
             y = y_min + gy * grid_resolution
-            free_grid[gx][gy] = _polyline_corridor_is_free(
-                x, y, centerline, corridor_width, robot_inflation
-            )
+            free_grid[gx][gy] = _is_free(x, y)
 
     first = centerline[0]
     second = centerline[1]
@@ -301,15 +495,54 @@ def build_polyline_corridor_grid(
     prev = centerline[-2]
     start_len = max(math.hypot(second[0] - first[0], second[1] - first[1]), 1.0e-6)
     goal_len = max(math.hypot(last[0] - prev[0], last[1] - prev[1]), 1.0e-6)
+    start_offset = max(0.35, robot_inflation + 0.20)
+    goal_offset = max(0.35, robot_inflation + 0.35)
     start_xy = (
-        first[0] + (second[0] - first[0]) / start_len * 0.35,
-        first[1] + (second[1] - first[1]) / start_len * 0.35,
+        first[0] + (second[0] - first[0]) / start_len * start_offset,
+        first[1] + (second[1] - first[1]) / start_len * start_offset,
     )
     goal_xy = (
-        last[0] - (last[0] - prev[0]) / goal_len * 0.35,
-        last[1] - (last[1] - prev[1]) / goal_len * 0.35,
+        last[0] - (last[0] - prev[0]) / goal_len * goal_offset,
+        last[1] - (last[1] - prev[1]) / goal_len * goal_offset,
     )
     return GridMap2D(free_grid, origin=(x_min, y_min), resolution=grid_resolution), start_xy, goal_xy
+
+
+def structured_corridor_extra_polylines(
+    corridor_kind: str,
+    leg_length: float,
+    corridor_width: float,
+) -> tuple[tuple[WorldPoint, ...], ...]:
+    """Return dead-end branch polylines for free-space marking and obstacle sampling.
+
+    These branches are physically enclosed by walls but not traversed by the
+    navigation path.  They are used to:
+      1. Mark the branch interior as free in the A* grid (robot can enter if needed).
+      2. Distribute dynamic obstacles throughout the full floor layout.
+
+    Returns an empty tuple for corridor kinds with no dead-end branches.
+    """
+    kind = corridor_kind.lower()
+    if kind == "t_corridor":
+        # Right arm: from right-end of main back toward junction (not traversed).
+        jx = leg_length
+        ml = 2.0 * leg_length
+        return (((ml, 0.0), (jx, 0.0)),)
+    if kind == "hospital_ward":
+        # Branch 1 (first T-junction dead-end) — not traversed by the nav path.
+        B1 = leg_length
+        BL = leg_length
+        return (((B1, 0.0), (B1, BL)),)
+    if kind == "hospital_floor":
+        return (
+            ((0.75 * leg_length, 0.0), (0.75 * leg_length, -0.65 * leg_length)),  # reception/waiting bay
+            ((2.0 * leg_length, 0.0), (2.0 * leg_length, -0.70 * leg_length)),  # emergency/service bay
+            ((2.75 * leg_length, leg_length), (2.75 * leg_length, 1.45 * leg_length)),  # room door spur
+            ((2.60 * leg_length, leg_length), (2.60 * leg_length, 0.58 * leg_length)),  # imaging/check bay
+            ((3.28 * leg_length, leg_length), (3.28 * leg_length, 0.62 * leg_length)),  # ramp landing / rehab
+            ((3.84 * leg_length, leg_length), (3.84 * leg_length, 0.58 * leg_length)),  # pharmacy/meds bay
+        )
+    return ()
 
 
 def plan_structured_corridor_path(
@@ -333,8 +566,9 @@ def plan_structured_corridor_path(
     so collision safety is preserved.
     """
     centerline = structured_corridor_centerline(corridor_kind, leg_length, corridor_width, turn_length)
+    extra = structured_corridor_extra_polylines(corridor_kind, leg_length, corridor_width)
     grid, start_xy, goal_xy = build_polyline_corridor_grid(
-        centerline, corridor_width, robot_inflation, grid_resolution
+        centerline, corridor_width, robot_inflation, grid_resolution, extra_free_polylines=extra
     )
     result = plan_astar_path(
         grid,
@@ -359,7 +593,10 @@ def project_polyline_corridor_local(
     """Project points into the union of corridor rectangles around a polyline."""
     if centerline_xy.dim() == 2:
         centerline_xy = centerline_xy.unsqueeze(0).expand(local_xy.shape[0], -1, -1)
-    half_width = corridor_width.view(-1, 1) * 0.5
+    if corridor_width.dim() == 1:
+        half_width = corridor_width.view(-1, 1) * 0.5
+    else:
+        half_width = corridor_width * 0.5
     best_error = torch.full(local_xy.shape[:-1], float("inf"), device=local_xy.device, dtype=local_xy.dtype)
     best_projected = local_xy
     for segment_idx in range(centerline_xy.shape[1] - 1):

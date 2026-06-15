@@ -377,6 +377,8 @@ def local_goal_command_b(
     command_min_forward: float = 0.45,
     command_max_lateral: float = 0.85,
     command_max_heading: float = 0.6,
+    command_turn_slowdown_heading: float = math.inf,
+    command_turn_slowdown_min_forward: float = 0.0,
 ) -> torch.Tensor:
     """Return the current rolling local-waypoint command in the robot yaw frame.
 
@@ -446,6 +448,12 @@ def local_goal_command_b(
     bearing = torch.atan2(raw_xy_b[:, 1], raw_xy_b[:, 0])
     raw_heading = torch.where(near_goal, heading_b, bearing)
     command_heading = raw_heading.clamp(min=-command_max_heading, max=command_max_heading)
+    if math.isfinite(command_turn_slowdown_heading):
+        turn_denom = max(command_max_heading - command_turn_slowdown_heading, 1.0e-6)
+        turn_factor = ((raw_heading.abs() - command_turn_slowdown_heading) / turn_denom).clamp(0.0, 1.0)
+        min_turn_forward = max(command_min_forward, command_turn_slowdown_min_forward)
+        max_forward = lookahead_distance + turn_factor * (min_turn_forward - lookahead_distance)
+        command_x = torch.where(near_goal, command_x, torch.minimum(command_x, max_forward))
 
     command = torch.stack((command_x, command_y, command_heading), dim=-1)
     if nav_debug_enabled():
