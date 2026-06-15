@@ -1264,6 +1264,95 @@ def _resolve_play_seed(args_cli, default_seed: int | None) -> int:
     return (base_seed + random.SystemRandom().randrange(1, 2_147_483_647)) % 2_147_483_647
 
 
+def _init_spl_tracking(
+    base_env, termination_names: list[str]
+) -> tuple[bool, torch.Tensor, torch.Tensor, int | None]:
+    """Initialize SPL tracking state for structured navigation validation."""
+    spl_enabled = hasattr(base_env, "_go2w_navigation_path_s") and hasattr(
+        base_env, "_go2w_navigation_path_count"
+    )
+    nav_optimal_len = torch.zeros(base_env.num_envs)
+    nav_actual_len = torch.zeros(base_env.num_envs)
+    goal_reached_term_idx: int | None = (
+        termination_names.index("structured_goal_reached")
+        if "structured_goal_reached" in termination_names
+        else None
+    )
+    if spl_enabled:
+        for ei in range(base_env.num_envs):
+            pc = int(base_env._go2w_navigation_path_count[ei].item())
+            if pc > 0:
+                nav_optimal_len[ei] = float(base_env._go2w_navigation_path_s[ei, pc - 1].item())
+    return spl_enabled, nav_optimal_len, nav_actual_len, goal_reached_term_idx
+
+
+def _init_nav_markers(
+    base_env, args_cli: argparse.Namespace
+) -> tuple:
+    """Create navigation visualization markers; returns None markers for non-nav tasks."""
+    nav_goal_marker = None
+    nav_final_goal_marker = None
+    nav_start_marker = None
+    nav_path_marker = None
+    has_goal_markers = hasattr(base_env, "_go2w_goal_pos_w") and hasattr(base_env, "_go2w_start_pos_w")
+    has_astar_markers = (
+        not args_cli.no_astar
+        and hasattr(base_env, "_go2w_navigation_path_w")
+        and hasattr(base_env, "_go2w_navigation_path_count")
+    )
+    if has_goal_markers:
+        nav_goal_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/NavGoalMarker",
+                markers={
+                    "sphere": sim_utils.SphereCfg(
+                        radius=0.30,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.9, 0.1)),
+                    ),
+                },
+            )
+        )
+        nav_start_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/NavStartMarker",
+                markers={
+                    "sphere": sim_utils.SphereCfg(
+                        radius=0.20,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.5, 1.0)),
+                    ),
+                },
+            )
+        )
+        if has_astar_markers:
+            nav_final_goal_marker = VisualizationMarkers(
+                VisualizationMarkersCfg(
+                    prim_path="/Visuals/NavFinalGoalMarker",
+                    markers={
+                        "sphere": sim_utils.SphereCfg(
+                            radius=0.22,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.05, 0.02)),
+                        ),
+                    },
+                )
+            )
+            nav_path_marker = VisualizationMarkers(
+                VisualizationMarkersCfg(
+                    prim_path="/Visuals/NavPathMarker",
+                    markers={
+                        "line": sim_utils.CylinderCfg(
+                            radius=0.025,
+                            height=1.0,
+                            visual_material=sim_utils.PreviewSurfaceCfg(
+                                diffuse_color=(1.0, 0.9, 0.0),
+                                roughness=1.0,
+                            ),
+                        ),
+                    },
+                )
+            )
+    return nav_goal_marker, nav_final_goal_marker, nav_start_marker, nav_path_marker, has_goal_markers
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -1420,88 +1509,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Navigation visualization markers — only created for nav tasks.
     _base_env = env.unwrapped
 
-    # --- SPL tracking (structured navigation validation) ---
-    # SPL = (1/N) Σ sᵢ × lᵢ / max(pᵢ, lᵢ)
-    #   sᵢ = episode success (structured_goal_reached)
-    #   lᵢ = A* optimal path length (arc length stored in _go2w_navigation_path_s)
-    #   pᵢ = actual robot displacement accumulated over the episode
-    _spl_enabled = hasattr(_base_env, "_go2w_navigation_path_s") and hasattr(
-        _base_env, "_go2w_navigation_path_count"
+    # SPL = (1/N) Σ sᵢ × lᵢ / max(pᵢ, lᵢ) — initialized from first A* path lengths.
+    _spl_enabled, _nav_optimal_len, _nav_actual_len, _goal_reached_term_idx = (
+        _init_spl_tracking(_base_env, termination_names)
     )
-    _nav_optimal_len = torch.zeros(_base_env.num_envs)   # optimal path length per env
-    _nav_actual_len = torch.zeros(_base_env.num_envs)    # accumulated displacement per env
     _nav_prev_robot_pos: torch.Tensor | None = None
     _nav_spl_history: list[float] = []
-    _goal_reached_term_idx: int | None = (
-        termination_names.index("structured_goal_reached")
-        if "structured_goal_reached" in termination_names
-        else None
-    )
-    if _spl_enabled:
-        for ei in range(_base_env.num_envs):
-            pc = int(_base_env._go2w_navigation_path_count[ei].item())
-            if pc > 0:
-                _nav_optimal_len[ei] = float(_base_env._go2w_navigation_path_s[ei, pc - 1].item())
-    _nav_goal_marker = None
-    _nav_final_goal_marker = None
-    _nav_start_marker = None
-    _nav_path_marker = None
-    _nav_has_goal_markers = hasattr(_base_env, "_go2w_goal_pos_w") and hasattr(_base_env, "_go2w_start_pos_w")
-    _nav_has_astar_markers = (
-        not args_cli.no_astar
-        and hasattr(_base_env, "_go2w_navigation_path_w")
-        and hasattr(_base_env, "_go2w_navigation_path_count")
-    )
-    if _nav_has_goal_markers:
-        _nav_goal_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/NavGoalMarker",
-                markers={
-                    "sphere": sim_utils.SphereCfg(
-                        radius=0.30,
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.9, 0.1)),
-                    ),
-                },
-            )
-        )
-        _nav_start_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/NavStartMarker",
-                markers={
-                    "sphere": sim_utils.SphereCfg(
-                        radius=0.20,
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.5, 1.0)),
-                    ),
-                },
-            )
-        )
-        if _nav_has_astar_markers:
-            _nav_final_goal_marker = VisualizationMarkers(
-                VisualizationMarkersCfg(
-                    prim_path="/Visuals/NavFinalGoalMarker",
-                    markers={
-                        "sphere": sim_utils.SphereCfg(
-                            radius=0.22,
-                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.05, 0.02)),
-                        ),
-                    },
-                )
-            )
-            _nav_path_marker = VisualizationMarkers(
-                VisualizationMarkersCfg(
-                    prim_path="/Visuals/NavPathMarker",
-                    markers={
-                        "line": sim_utils.CylinderCfg(
-                            radius=0.025,
-                            height=1.0,
-                            visual_material=sim_utils.PreviewSurfaceCfg(
-                                diffuse_color=(1.0, 0.9, 0.0),
-                                roughness=1.0,
-                            ),
-                        ),
-                    },
-                )
-            )
+    (
+        _nav_goal_marker, _nav_final_goal_marker, _nav_start_marker, _nav_path_marker,
+        _nav_has_goal_markers,
+    ) = _init_nav_markers(_base_env, args_cli)
 
     # play output directory setup
     _out_dir: str | None = None
