@@ -152,7 +152,7 @@ def hospital_floor_semantic_local_poses(
         slot(1,  2.58 * L,  0.72 * L, math.pi * 0.5),  # elderly patient (imaging bay)
         slot(2,  1.44 * L, -1.35, 0.0),                # guardian/adult (near south wall)
         slot(3,  1.49 * L, -1.35, 0.0),                # child with guardian
-        slot(18, 1.60 * L,  1.55, 0.0),                # trash bin (corridor wall)
+        slot(18, 1.60 * L,  1.45, 0.0),                # trash bin (corridor wall)
         slot(19, 2.60 * L,  L - 2.5, 0.0),             # table (imaging/check bay)
     )
 

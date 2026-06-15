@@ -136,7 +136,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wHospitalPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.go2w_hospital_env_cfg:Go2wHospitalPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
     },
 )
@@ -146,7 +146,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wHospitalDepthPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.go2w_hospital_env_cfg:Go2wHospitalDepthPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
@@ -156,7 +156,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wHospitalWardDepthPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.go2w_hospital_env_cfg:Go2wHospitalWardDepthPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
@@ -166,7 +166,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wHospitalFloorDepthPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.go2w_hospital_env_cfg:Go2wHospitalFloorDepthPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
