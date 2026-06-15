@@ -36,6 +36,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
+from matplotlib.transforms import Affine2D
 import numpy as np
 
 # ── mdp module loader (no Isaac Lab needed) ───────────────────────────────────
@@ -79,6 +80,14 @@ _LINE_RE = re.compile(
     r"\s+final=\(([+\-\d.]+),([+\-\d.]+)\)"
 )
 
+_OBS_RE = re.compile(
+    r"\[GO2W_NAV_OBSTACLES\]"
+    r"\s+step=(\d+)"
+    r"\s+env=(\d+)"
+    r"\s+active_count=(\d+)"
+    r"\s+obstacles=(.*)"
+)
+
 
 def parse_log(path: str, env_filter: int) -> list[dict]:
     records = []
@@ -106,6 +115,43 @@ def parse_log(path: str, env_filter: int) -> list[dict]:
     return records
 
 
+def parse_obstacle_snapshots(path: str, env_filter: int) -> list[dict]:
+    """Parse labeled obstacle snapshots emitted by play.py."""
+    snapshots = []
+    with open(path) as f:
+        for line in f:
+            m = _OBS_RE.search(line)
+            if not m:
+                continue
+            if int(m.group(2)) != env_filter:
+                continue
+            obstacles = []
+            raw = m.group(4).strip()
+            if raw:
+                for item in raw.split(";"):
+                    fields = item.split(":")
+                    if len(fields) < 6:
+                        continue
+                    try:
+                        obstacles.append({
+                            "name": fields[0],
+                            "label": fields[1],
+                            "x": float(fields[2]),
+                            "y": float(fields[3]),
+                            "width": float(fields[4]),
+                            "depth": float(fields[5]),
+                        })
+                    except ValueError:
+                        continue
+            snapshots.append({
+                "step": int(m.group(1)),
+                "active_count": int(m.group(3)),
+                "obstacles": obstacles,
+            })
+    snapshots.sort(key=lambda r: r["step"])
+    return snapshots
+
+
 # ── corridor grid + A* path reconstruction ───────────────────────────────────
 
 def build_corridor_and_path(
@@ -116,6 +162,8 @@ def build_corridor_and_path(
     grid_resolution: float,
     clearance_cost_weight: float,
     clearance_cost_sigma: float,
+    corner_rounding: bool,
+    corner_radius: float,
 ):
     """Return (occ_image, extent, astar_raw_path, astar_sparse_path) or raise."""
     _astar = _load_mdp("astar")
@@ -132,7 +180,17 @@ def build_corridor_and_path(
         clearance_cost_sigma=clearance_cost_sigma,
     )
     raw    = result.points
-    sparse = _corr._sparsify_preserve_turns(raw, 0.35)
+    sparse = _corr.plan_structured_corridor_path(
+        corridor_kind,
+        leg_length,
+        corridor_width,
+        robot_inflation,
+        grid_resolution,
+        clearance_cost_weight=clearance_cost_weight,
+        clearance_cost_sigma=clearance_cost_sigma,
+        corner_rounding=corner_rounding,
+        corner_radius=corner_radius,
+    )
 
     # occupancy image
     arr = np.zeros((grid.height, grid.width), dtype=float)
@@ -149,6 +207,54 @@ def build_corridor_and_path(
 
 # ── combined plot ─────────────────────────────────────────────────────────────
 
+def _polyline_sample_at_s(points: list, target_s: float) -> tuple[float, float]:
+    """Sample a 2D polyline by arc length."""
+    if not points:
+        return (0.0, 0.0)
+    if len(points) == 1 or target_s <= 0.0:
+        return points[0]
+    traveled = 0.0
+    for p0, p1 in zip(points[:-1], points[1:]):
+        seg_len = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        if seg_len <= 1.0e-9:
+            continue
+        if traveled + seg_len >= target_s:
+            u = max(0.0, min(1.0, (target_s - traveled) / seg_len))
+            return (p0[0] + (p1[0] - p0[0]) * u, p0[1] + (p1[1] - p0[1]) * u)
+        traveled += seg_len
+    return points[-1]
+
+
+def _infer_local_to_world(records: list[dict], local_path: list | None) -> Affine2D:
+    """Infer the structured-corridor local→world transform from logged path points."""
+    if not records or not local_path or len(local_path) < 2:
+        return Affine2D()
+    first = records[0]
+    local_anchor = _polyline_sample_at_s(local_path, first["target_s"])
+    local_final = local_path[-1]
+    world_anchor = (first["target_x"], first["target_y"])
+    world_final = (first["final_x"], first["final_y"])
+
+    local_vec = (local_final[0] - local_anchor[0], local_final[1] - local_anchor[1])
+    world_vec = (world_final[0] - world_anchor[0], world_final[1] - world_anchor[1])
+    local_len = math.hypot(*local_vec)
+    world_len = math.hypot(*world_vec)
+    if local_len <= 1.0e-6 or world_len <= 1.0e-6:
+        return Affine2D()
+
+    theta = math.atan2(world_vec[1], world_vec[0]) - math.atan2(local_vec[1], local_vec[0])
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    tx = world_anchor[0] - (local_anchor[0] * cos_t - local_anchor[1] * sin_t)
+    ty = world_anchor[1] - (local_anchor[0] * sin_t + local_anchor[1] * cos_t)
+    return Affine2D().rotate(theta).translate(tx, ty)
+
+
+def _transform_points(points: list | None, transform: Affine2D) -> list | None:
+    if not points:
+        return points
+    return [tuple(transform.transform_point((p[0], p[1]))) for p in points]
+
 def plot_combined(
     records: list[dict],
     env_id: int,
@@ -156,6 +262,7 @@ def plot_combined(
     extent: list[float] | None,
     astar_raw: list | None,
     astar_sparse: list | None,
+    obstacle_snapshots: list[dict] | None,
     out_path: Path,
     show: bool,
 ) -> None:
@@ -194,17 +301,76 @@ def plot_combined(
     ax_look = fig.add_subplot(gs[1, 2])
 
     # ── Map ──────────────────────────────────────────────────────────────────
+    local_to_world = _infer_local_to_world(records, astar_sparse or astar_raw)
     if occ is not None and extent is not None:
-        ax_map.imshow(occ, origin="lower", extent=extent, cmap="gray", vmin=0, vmax=1, alpha=0.40)
+        ax_map.imshow(
+            occ,
+            origin="lower",
+            extent=extent,
+            cmap="gray",
+            vmin=0,
+            vmax=1,
+            alpha=0.40,
+            transform=local_to_world + ax_map.transData,
+        )
+        corners = [
+            (extent[0], extent[2]),
+            (extent[0], extent[3]),
+            (extent[1], extent[2]),
+            (extent[1], extent[3]),
+        ]
+        ax_map.update_datalim(local_to_world.transform(corners))
 
     # A* planned path
+    astar_raw_w = None
+    astar_sparse_w = None
     if astar_raw:
-        xs, ys = zip(*astar_raw)
+        astar_raw_w = _transform_points(astar_raw, local_to_world)
+        xs, ys = zip(*astar_raw_w)
         ax_map.plot(xs, ys, color="#888800", linewidth=1.2, alpha=0.55, label="A* path (raw)", zorder=2)
     if astar_sparse:
-        xs, ys = zip(*astar_sparse)
+        astar_sparse_w = _transform_points(astar_sparse, local_to_world)
+        xs, ys = zip(*astar_sparse_w)
         ax_map.plot(xs, ys, "o--", color="#aaaa00", markersize=5, linewidth=1.5,
                     alpha=0.85, label=f"A* sparse ({len(astar_sparse)} wpts)", zorder=3)
+
+    if obstacle_snapshots:
+        latest_obs = obstacle_snapshots[-1]
+        obs = latest_obs.get("obstacles", [])
+        if obs:
+            ox = [o["x"] for o in obs]
+            oy = [o["y"] for o in obs]
+            ax_map.scatter(
+                ox, oy, s=26, marker="s", facecolors="none", edgecolors="#111111",
+                linewidths=0.7, zorder=6, label=f"labeled obstacles (step {latest_obs['step']})",
+            )
+            _placed_xy: list[tuple[float, float]] = []
+            _label_r = 2.0
+            _label_col_dist = 1.4
+            _n_ang = 48
+            centroid_x = sum(o["x"] for o in obs) / len(obs)
+            centroid_y = sum(o["y"] for o in obs) / len(obs)
+            for o in obs:
+                cx, cy = o["x"], o["y"]
+                dx_c, dy_c = cx - centroid_x, cy - centroid_y
+                base_angle = math.atan2(dy_c, dx_c) if (abs(dx_c) + abs(dy_c)) > 0.01 else math.pi / 2
+                best_tx = cx + _label_r * math.cos(base_angle)
+                best_ty = cy + _label_r * math.sin(base_angle)
+                for k in range(_n_ang):
+                    angle = base_angle + 2 * math.pi * k / _n_ang
+                    tx = cx + _label_r * math.cos(angle)
+                    ty = cy + _label_r * math.sin(angle)
+                    if not any(math.hypot(tx - px, ty - py) < _label_col_dist for px, py in _placed_xy):
+                        best_tx, best_ty = tx, ty
+                        break
+                _placed_xy.append((best_tx, best_ty))
+                ax_map.annotate(
+                    o["label"],
+                    xy=(cx, cy), xytext=(best_tx, best_ty),
+                    fontsize=6.5, color="#111111", ha="center", va="center", zorder=7,
+                    arrowprops={"arrowstyle": "-", "color": "#aaaaaa", "lw": 0.5},
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.78, "pad": 0.6},
+                )
 
     # robot trajectory (color = time)
     sc_robot = ax_map.scatter(robot_x, robot_y, c=steps, cmap="plasma",
@@ -222,6 +388,19 @@ def plot_combined(
     ax_map.set_xlabel("x (m)")
     ax_map.set_ylabel("y (m)")
     ax_map.set_aspect("equal")
+    # Zoom to actual navigation data rather than the full corridor grid extent.
+    _data_xs = list(robot_x) + list(target_x) + [final_x]
+    _data_ys = list(robot_y) + list(target_y) + [final_y]
+    if astar_raw_w:
+        _data_xs += [p[0] for p in astar_raw_w]
+        _data_ys += [p[1] for p in astar_raw_w]
+    if obstacle_snapshots:
+        for _o in obstacle_snapshots[-1].get("obstacles", []):
+            _data_xs.append(_o["x"])
+            _data_ys.append(_o["y"])
+    _pad = max(2.0, (max(_data_xs) - min(_data_xs)) * 0.08, (max(_data_ys) - min(_data_ys)) * 0.08)
+    ax_map.set_xlim(min(_data_xs) - _pad, max(_data_xs) + _pad)
+    ax_map.set_ylim(min(_data_ys) - _pad, max(_data_ys) + _pad)
     ax_map.legend(fontsize=8, loc="upper left")
 
     # ── progress_s ───────────────────────────────────────────────────────────
@@ -322,7 +501,7 @@ def main() -> None:
     ap.add_argument("--show", action="store_true")
     # corridor grid + A* reconstruction
     ap.add_argument("--corridor", default=None,
-                    choices=["l_corridor", "serpentine_corridor"],
+                    choices=["l_corridor", "serpentine_corridor", "t_corridor", "hospital_ward", "hospital_floor"],
                     help="Reconstruct A* path and corridor grid for overlay")
     ap.add_argument("--leg_length", type=float, default=6.0)
     ap.add_argument("--corridor_width", type=float, default=1.8)
@@ -330,6 +509,8 @@ def main() -> None:
     ap.add_argument("--grid_resolution", type=float, default=0.14)
     ap.add_argument("--alpha", type=float, default=2.0, help="clearance_cost_weight")
     ap.add_argument("--sigma", type=float, default=0.4, help="clearance_cost_sigma")
+    ap.add_argument("--corner_rounding", action="store_true", help="Match rounded-corner structured play paths.")
+    ap.add_argument("--corner_radius", type=float, default=0.80)
     args = ap.parse_args()
 
     log_path = Path(args.log)
@@ -344,9 +525,16 @@ def main() -> None:
     if not records:
         print("No [GO2W_NAV_PATH] lines found. Run with GO2W_NAV_DEBUG=1.", file=sys.stderr)
         sys.exit(1)
+    obstacle_snapshots = parse_obstacle_snapshots(str(log_path), env_filter=args.env)
 
     print(f"\n[env {args.env}] parsed {len(records)} records from {log_path.name}")
     print_summary(records)
+    if obstacle_snapshots:
+        latest = obstacle_snapshots[-1]
+        print(
+            f"  obstacle labels: {latest['active_count']} active labeled obstacles "
+            f"from step {latest['step']}"
+        )
 
     occ = extent = astar_raw = astar_sparse = None
     if args.corridor:
@@ -356,13 +544,14 @@ def main() -> None:
                 args.corridor, args.leg_length, args.corridor_width,
                 args.robot_inflation, args.grid_resolution,
                 args.alpha, args.sigma,
+                args.corner_rounding, args.corner_radius,
             )
             print(f"  A* path: {len(astar_raw)} raw, {len(astar_sparse)} sparse waypoints")
         except Exception as exc:
             print(f"  [warn] A* reconstruction failed: {exc}")
 
     out_path = out_dir / f"{log_path.stem}_env{args.env}.png"
-    plot_combined(records, args.env, occ, extent, astar_raw, astar_sparse, out_path, args.show)
+    plot_combined(records, args.env, occ, extent, astar_raw, astar_sparse, obstacle_snapshots, out_path, args.show)
     print(f"\nDone.")
 
 

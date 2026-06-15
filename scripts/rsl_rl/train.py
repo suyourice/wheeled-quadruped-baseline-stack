@@ -75,6 +75,18 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
+
+def _reject_play_task_for_training(task_name: str | None) -> None:
+    """Prevent accidentally training with evaluation/play environment configs."""
+    if task_name is not None and "-Play" in task_name:
+        raise ValueError(
+            f"Refusing to train a Play task: {task_name}\n"
+            "Use scripts/rsl_rl/play.py for Play tasks, or choose a non-Play training task."
+        )
+
+
+_reject_play_task_for_training(args_cli.task)
+
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True

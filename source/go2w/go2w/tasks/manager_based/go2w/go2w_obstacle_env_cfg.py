@@ -31,239 +31,175 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCameraCfg, MultiMeshRayCasterCfg
 from isaaclab.sensors.ray_caster import patterns
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from . import mdp
+from .mdp.hospital import events as _hospital_events
+from .mdp.hospital import specs as _hospital_specs
+from .mdp.hospital.floor import (
+    HOSPITAL_RAMP_ASSET_NAME,
+    HOSPITAL_RAMP_B_ASSET_NAME,
+    make_hospital_ramp_cfg as _make_hospital_ramp_cfg,
+    make_hospital_ramp_b_cfg as _make_hospital_ramp_b_cfg,
+    HOSPITAL_FLOOR_CORRIDOR_KIND,
+    HOSPITAL_FLOOR_LEG_LENGTH,
+    HOSPITAL_FLOOR_CORRIDOR_WIDTH,
+    HOSPITAL_FLOOR_WALL_THICKNESS,
+    HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
+    HOSPITAL_FLOOR_EPISODE_LENGTH_S,
+    HOSPITAL_FLOOR_ENV_SPACING,
+    HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
+    HOSPITAL_FLOOR_GOAL_DONE_RADIUS,
+    HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
+    HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
+    hospital_floor_semantic_local_poses as _hospital_floor_semantic_local_poses,
+    hospital_floor_queue_groups as _hospital_floor_queue_groups,
+    hospital_floor_seated_groups as _hospital_floor_seated_groups,
+)
 from .go2w_env_cfg import EventCfg, Go2wEnvCfg, Go2wSceneCfg
-from .mdp.obstacle_geometry import (
-    OBSTACLE_SHAPE_CONE,
-    OBSTACLE_SHAPE_CUBOID,
-    OBSTACLE_SHAPE_CYLINDER,
-)
 
-# =============================================================================
-# Constants
-# =============================================================================
-
-# Physical obstacle slots
-TRAIN_PHYSICAL_OBSTACLE_SLOTS = 15
-PLAY_PHYSICAL_OBSTACLE_SLOTS = 48
-PLAY_DEFAULT_ACTIVE_OBSTACLES = 5
-
-# Convenience aliases
-NUM_OBSTACLES = TRAIN_PHYSICAL_OBSTACLE_SLOTS
-PRIVILEGED_OBSTACLE_SLOTS = 15
-PLAY_MAX_OBSTACLES = PLAY_PHYSICAL_OBSTACLE_SLOTS
-PLAY_NUM_OBSTACLES = PLAY_DEFAULT_ACTIVE_OBSTACLES
-PLAY_MIN_INTER_OBSTACLE_DIST = 0.7
-
-OBSTACLE_SIZE = (0.3, 0.3, 0.5)
-# Fixed physical assets used as a randomized training pool. Most slots retain
-# the familiar baseline box; the remaining slots introduce real shape/size diversity.
-TRAIN_OBSTACLE_SPECS = (
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.30, 0.30)),
-    ("cuboid", (0.18, 0.24)),
-    ("cuboid", (0.46, 0.30)),
-    ("cuboid", (0.46, 0.46)),
-    ("cylinder", (0.44, 0.44)),
-    ("cone", (0.54, 0.54)),
-)
-_SHAPE_ID_BY_KIND = {
-    "cuboid": OBSTACLE_SHAPE_CUBOID,
-    "cylinder": OBSTACLE_SHAPE_CYLINDER,
-    "cone": OBSTACLE_SHAPE_CONE,
-}
-TRAIN_OBSTACLE_SHAPE_IDS = tuple(_SHAPE_ID_BY_KIND[kind] for kind, _ in TRAIN_OBSTACLE_SPECS)
-TRAIN_OBSTACLE_WIDTHS = tuple(size[0] for _, size in TRAIN_OBSTACLE_SPECS)
-TRAIN_OBSTACLE_DEPTHS = tuple(size[1] for _, size in TRAIN_OBSTACLE_SPECS)
-PLAY_OBSTACLE_SPECS = TRAIN_OBSTACLE_SPECS + (
-    ("cuboid", (OBSTACLE_SIZE[0], OBSTACLE_SIZE[1])),
-) * (PLAY_PHYSICAL_OBSTACLE_SLOTS - TRAIN_PHYSICAL_OBSTACLE_SLOTS)
-PLAY_OBSTACLE_SHAPE_IDS = tuple(_SHAPE_ID_BY_KIND[kind] for kind, _ in PLAY_OBSTACLE_SPECS)
-PLAY_OBSTACLE_WIDTHS = tuple(size[0] for _, size in PLAY_OBSTACLE_SPECS)
-PLAY_OBSTACLE_DEPTHS = tuple(size[1] for _, size in PLAY_OBSTACLE_SPECS)
-# Float the (kinematic, gravity-disabled) obstacles slightly above the floor so
-# they never register an obstacle-to-ground contact. Without this, every asset rests on
-# z = OBSTACLE_SIZE[2]/2 and the obstacle contact sensor fires on the ground
-# reaction on every step (even in the empty scenario with obstacles parked away).
-# Each asset still spans the robot collision height, so robot-to-obstacle
-# contacts are detected normally.
-OBSTACLE_GROUND_CLEARANCE = 0.05
-OBSTACLE_Z = OBSTACLE_SIZE[2] / 2 + OBSTACLE_GROUND_CLEARANCE
-OBSTACLE_SPAWN_RANGE = {"x": (-3.5, 3.5), "y": (-2.5, 2.5)}
-OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(TRAIN_PHYSICAL_OBSTACLE_SLOTS)]
-PLAY_OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(PLAY_PHYSICAL_OBSTACLE_SLOTS)]
-
-CURRICULUM_STEPS_PER_ITERATION = 128
-CURRICULUM_OBSTACLE_START_ITERATION = 1700
-CURRICULUM_OBSTACLE_WARMUP_ITERATIONS = 1000
-CURRICULUM_COLLISION_WARMUP_ITERATIONS = 300
-CURRICULUM_SPEED_START_ITERATION = 0
-CURRICULUM_SPEED_WARMUP_ITERATIONS = 800
-NAV_CURRICULUM_COLLISION_START_ITERATION = 0
-OBSTACLE_MIN_SPAWN_DISTANCE_INITIAL = 2.2
-OBSTACLE_MIN_SPAWN_DISTANCE_FROM_ROBOT = 1.2
-OBSTACLE_LIN_VEL_X = (-2.0, 2.0)
-OBSTACLE_LIN_VEL_Y = (-2.0, 2.0)
-OBSTACLE_ANG_VEL_Z = (-2.0, 2.0)
-OBSTACLE_COLLISION_WEIGHT = -40.0
-NAV_TTC_FALLBACK_OBSTACLE_RADIUS = 0.22  # Used only if physical footprint metadata is unavailable.
-NAV_TTC_ROBOT_HALF_WIDTH = 0.30     # Wheels reach ~0.22 m from center; extra width covers gait/body sway.
-NAV_TTC_SAFETY_MARGIN = 0.05        # Keeps edge intrusions soft without blocking narrow-gap entries.
-NAV_TTC_FRONT_MARGIN = 0.20         # Approximate front half-length plus a small contact buffer.
-NAV_TTC_LOOKAHEAD_DISTANCE = 2.2    # About 1.1 s at 2.0 m/s, enough to turn without over-penalizing distant gaps.
-NAV_TTC_SUM_CLIP = 1.5              # Caps dense TTC cost when several obstacles overlap the same corridor.
-NAV_OBSTACLE_RADIUS_MARGIN = 0.03
-NAV_PHYSICAL_SLOT_RANDOMIZATION_START_ITERATION = 500
-NAV_PHYSICAL_SLOT_RANDOMIZATION_WARMUP_ITERATIONS = 500
-NAV_RANDOMIZE_OBSTACLE_YAW = True
-NAV_OBSTACLE_YAW_RANGE = (-math.pi, math.pi)
-NAV_PASSABLE_GAP_ROBOT_WIDTH = 0.44
-NAV_PASSABLE_GAP_MIN_WIDTH = 0.50
-
-# Navigation task geometry
-NAV_GOAL_FORWARD_RANGE = (2.5, 4.5)
-NAV_GOAL_LATERAL_RANGE = (-1.5, 1.5)
-NAV_GOAL_HEADING_JITTER_RANGE = (-0.35, 0.35)
-NAV_MIN_GOAL_DISTANCE = 2.0
-NAV_START_EXCLUSION_RADIUS = 1.0
-NAV_GOAL_EXCLUSION_RADIUS = 0.9
-NAV_HEAD_ON_PROGRESS_RANGE = (0.2, 0.85)
-NAV_HEAD_ON_LATERAL_RANGE = (-0.25, 0.25)
-NAV_EDGE_PROGRESS_RANGE = (0.25, 0.8)
-NAV_EDGE_LATERAL_RANGE = (0.55, 1.1)
-NAV_DIAGONAL_PROGRESS_RANGE = (0.15, 0.7)
-NAV_DIAGONAL_LATERAL_RANGE = (0.8, 1.6)
-NAV_OFFPATH_PROGRESS_RANGE = (0.3, 0.9)
-NAV_OFFPATH_LATERAL_RANGE = (1.3, 2.2)
-NAV_NARROW_GAP_PROGRESS_RANGE = (0.35, 0.75)
-NAV_NARROW_GAP_CENTER_LATERAL_RANGE = (-0.15, 0.15)
-NAV_NARROW_GAP_HALF_WIDTH_RANGE = (0.45, 0.65)
-NAV_NARROW_GAP_WIDE_HALF_WIDTH_RANGE = (0.60, 0.80)
-NAV_NARROW_GAP_BARELY_HALF_WIDTH_RANGE = (0.40, 0.52)  # Geometry filtering rejects samples below the passable free width.
-NAV_NARROW_GAP_PROBABILITY = 0.25
-NAV_PARTIAL_BLOCKAGE_PROGRESS_RANGE = (0.2, 0.75)
-NAV_PARTIAL_BLOCKAGE_LATERAL_RANGE = (0.5, 1.15)
-NAV_PARTIAL_BLOCKAGE_PROBABILITY = 0.20
-NAV_CLUTTERED_PROGRESS_RANGE = (0.15, 0.85)
-NAV_CLUTTERED_LATERAL_RANGE = (-1.2, 1.2)
-
-# Curriculum phase schedule: maps start_iteration → tuple of template names available.
-# Phase 0 (from iter 0): basic 7 templates + standard narrow gap.
-# Phase 1 (from iter 500): add partial blockage variants.
-# Phase 2 (from iter 1000): add wide/barely narrow gap variants + cluttered corridor.
-NAV_CURRICULUM_PHASE_SCHEDULE = {
-    "0": (
-        "head_on", "left_edge", "right_edge",
-        "diag_left", "diag_right", "off_left", "off_right",
-        "narrow_gap",
-    ),
-    "500": (
-        "head_on", "left_edge", "right_edge",
-        "diag_left", "diag_right", "off_left", "off_right",
-        "narrow_gap",
-        "partial_blockage_left_open", "partial_blockage_right_open",
-    ),
-    "1000": (
-        "head_on", "left_edge", "right_edge",
-        "diag_left", "diag_right", "off_left", "off_right",
-        "narrow_gap", "narrow_gap_wide", "narrow_gap_barely",
-        "partial_blockage_left_open", "partial_blockage_right_open",
-        "cluttered",
-    ),
-}
-
-NAV_GOAL_HEADING_STD = 0.8
-NAV_GOAL_SUCCESS_POSITION_THRESHOLD = 0.35
-NAV_GOAL_SUCCESS_HEADING_THRESHOLD = 0.6
-
-# Local waypoint shaping for obs terms
-NAV_WAYPOINT_LOOKAHEAD_DISTANCE = 1.25
-NAV_WAYPOINT_GOAL_SNAP_DISTANCE = 1.0
-NAV_WAYPOINT_REFINEMENT_OFFSETS = (0.0, 0.45, -0.45, 0.70, -0.70)
-NAV_LOCAL_PLANNER_ACTIVATION_THRESHOLD = 0.22
-NAV_LOCAL_PLANNER_LATERAL_PENALTY = 0.16
-NAV_LOCAL_PLANNER_MIN_IMPROVEMENT = 0.07
-NAV_LOCAL_PLANNER_MAX_BLEND = 0.65
-NAV_WAYPOINT_COMMAND_MIN_FORWARD = 0
-NAV_WAYPOINT_COMMAND_MAX_LATERAL = 1.5
-NAV_WAYPOINT_COMMAND_MAX_HEADING = 0.90
-
-# Passable narrow-gap traversal, dense recovery, and grazing shaping.
-# Gap reward is gated only on the passable narrow-gap scenarios (8/13/14).
-NAV_PASSABLE_GAP_REWARD_WEIGHT = 1.5
-# Fraction of clearance/TTC penalty waived while aligned in a passable gap.
-NAV_CLEARANCE_PASSABLE_GAP_RELIEF = 0.5
-NAV_TTC_PASSABLE_GAP_RELIEF = 0.5
-# Dense recovery is gated only on blocked/cluttered states (scenarios 10/11/12
-# or a strongly blocked goal corridor).
-NAV_DENSE_RECOVERY_WEIGHT = 1.0
-# Mild near-contact (grazing) penalty, kept far weaker than obstacle_collision.
-NAV_GRAZING_WEIGHT = -0.5
-NAV_CLEARANCE_SURFACE_BUFFER = 0.20
-NAV_GRAZING_DISTANCE = 0.05
-NAV_GRAZING_CONTACT_DISTANCE = -0.10
-NAV_GRAZING_PASSABLE_GAP_RELIEF = 0.4
-
-# Unitree L2 reference spec: 360 x 96 deg FoV, 30 m max range.
-# Training uses a lightweight subset.
-LIDAR_MAX_DISTANCE = 20.0
-LIDAR_HORIZONTAL_FOV = (0.0, 360.0)
-LIDAR_HORIZONTAL_RES = 2.0   # 180 rays
-LIDAR_CHANNELS = 1            # single horizontal ring for 180D HLC student obs
-LIDAR_VERTICAL_FOV = (0.0, 0.0)
-
-# Intel RealSense D456-style depth student setup. The native sensor supports
-# 1280 x 720 depth, but distillation trains on a small 16:9 image to keep rollout
-# storage and ray-casting cost manageable.
-D456_DEPTH_MIN_DISTANCE = 0.60
-D456_DEPTH_MAX_DISTANCE = 6.0
-D456_DEPTH_HORIZONTAL_FOV_DEG = 86.0
-D456_DEPTH_VERTICAL_FOV_DEG = 57.0
-D456_NATIVE_DEPTH_RESOLUTION = (1280, 720)
-DEPTH_IMAGE_WIDTH = 128
-DEPTH_IMAGE_HEIGHT = 72
-DEPTH_HISTORY_LENGTH = 3
-DEPTH_DISTILL_NUM_ENVS = 512
-DEPTH_DISTILL_MIN_OBSTACLES = 6
-DEPTH_DISTILL_MAX_OBSTACLES = 10
-DEPTH_DISTILL_EMPTY_ENV_FRACTION = 0.05
-DEPTH_DISTILL_MIN_INTER_OBSTACLE_DIST = 0.9
-DEPTH_DISTILL_DYNAMIC_START_ITERATION = 250
-DEPTH_DISTILL_DYNAMIC_WARMUP_ITERATIONS = 250
-DEPTH_DISTILL_DYNAMIC_SPEED_RANGE = (0.03, 0.40)
-DEPTH_DISTILL_DYNAMIC_LATERAL_SPEED = 0.08
-DEPTH_DISTILL_DYNAMIC_LONGITUDINAL_EXTENT = 1.4
-DEPTH_DISTILL_DYNAMIC_LATERAL_EXTENT = 0.35
-DEPTH_DISTILL_DYNAMIC_SPEED_CHANGE_INTERVAL = (1.2, 2.8)
-DEPTH_DISTILL_DYNAMIC_WANDER_FRACTION = 0.15
-D456_CAMERA_FOCAL_LENGTH_CM = 24.0
-D456_CAMERA_HORIZONTAL_APERTURE_CM = 2.0 * D456_CAMERA_FOCAL_LENGTH_CM * math.tan(
-    math.radians(D456_DEPTH_HORIZONTAL_FOV_DEG) * 0.5
-)
-D456_CAMERA_VERTICAL_APERTURE_CM = 2.0 * D456_CAMERA_FOCAL_LENGTH_CM * math.tan(
-    math.radians(D456_DEPTH_VERTICAL_FOV_DEG) * 0.5
-)
-D456_CAMERA_PITCH_DOWN_DEG = 5.0
-_D456_CAMERA_PITCH_HALF_RAD = math.radians(D456_CAMERA_PITCH_DOWN_DEG) * 0.5
-D456_CAMERA_PITCH_DOWN_QUAT_WXYZ = (
-    math.cos(_D456_CAMERA_PITCH_HALF_RAD),
-    0.0,
-    math.sin(_D456_CAMERA_PITCH_HALF_RAD),
-    0.0,
-)
+TRAIN_PHYSICAL_OBSTACLE_SLOTS = _hospital_specs.TRAIN_PHYSICAL_OBSTACLE_SLOTS
+PLAY_PHYSICAL_OBSTACLE_SLOTS = _hospital_specs.PLAY_PHYSICAL_OBSTACLE_SLOTS
+PLAY_DEFAULT_ACTIVE_OBSTACLES = _hospital_specs.PLAY_DEFAULT_ACTIVE_OBSTACLES
+NUM_OBSTACLES = _hospital_specs.NUM_OBSTACLES
+PRIVILEGED_OBSTACLE_SLOTS = _hospital_specs.PRIVILEGED_OBSTACLE_SLOTS
+PLAY_MAX_OBSTACLES = _hospital_specs.PLAY_MAX_OBSTACLES
+PLAY_NUM_OBSTACLES = _hospital_specs.PLAY_NUM_OBSTACLES
+PLAY_MIN_INTER_OBSTACLE_DIST = _hospital_specs.PLAY_MIN_INTER_OBSTACLE_DIST
+OBSTACLE_SIZE = _hospital_specs.OBSTACLE_SIZE
+TRAIN_OBSTACLE_SPECS = _hospital_specs.TRAIN_OBSTACLE_SPECS
+TRAIN_OBSTACLE_SHAPE_IDS = _hospital_specs.TRAIN_OBSTACLE_SHAPE_IDS
+TRAIN_OBSTACLE_WIDTHS = _hospital_specs.TRAIN_OBSTACLE_WIDTHS
+TRAIN_OBSTACLE_DEPTHS = _hospital_specs.TRAIN_OBSTACLE_DEPTHS
+PLAY_OBSTACLE_SPECS = _hospital_specs.PLAY_OBSTACLE_SPECS
+PLAY_OBSTACLE_SHAPE_IDS = _hospital_specs.PLAY_OBSTACLE_SHAPE_IDS
+PLAY_OBSTACLE_WIDTHS = _hospital_specs.PLAY_OBSTACLE_WIDTHS
+PLAY_OBSTACLE_DEPTHS = _hospital_specs.PLAY_OBSTACLE_DEPTHS
+HOSPITAL_PLAY_OBSTACLE_SHAPE_IDS = _hospital_specs.HOSPITAL_PLAY_OBSTACLE_SHAPE_IDS
+HOSPITAL_PLAY_OBSTACLE_WIDTHS = _hospital_specs.HOSPITAL_PLAY_OBSTACLE_WIDTHS
+HOSPITAL_PLAY_OBSTACLE_DEPTHS = _hospital_specs.HOSPITAL_PLAY_OBSTACLE_DEPTHS
+HOSPITAL_PLAY_OBSTACLE_HEIGHTS = _hospital_specs.HOSPITAL_PLAY_OBSTACLE_HEIGHTS
+HOSPITAL_PLAY_OBSTACLE_LABELS = _hospital_specs.HOSPITAL_PLAY_OBSTACLE_LABELS
+HOSPITAL_PLAY_GROUP_PAIRS = _hospital_specs.HOSPITAL_PLAY_GROUP_PAIRS
+HOSPITAL_DEFAULT_COLOR = _hospital_specs.HOSPITAL_DEFAULT_COLOR
+HOSPITAL_LABEL_COLORS = _hospital_specs.HOSPITAL_LABEL_COLORS
+OBSTACLE_SHAPE_CUBOID = _hospital_specs.OBSTACLE_SHAPE_CUBOID
+OBSTACLE_SHAPE_CYLINDER = _hospital_specs.OBSTACLE_SHAPE_CYLINDER
+OBSTACLE_SHAPE_CONE = _hospital_specs.OBSTACLE_SHAPE_CONE
+OBSTACLE_GROUND_CLEARANCE = _hospital_specs.OBSTACLE_GROUND_CLEARANCE
+OBSTACLE_Z = _hospital_specs.OBSTACLE_Z
+OBSTACLE_SPAWN_RANGE = _hospital_specs.OBSTACLE_SPAWN_RANGE
+OBSTACLE_NAMES = _hospital_specs.OBSTACLE_NAMES
+PLAY_OBSTACLE_NAMES = _hospital_specs.PLAY_OBSTACLE_NAMES
+CURRICULUM_STEPS_PER_ITERATION = _hospital_specs.CURRICULUM_STEPS_PER_ITERATION
+CURRICULUM_OBSTACLE_START_ITERATION = _hospital_specs.CURRICULUM_OBSTACLE_START_ITERATION
+CURRICULUM_OBSTACLE_WARMUP_ITERATIONS = _hospital_specs.CURRICULUM_OBSTACLE_WARMUP_ITERATIONS
+CURRICULUM_COLLISION_WARMUP_ITERATIONS = _hospital_specs.CURRICULUM_COLLISION_WARMUP_ITERATIONS
+CURRICULUM_SPEED_START_ITERATION = _hospital_specs.CURRICULUM_SPEED_START_ITERATION
+CURRICULUM_SPEED_WARMUP_ITERATIONS = _hospital_specs.CURRICULUM_SPEED_WARMUP_ITERATIONS
+NAV_CURRICULUM_COLLISION_START_ITERATION = _hospital_specs.NAV_CURRICULUM_COLLISION_START_ITERATION
+OBSTACLE_MIN_SPAWN_DISTANCE_INITIAL = _hospital_specs.OBSTACLE_MIN_SPAWN_DISTANCE_INITIAL
+OBSTACLE_MIN_SPAWN_DISTANCE_FROM_ROBOT = _hospital_specs.OBSTACLE_MIN_SPAWN_DISTANCE_FROM_ROBOT
+OBSTACLE_LIN_VEL_X = _hospital_specs.OBSTACLE_LIN_VEL_X
+OBSTACLE_LIN_VEL_Y = _hospital_specs.OBSTACLE_LIN_VEL_Y
+OBSTACLE_ANG_VEL_Z = _hospital_specs.OBSTACLE_ANG_VEL_Z
+OBSTACLE_COLLISION_WEIGHT = _hospital_specs.OBSTACLE_COLLISION_WEIGHT
+NAV_TTC_FALLBACK_OBSTACLE_RADIUS = _hospital_specs.NAV_TTC_FALLBACK_OBSTACLE_RADIUS
+NAV_TTC_ROBOT_HALF_WIDTH = _hospital_specs.NAV_TTC_ROBOT_HALF_WIDTH
+NAV_TTC_SAFETY_MARGIN = _hospital_specs.NAV_TTC_SAFETY_MARGIN
+NAV_TTC_FRONT_MARGIN = _hospital_specs.NAV_TTC_FRONT_MARGIN
+NAV_TTC_LOOKAHEAD_DISTANCE = _hospital_specs.NAV_TTC_LOOKAHEAD_DISTANCE
+NAV_TTC_SUM_CLIP = _hospital_specs.NAV_TTC_SUM_CLIP
+NAV_OBSTACLE_RADIUS_MARGIN = _hospital_specs.NAV_OBSTACLE_RADIUS_MARGIN
+NAV_PHYSICAL_SLOT_RANDOMIZATION_START_ITERATION = _hospital_specs.NAV_PHYSICAL_SLOT_RANDOMIZATION_START_ITERATION
+NAV_PHYSICAL_SLOT_RANDOMIZATION_WARMUP_ITERATIONS = _hospital_specs.NAV_PHYSICAL_SLOT_RANDOMIZATION_WARMUP_ITERATIONS
+NAV_RANDOMIZE_OBSTACLE_YAW = _hospital_specs.NAV_RANDOMIZE_OBSTACLE_YAW
+NAV_OBSTACLE_YAW_RANGE = _hospital_specs.NAV_OBSTACLE_YAW_RANGE
+NAV_PASSABLE_GAP_ROBOT_WIDTH = _hospital_specs.NAV_PASSABLE_GAP_ROBOT_WIDTH
+NAV_PASSABLE_GAP_MIN_WIDTH = _hospital_specs.NAV_PASSABLE_GAP_MIN_WIDTH
+NAV_GOAL_FORWARD_RANGE = _hospital_specs.NAV_GOAL_FORWARD_RANGE
+NAV_GOAL_LATERAL_RANGE = _hospital_specs.NAV_GOAL_LATERAL_RANGE
+NAV_GOAL_HEADING_JITTER_RANGE = _hospital_specs.NAV_GOAL_HEADING_JITTER_RANGE
+NAV_MIN_GOAL_DISTANCE = _hospital_specs.NAV_MIN_GOAL_DISTANCE
+NAV_START_EXCLUSION_RADIUS = _hospital_specs.NAV_START_EXCLUSION_RADIUS
+NAV_GOAL_EXCLUSION_RADIUS = _hospital_specs.NAV_GOAL_EXCLUSION_RADIUS
+NAV_HEAD_ON_PROGRESS_RANGE = _hospital_specs.NAV_HEAD_ON_PROGRESS_RANGE
+NAV_HEAD_ON_LATERAL_RANGE = _hospital_specs.NAV_HEAD_ON_LATERAL_RANGE
+NAV_EDGE_PROGRESS_RANGE = _hospital_specs.NAV_EDGE_PROGRESS_RANGE
+NAV_EDGE_LATERAL_RANGE = _hospital_specs.NAV_EDGE_LATERAL_RANGE
+NAV_DIAGONAL_PROGRESS_RANGE = _hospital_specs.NAV_DIAGONAL_PROGRESS_RANGE
+NAV_DIAGONAL_LATERAL_RANGE = _hospital_specs.NAV_DIAGONAL_LATERAL_RANGE
+NAV_OFFPATH_PROGRESS_RANGE = _hospital_specs.NAV_OFFPATH_PROGRESS_RANGE
+NAV_OFFPATH_LATERAL_RANGE = _hospital_specs.NAV_OFFPATH_LATERAL_RANGE
+NAV_NARROW_GAP_PROGRESS_RANGE = _hospital_specs.NAV_NARROW_GAP_PROGRESS_RANGE
+NAV_NARROW_GAP_CENTER_LATERAL_RANGE = _hospital_specs.NAV_NARROW_GAP_CENTER_LATERAL_RANGE
+NAV_NARROW_GAP_HALF_WIDTH_RANGE = _hospital_specs.NAV_NARROW_GAP_HALF_WIDTH_RANGE
+NAV_NARROW_GAP_WIDE_HALF_WIDTH_RANGE = _hospital_specs.NAV_NARROW_GAP_WIDE_HALF_WIDTH_RANGE
+NAV_NARROW_GAP_BARELY_HALF_WIDTH_RANGE = _hospital_specs.NAV_NARROW_GAP_BARELY_HALF_WIDTH_RANGE
+NAV_NARROW_GAP_PROBABILITY = _hospital_specs.NAV_NARROW_GAP_PROBABILITY
+NAV_PARTIAL_BLOCKAGE_PROGRESS_RANGE = _hospital_specs.NAV_PARTIAL_BLOCKAGE_PROGRESS_RANGE
+NAV_PARTIAL_BLOCKAGE_LATERAL_RANGE = _hospital_specs.NAV_PARTIAL_BLOCKAGE_LATERAL_RANGE
+NAV_PARTIAL_BLOCKAGE_PROBABILITY = _hospital_specs.NAV_PARTIAL_BLOCKAGE_PROBABILITY
+NAV_CLUTTERED_PROGRESS_RANGE = _hospital_specs.NAV_CLUTTERED_PROGRESS_RANGE
+NAV_CLUTTERED_LATERAL_RANGE = _hospital_specs.NAV_CLUTTERED_LATERAL_RANGE
+NAV_CURRICULUM_PHASE_SCHEDULE = _hospital_specs.NAV_CURRICULUM_PHASE_SCHEDULE
+NAV_GOAL_HEADING_STD = _hospital_specs.NAV_GOAL_HEADING_STD
+NAV_GOAL_SUCCESS_POSITION_THRESHOLD = _hospital_specs.NAV_GOAL_SUCCESS_POSITION_THRESHOLD
+NAV_GOAL_SUCCESS_HEADING_THRESHOLD = _hospital_specs.NAV_GOAL_SUCCESS_HEADING_THRESHOLD
+NAV_WAYPOINT_LOOKAHEAD_DISTANCE = _hospital_specs.NAV_WAYPOINT_LOOKAHEAD_DISTANCE
+NAV_WAYPOINT_GOAL_SNAP_DISTANCE = _hospital_specs.NAV_WAYPOINT_GOAL_SNAP_DISTANCE
+NAV_WAYPOINT_REFINEMENT_OFFSETS = _hospital_specs.NAV_WAYPOINT_REFINEMENT_OFFSETS
+NAV_LOCAL_PLANNER_ACTIVATION_THRESHOLD = _hospital_specs.NAV_LOCAL_PLANNER_ACTIVATION_THRESHOLD
+NAV_LOCAL_PLANNER_LATERAL_PENALTY = _hospital_specs.NAV_LOCAL_PLANNER_LATERAL_PENALTY
+NAV_LOCAL_PLANNER_MIN_IMPROVEMENT = _hospital_specs.NAV_LOCAL_PLANNER_MIN_IMPROVEMENT
+NAV_LOCAL_PLANNER_MAX_BLEND = _hospital_specs.NAV_LOCAL_PLANNER_MAX_BLEND
+NAV_WAYPOINT_COMMAND_MIN_FORWARD = _hospital_specs.NAV_WAYPOINT_COMMAND_MIN_FORWARD
+NAV_WAYPOINT_COMMAND_MAX_LATERAL = _hospital_specs.NAV_WAYPOINT_COMMAND_MAX_LATERAL
+NAV_WAYPOINT_COMMAND_MAX_HEADING = _hospital_specs.NAV_WAYPOINT_COMMAND_MAX_HEADING
+NAV_PASSABLE_GAP_REWARD_WEIGHT = _hospital_specs.NAV_PASSABLE_GAP_REWARD_WEIGHT
+NAV_CLEARANCE_PASSABLE_GAP_RELIEF = _hospital_specs.NAV_CLEARANCE_PASSABLE_GAP_RELIEF
+NAV_TTC_PASSABLE_GAP_RELIEF = _hospital_specs.NAV_TTC_PASSABLE_GAP_RELIEF
+NAV_DENSE_RECOVERY_WEIGHT = _hospital_specs.NAV_DENSE_RECOVERY_WEIGHT
+NAV_GRAZING_WEIGHT = _hospital_specs.NAV_GRAZING_WEIGHT
+NAV_CLEARANCE_SURFACE_BUFFER = _hospital_specs.NAV_CLEARANCE_SURFACE_BUFFER
+NAV_GRAZING_DISTANCE = _hospital_specs.NAV_GRAZING_DISTANCE
+NAV_GRAZING_CONTACT_DISTANCE = _hospital_specs.NAV_GRAZING_CONTACT_DISTANCE
+NAV_GRAZING_PASSABLE_GAP_RELIEF = _hospital_specs.NAV_GRAZING_PASSABLE_GAP_RELIEF
+LIDAR_MAX_DISTANCE = _hospital_specs.LIDAR_MAX_DISTANCE
+LIDAR_HORIZONTAL_FOV = _hospital_specs.LIDAR_HORIZONTAL_FOV
+LIDAR_HORIZONTAL_RES = _hospital_specs.LIDAR_HORIZONTAL_RES
+LIDAR_CHANNELS = _hospital_specs.LIDAR_CHANNELS
+LIDAR_VERTICAL_FOV = _hospital_specs.LIDAR_VERTICAL_FOV
+D456_DEPTH_MIN_DISTANCE = _hospital_specs.D456_DEPTH_MIN_DISTANCE
+D456_DEPTH_MAX_DISTANCE = _hospital_specs.D456_DEPTH_MAX_DISTANCE
+D456_DEPTH_HORIZONTAL_FOV_DEG = _hospital_specs.D456_DEPTH_HORIZONTAL_FOV_DEG
+D456_DEPTH_VERTICAL_FOV_DEG = _hospital_specs.D456_DEPTH_VERTICAL_FOV_DEG
+D456_NATIVE_DEPTH_RESOLUTION = _hospital_specs.D456_NATIVE_DEPTH_RESOLUTION
+DEPTH_IMAGE_WIDTH = _hospital_specs.DEPTH_IMAGE_WIDTH
+DEPTH_IMAGE_HEIGHT = _hospital_specs.DEPTH_IMAGE_HEIGHT
+DEPTH_HISTORY_LENGTH = _hospital_specs.DEPTH_HISTORY_LENGTH
+DEPTH_DISTILL_NUM_ENVS = _hospital_specs.DEPTH_DISTILL_NUM_ENVS
+DEPTH_DISTILL_MIN_OBSTACLES = _hospital_specs.DEPTH_DISTILL_MIN_OBSTACLES
+DEPTH_DISTILL_MAX_OBSTACLES = _hospital_specs.DEPTH_DISTILL_MAX_OBSTACLES
+DEPTH_DISTILL_EMPTY_ENV_FRACTION = _hospital_specs.DEPTH_DISTILL_EMPTY_ENV_FRACTION
+DEPTH_DISTILL_MIN_INTER_OBSTACLE_DIST = _hospital_specs.DEPTH_DISTILL_MIN_INTER_OBSTACLE_DIST
+DEPTH_DISTILL_DYNAMIC_START_ITERATION = _hospital_specs.DEPTH_DISTILL_DYNAMIC_START_ITERATION
+DEPTH_DISTILL_DYNAMIC_WARMUP_ITERATIONS = _hospital_specs.DEPTH_DISTILL_DYNAMIC_WARMUP_ITERATIONS
+DEPTH_DISTILL_DYNAMIC_SPEED_RANGE = _hospital_specs.DEPTH_DISTILL_DYNAMIC_SPEED_RANGE
+DEPTH_DISTILL_DYNAMIC_LATERAL_SPEED = _hospital_specs.DEPTH_DISTILL_DYNAMIC_LATERAL_SPEED
+DEPTH_DISTILL_DYNAMIC_LONGITUDINAL_EXTENT = _hospital_specs.DEPTH_DISTILL_DYNAMIC_LONGITUDINAL_EXTENT
+DEPTH_DISTILL_DYNAMIC_LATERAL_EXTENT = _hospital_specs.DEPTH_DISTILL_DYNAMIC_LATERAL_EXTENT
+DEPTH_DISTILL_DYNAMIC_SPEED_CHANGE_INTERVAL = _hospital_specs.DEPTH_DISTILL_DYNAMIC_SPEED_CHANGE_INTERVAL
+DEPTH_DISTILL_DYNAMIC_WANDER_FRACTION = _hospital_specs.DEPTH_DISTILL_DYNAMIC_WANDER_FRACTION
+D456_CAMERA_FOCAL_LENGTH_CM = _hospital_specs.D456_CAMERA_FOCAL_LENGTH_CM
+D456_CAMERA_HORIZONTAL_APERTURE_CM = _hospital_specs.D456_CAMERA_HORIZONTAL_APERTURE_CM
+D456_CAMERA_VERTICAL_APERTURE_CM = _hospital_specs.D456_CAMERA_VERTICAL_APERTURE_CM
+D456_CAMERA_PITCH_DOWN_DEG = _hospital_specs.D456_CAMERA_PITCH_DOWN_DEG
+D456_CAMERA_PITCH_DOWN_QUAT_WXYZ = _hospital_specs.D456_CAMERA_PITCH_DOWN_QUAT_WXYZ
 
 
 # =============================================================================
@@ -293,9 +229,12 @@ def _make_obstacle_cfg(
     idx: int,
     shape_kind: str = "cuboid",
     footprint_size: tuple[float, float] = (OBSTACLE_SIZE[0], OBSTACLE_SIZE[1]),
+    height: float = OBSTACLE_SIZE[2],
+    visual_color: tuple[float, float, float] = HOSPITAL_DEFAULT_COLOR,
 ) -> RigidObjectCfg:
     """Create a physical obstacle with variable footprint and fixed height."""
     width, depth = footprint_size
+    center_z = height * 0.5 + OBSTACLE_GROUND_CLEARANCE
     spawn_kwargs = {
         "rigid_props": sim_utils.RigidBodyPropertiesCfg(
             kinematic_enabled=True,
@@ -305,25 +244,25 @@ def _make_obstacle_cfg(
             collision_enabled=True,
         ),
         "visual_material": sim_utils.PreviewSurfaceCfg(
-            diffuse_color=(0.8, 0.2, 0.2),
+            diffuse_color=visual_color,
         ),
         "activate_contact_sensors": True,
     }
     if shape_kind == "cuboid":
         spawn = sim_utils.CuboidCfg(
-            size=(width, depth, OBSTACLE_SIZE[2]),
+            size=(width, depth, height),
             **spawn_kwargs,
         )
     elif shape_kind == "cylinder":
         spawn = sim_utils.CylinderCfg(
             radius=max(width, depth) / 2.0,
-            height=OBSTACLE_SIZE[2],
+            height=height,
             **spawn_kwargs,
         )
     elif shape_kind == "cone":
         spawn = sim_utils.ConeCfg(
             radius=max(width, depth) / 2.0,
-            height=OBSTACLE_SIZE[2],
+            height=height,
             **spawn_kwargs,
         )
     else:
@@ -333,7 +272,7 @@ def _make_obstacle_cfg(
         prim_path=f"{{ENV_REGEX_NS}}/{name}",
         spawn=spawn,
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(1.5 + idx * 0.5, 0.0, OBSTACLE_Z),
+            pos=(1.5 + idx * 0.5, 0.0, center_z),
         ),
     )
 
@@ -343,9 +282,13 @@ def make_play_obstacle_cfg(
     idx: int,
     shape_kind: str,
     footprint_size: tuple[float, float],
+    height: float = OBSTACLE_SIZE[2],
+    visual_color: tuple[float, float, float] = HOSPITAL_DEFAULT_COLOR,
 ) -> RigidObjectCfg:
     """Create an overridden play obstacle asset."""
-    return _make_obstacle_cfg(name, idx, shape_kind, footprint_size)
+    return _make_obstacle_cfg(name, idx, shape_kind, footprint_size, height, visual_color)
+
+
 
 
 @configclass
@@ -396,6 +339,9 @@ class ObstacleSceneCfg(Go2wSceneCfg):
 @configclass
 class ObstaclePlaySceneCfg(ObstacleSceneCfg):
     """Play scene with configurable obstacle capacity for visual testing."""
+
+    hospital_ramp: RigidObjectCfg = _make_hospital_ramp_cfg()
+    hospital_ramp_b: RigidObjectCfg = _make_hospital_ramp_b_cfg()
 
     if PLAY_MAX_OBSTACLES > NUM_OBSTACLES:
         for i in range(NUM_OBSTACLES, PLAY_MAX_OBSTACLES):
@@ -502,6 +448,10 @@ class ObstacleEventCfg(EventCfg):
     """Base obstacle-environment events (legacy obstacle curriculum for compatibility)."""
 
     depth_distill_dynamic_obstacles: EventTerm | None = None
+    navigation_path_update: EventTerm | None = None
+    hospital_dynamic_motion: EventTerm | None = None
+    hospital_velocity_resample: EventTerm | None = None
+    hospital_group_update: EventTerm | None = None
 
     speed_curriculum: EventTerm | None = EventTerm(
         func=mdp.update_locomotion_curriculum,
@@ -1229,3 +1179,602 @@ class Go2wNavDepthRLDistillEnvCfg_PLAY(Go2wNavDepthRLDistillEnvCfg):
         self.observations.student_state.enable_corruption = False
         self.observations.student_depth.enable_corruption = False
         _configure_play_obstacle_obs(self.observations.teacher)
+
+
+# =============================================================================
+# Hospital play environment (test existing Nav Teacher in hospital corridors)
+# =============================================================================
+
+# Default hospital corridor layout for play testing.
+# Derived from HOSPITAL_LAYOUT_TEMPLATES["main_corridor"]:
+#   corridor_kind="l_corridor", leg_length=12.0, corridor_width=2.6
+HOSPITAL_PLAY_CORRIDOR_KIND = "l_corridor"
+HOSPITAL_PLAY_LEG_LENGTH = 12.0
+HOSPITAL_PLAY_CORRIDOR_WIDTH = 2.6
+HOSPITAL_PLAY_WALL_THICKNESS = 0.20
+HOSPITAL_PLAY_WALL_HEIGHT = 2.40
+HOSPITAL_PLAY_EPISODE_LENGTH_S = 90.0
+HOSPITAL_PLAY_ENV_SPACING = 30.0
+HOSPITAL_PLAY_GOAL_DONE_RADIUS = 0.70
+# Number of dynamic obstacles placed inside the corridor (excludes wall slots).
+HOSPITAL_PLAY_DYNAMIC_OBSTACLE_COUNT = 12
+
+
+def _shape_kind_from_id(shape_id: int) -> str:
+    """Map obstacle metadata shape ids back to scene shape names."""
+    if shape_id == OBSTACLE_SHAPE_CYLINDER:
+        return "cylinder"
+    if shape_id == OBSTACLE_SHAPE_CONE:
+        return "cone"
+    return "cuboid"
+
+
+def _hospital_structured_slot_tables(
+    corridor_kind: str,
+    leg_length: float,
+    corridor_width: float,
+    wall_thickness: float,
+    corridor_turn_length: float | None = None,
+) -> dict[str, object]:
+    """Return physical slot tables with walls followed by the hospital actor palette."""
+    wall_specs = mdp.structured_corridor_wall_specs(
+        corridor_kind,
+        leg_length,
+        corridor_width,
+        wall_thickness,
+        corridor_turn_length,
+    )
+    wall_count = len(wall_specs)
+    slot_count = len(PLAY_OBSTACLE_NAMES)
+
+    shape_ids = [OBSTACLE_SHAPE_CUBOID] * slot_count
+    widths = [OBSTACLE_SIZE[0]] * slot_count
+    depths = [OBSTACLE_SIZE[1]] * slot_count
+    heights = [OBSTACLE_SIZE[2]] * slot_count
+    labels = ["chair"] * slot_count
+    colors = [HOSPITAL_LABEL_COLORS.get("chair", HOSPITAL_DEFAULT_COLOR)] * slot_count
+
+    for slot_idx, (_, _, _, wall_length, wall_depth) in enumerate(wall_specs):
+        shape_ids[slot_idx] = OBSTACLE_SHAPE_CUBOID
+        widths[slot_idx] = wall_length
+        depths[slot_idx] = wall_depth
+        heights[slot_idx] = HOSPITAL_PLAY_WALL_HEIGHT
+        labels[slot_idx] = "wall"
+        colors[slot_idx] = HOSPITAL_LABEL_COLORS.get("wall", HOSPITAL_DEFAULT_COLOR)
+
+    palette_slots = slot_count - wall_count
+    for palette_idx in range(palette_slots):
+        slot_idx = wall_count + palette_idx
+        shape_ids[slot_idx] = HOSPITAL_PLAY_OBSTACLE_SHAPE_IDS[palette_idx]
+        widths[slot_idx] = HOSPITAL_PLAY_OBSTACLE_WIDTHS[palette_idx]
+        depths[slot_idx] = HOSPITAL_PLAY_OBSTACLE_DEPTHS[palette_idx]
+        heights[slot_idx] = HOSPITAL_PLAY_OBSTACLE_HEIGHTS[palette_idx]
+        labels[slot_idx] = HOSPITAL_PLAY_OBSTACLE_LABELS[palette_idx]
+        colors[slot_idx] = HOSPITAL_LABEL_COLORS.get(labels[slot_idx], HOSPITAL_DEFAULT_COLOR)
+
+    center_zs = tuple(height * 0.5 + OBSTACLE_GROUND_CLEARANCE for height in heights)
+    return {
+        "wall_count": wall_count,
+        "shape_ids": tuple(shape_ids),
+        "widths": tuple(widths),
+        "depths": tuple(depths),
+        "heights": tuple(heights),
+        "center_zs": center_zs,
+        "labels": tuple(labels),
+        "colors": tuple(colors),
+    }
+
+
+def _apply_hospital_obstacle_asset_overrides(scene, slot_tables: dict[str, object]) -> None:
+    """Make hospital physical assets match the slot metadata seen by depth sensors."""
+    shape_ids = slot_tables["shape_ids"]
+    widths = slot_tables["widths"]
+    depths = slot_tables["depths"]
+    heights = slot_tables["heights"]
+    colors = slot_tables["colors"]
+    for slot_idx, obstacle_name in enumerate(PLAY_OBSTACLE_NAMES):
+        setattr(
+            scene,
+            obstacle_name,
+            make_play_obstacle_cfg(
+                obstacle_name,
+                slot_idx,
+                _shape_kind_from_id(shape_ids[slot_idx]),
+                (widths[slot_idx], depths[slot_idx]),
+                heights[slot_idx],
+                colors[slot_idx],
+            ),
+        )
+
+
+def _include_hospital_ramp_in_depth_camera(scene) -> None:
+    """Expose both ramp halves to depth without adding them to obstacle contacts/rewards."""
+    scene.depth_camera.mesh_prim_paths = [
+        "/World/ground",
+        MultiMeshRayCasterCfg.RaycastTargetCfg(
+            prim_expr="{ENV_REGEX_NS}/obstacle_.*",
+            track_mesh_transforms=True,
+            is_shared=True,
+        ),
+        MultiMeshRayCasterCfg.RaycastTargetCfg(
+            prim_expr="{ENV_REGEX_NS}/hospital_ramp",
+            track_mesh_transforms=True,
+            is_shared=True,
+        ),
+        MultiMeshRayCasterCfg.RaycastTargetCfg(
+            prim_expr="{ENV_REGEX_NS}/hospital_ramp_b",
+            track_mesh_transforms=True,
+            is_shared=True,
+        ),
+    ]
+
+
+def _hospital_group_registry(wall_count: int) -> list[dict]:
+    """Build physical group relationships from dynamic-palette relation pairs."""
+    return [
+        {
+            "relation_type": rel,
+            "leader_name": f"obstacle_{wall_count + leader}",
+            "follower_name": f"obstacle_{wall_count + follower}",
+        }
+        for leader, follower, rel in HOSPITAL_PLAY_GROUP_PAIRS
+    ]
+
+
+def _hospital_motion_slot_params(
+    wall_count: int,
+    slot_tables: dict,
+    group_registry: list[dict],
+    queue_groups: list[dict] | None = None,
+    seated_groups: list[dict] | None = None,
+) -> dict:
+    """Return moving actors plus read-only static blockers for hospital motion."""
+    labels = list(slot_tables["labels"])
+    center_zs = tuple(slot_tables["center_zs"])
+    keep_names: set[str] = set()
+
+    for slot_idx in range(wall_count, len(PLAY_OBSTACLE_NAMES)):
+        label = labels[slot_idx]
+        label_spec = _hospital_specs.HOSPITAL_LABEL_SPECS.get(label)
+        if label_spec is None:
+            continue
+        if label_spec.motion_profile != "static" or label_spec.category in {"furniture", "misc"}:
+            keep_names.add(PLAY_OBSTACLE_NAMES[slot_idx])
+
+    for group in group_registry:
+        keep_names.add(group["leader_name"])
+        keep_names.add(group["follower_name"])
+    for queue_group in queue_groups or ():
+        keep_names.update(queue_group.get("names", ()))
+    for seated_group in seated_groups or ():
+        name = seated_group.get("name")
+        if name is not None:
+            keep_names.add(name)
+
+    indices = [
+        slot_idx
+        for slot_idx, name in enumerate(PLAY_OBSTACLE_NAMES)
+        if slot_idx >= wall_count and name in keep_names
+    ]
+    return {
+        "obstacle_names": [PLAY_OBSTACLE_NAMES[slot_idx] for slot_idx in indices],
+        "obstacle_labels": [labels[slot_idx] for slot_idx in indices],
+        "obstacle_indices": indices,
+        "obstacle_center_zs": tuple(center_zs[slot_idx] for slot_idx in indices),
+    }
+
+
+def _structured_path_update_event() -> EventTerm:
+    """Update the rolling local waypoint every step for structured routes."""
+    return EventTerm(
+        func=mdp.update_navigation_path_waypoint_event,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            "lookahead_distance": 1.25,
+            "waypoint_reach_radius": 0.45,
+            "adaptive_lookahead": True,
+            "lookahead_min": 0.6,
+            "curvature_scan_horizon": 2.5,
+            "curvature_threshold": 0.3,
+        },
+    )
+
+
+def _set_structured_goal_termination(cfg, position_threshold: float) -> None:
+    """Terminate structured play when the robot reaches the final path goal."""
+    cfg.terminations.structured_goal_reached = DoneTerm(
+        func=mdp.navigation_path_final_goal_reached,
+        params={"position_threshold": position_threshold},
+    )
+
+
+def _configure_hospital_structured_depth_play(
+    cfg,
+    *,
+    corridor_kind: str,
+    leg_length: float,
+    corridor_width: float,
+    wall_thickness: float,
+    dynamic_obstacle_count: int,
+    speed_scale: float = 1.0,
+    semantic_local_poses: tuple[tuple[int, float, float, float], ...] | None = None,
+    queue_groups: list[dict] | None = None,
+    seated_groups: list[dict] | None = None,
+    ramp_local_pose: tuple[float, ...] | None = None,
+    ramp_b_local_pose: tuple[float, ...] | None = None,
+    robot_start_local_xy: tuple[float, float] = (0.0, 0.0),
+    min_inter_obstacle_dist: float = 0.80,
+) -> None:
+    """Configure a depth play env as a structured hospital scene."""
+    slot_tables = _hospital_structured_slot_tables(
+        corridor_kind,
+        leg_length,
+        corridor_width,
+        wall_thickness,
+    )
+    _apply_hospital_obstacle_asset_overrides(cfg.scene, slot_tables)
+    wall_count = int(slot_tables["wall_count"])
+    cfg.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
+    cfg.events.reset_obstacles.params = {
+        "obstacle_names": PLAY_OBSTACLE_NAMES,
+        "corridor_kind": corridor_kind,
+        "leg_length": leg_length,
+        "corridor_width": corridor_width,
+        "wall_thickness": wall_thickness,
+        "dynamic_obstacle_count": dynamic_obstacle_count,
+        "obstacle_z": OBSTACLE_Z,
+        "min_inter_obstacle_dist": min_inter_obstacle_dist,
+        "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+        "fixed_obstacle_shape_ids": slot_tables["shape_ids"],
+        "fixed_obstacle_widths": slot_tables["widths"],
+        "fixed_obstacle_depths": slot_tables["depths"],
+        "fixed_obstacle_center_zs": slot_tables["center_zs"],
+        "obstacle_labels": slot_tables["labels"],
+        "fixed_obstacle_local_poses": semantic_local_poses,
+        "robot_start_local_xy": robot_start_local_xy,
+        "ramp_asset_name": HOSPITAL_RAMP_ASSET_NAME,
+        "ramp_local_pose": ramp_local_pose,
+        "ramp_b_asset_name": HOSPITAL_RAMP_B_ASSET_NAME,
+        "ramp_b_local_pose": ramp_b_local_pose,
+        "randomize_obstacle_yaw": NAV_RANDOMIZE_OBSTACLE_YAW,
+        "obstacle_yaw_range": NAV_OBSTACLE_YAW_RANGE,
+        "robot_inflation": 0.50,
+        "clearance_cost_weight": 3.0,
+        "clearance_cost_sigma": 0.60,
+        "corner_rounding": True,
+        "corner_radius": 0.80,
+        "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+        "dynamic_start_exclusion_radius": 1.8,
+        "dynamic_robot_keepout_radius": 1.25,
+        "lookahead_distance": 1.25,
+        "waypoint_reach_radius": 0.45,
+        "adaptive_lookahead": True,
+        "lookahead_min": 0.6,
+        "curvature_scan_horizon": 2.5,
+        "curvature_threshold": 0.3,
+    }
+
+    cfg.events.navigation_path_update = _structured_path_update_event()
+    cfg.events.hospital_velocity_resample = None
+    cfg.events.hospital_group_update = None
+    group_registry = _hospital_group_registry(wall_count)
+    motion_slot_params = _hospital_motion_slot_params(
+        wall_count,
+        slot_tables,
+        group_registry,
+        queue_groups=queue_groups,
+        seated_groups=seated_groups,
+    )
+    motion_params = {
+        **motion_slot_params,
+        "group_registry": group_registry,
+        "min_inter_obstacle_dist": 0.25,
+        "active_distance": 24.0,
+        "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+        "robot_keepout_radius": 1.25,
+    }
+    if queue_groups is not None:
+        motion_params["queue_groups"] = queue_groups
+    if seated_groups is not None:
+        motion_params["seated_groups"] = seated_groups
+    if speed_scale != 1.0:
+        motion_params["speed_scale"] = speed_scale
+    cfg.events.hospital_dynamic_motion = EventTerm(
+        func=_hospital_events.move_hospital_dynamic_obstacles,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params=motion_params,
+    )
+
+
+@configclass
+class Go2wHospitalPlayEnvCfg(Go2wNavTeacherEnvCfg_PLAY):
+    """Play/eval env that runs the Nav Teacher policy in a hospital-style corridor.
+
+    Uses ``reset_structured_astar_corridor`` to lay out an L-shaped corridor
+    (main_corridor template: leg_length=12 m, width=2.6 m) with hospital-scale
+    obstacle footprints (patients, wheelchairs, carts, beds).  No new training
+    is required — load any existing Nav Teacher checkpoint directly.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = HOSPITAL_PLAY_EPISODE_LENGTH_S
+        self.scene.env_spacing = HOSPITAL_PLAY_ENV_SPACING
+        slot_tables = _hospital_structured_slot_tables(
+            HOSPITAL_PLAY_CORRIDOR_KIND,
+            HOSPITAL_PLAY_LEG_LENGTH,
+            HOSPITAL_PLAY_CORRIDOR_WIDTH,
+            HOSPITAL_PLAY_WALL_THICKNESS,
+        )
+        _apply_hospital_obstacle_asset_overrides(self.scene, slot_tables)
+        _wall_count = int(slot_tables["wall_count"])
+        # _configure_play_common already called by parent; redo obstacle event
+        # to use the structured corridor reset instead of the flat scatter reset.
+        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
+        self.events.reset_obstacles.params = {
+            "obstacle_names": PLAY_OBSTACLE_NAMES,
+            "corridor_kind": HOSPITAL_PLAY_CORRIDOR_KIND,
+            "leg_length": HOSPITAL_PLAY_LEG_LENGTH,
+            "corridor_width": HOSPITAL_PLAY_CORRIDOR_WIDTH,
+            "wall_thickness": HOSPITAL_PLAY_WALL_THICKNESS,
+            "dynamic_obstacle_count": HOSPITAL_PLAY_DYNAMIC_OBSTACLE_COUNT,
+            "obstacle_z": OBSTACLE_Z,
+            "min_inter_obstacle_dist": 0.80,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "fixed_obstacle_shape_ids": slot_tables["shape_ids"],
+            "fixed_obstacle_widths": slot_tables["widths"],
+            "fixed_obstacle_depths": slot_tables["depths"],
+            "fixed_obstacle_center_zs": slot_tables["center_zs"],
+            "obstacle_labels": slot_tables["labels"],
+            "randomize_obstacle_yaw": NAV_RANDOMIZE_OBSTACLE_YAW,
+            "obstacle_yaw_range": NAV_OBSTACLE_YAW_RANGE,
+            "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+            "dynamic_start_exclusion_radius": 1.8,
+            "dynamic_robot_keepout_radius": 1.25,
+            "lookahead_distance": 1.25,
+            "waypoint_reach_radius": 0.45,
+            "adaptive_lookahead": True,
+            "lookahead_min": 0.6,
+            "curvature_scan_horizon": 2.5,
+            "curvature_threshold": 0.3,
+        }
+        # Redirect privileged obs to the full play obstacle list.
+        _configure_play_obstacle_obs(self.observations.policy)
+
+        self.events.navigation_path_update = _structured_path_update_event()
+        _set_structured_goal_termination(self, HOSPITAL_PLAY_GOAL_DONE_RADIUS)
+        self.events.hospital_velocity_resample = None
+        self.events.hospital_group_update = None
+        group_registry = _hospital_group_registry(_wall_count)
+        motion_slot_params = _hospital_motion_slot_params(_wall_count, slot_tables, group_registry)
+        self.events.hospital_dynamic_motion = EventTerm(
+            func=_hospital_events.move_hospital_dynamic_obstacles,
+            mode="interval",
+            interval_range_s=(0.0, 0.0),
+            params={
+                **motion_slot_params,
+                "group_registry": group_registry,
+                "min_inter_obstacle_dist": 0.25,
+                "active_distance": 24.0,
+                "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+                "robot_keepout_radius": 1.25,
+            },
+        )
+
+
+# =============================================================================
+# Hospital play environment — Depth Camera Student
+# =============================================================================
+
+
+@configclass
+class Go2wHospitalDepthPlayEnvCfg(Go2wNavDepthRLDistillEnvCfg_PLAY):
+    """Play/eval env for the depth-camera student in a hospital-style corridor.
+
+    Shares depth camera and student obs (state + depth stack) with the standard
+    depth-distillation play env.  Replaces the flat scatter reset with
+    ``reset_structured_astar_corridor`` using hospital-scale obstacle footprints.
+    No new training required — load any existing depth-student checkpoint.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = HOSPITAL_PLAY_EPISODE_LENGTH_S
+        self.scene.env_spacing = HOSPITAL_PLAY_ENV_SPACING
+        slot_tables = _hospital_structured_slot_tables(
+            HOSPITAL_PLAY_CORRIDOR_KIND,
+            HOSPITAL_PLAY_LEG_LENGTH,
+            HOSPITAL_PLAY_CORRIDOR_WIDTH,
+            HOSPITAL_PLAY_WALL_THICKNESS,
+        )
+        _apply_hospital_obstacle_asset_overrides(self.scene, slot_tables)
+        _wall_count = int(slot_tables["wall_count"])
+        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
+        self.events.reset_obstacles.params = {
+            "obstacle_names": PLAY_OBSTACLE_NAMES,
+            "corridor_kind": HOSPITAL_PLAY_CORRIDOR_KIND,
+            "leg_length": HOSPITAL_PLAY_LEG_LENGTH,
+            "corridor_width": HOSPITAL_PLAY_CORRIDOR_WIDTH,
+            "wall_thickness": HOSPITAL_PLAY_WALL_THICKNESS,
+            "dynamic_obstacle_count": HOSPITAL_PLAY_DYNAMIC_OBSTACLE_COUNT,
+            "obstacle_z": OBSTACLE_Z,
+            "min_inter_obstacle_dist": 0.80,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "fixed_obstacle_shape_ids": slot_tables["shape_ids"],
+            "fixed_obstacle_widths": slot_tables["widths"],
+            "fixed_obstacle_depths": slot_tables["depths"],
+            "fixed_obstacle_center_zs": slot_tables["center_zs"],
+            "obstacle_labels": slot_tables["labels"],
+            "randomize_obstacle_yaw": NAV_RANDOMIZE_OBSTACLE_YAW,
+            "obstacle_yaw_range": NAV_OBSTACLE_YAW_RANGE,
+            "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+            "dynamic_start_exclusion_radius": 1.8,
+            "dynamic_robot_keepout_radius": 1.25,
+            "lookahead_distance": 1.25,
+            "waypoint_reach_radius": 0.45,
+            "adaptive_lookahead": True,
+            "lookahead_min": 0.6,
+            "curvature_scan_horizon": 2.5,
+            "curvature_threshold": 0.3,
+        }
+
+        self.events.navigation_path_update = _structured_path_update_event()
+        _set_structured_goal_termination(self, HOSPITAL_PLAY_GOAL_DONE_RADIUS)
+        self.events.hospital_velocity_resample = None
+        self.events.hospital_group_update = None
+        group_registry = _hospital_group_registry(_wall_count)
+        motion_slot_params = _hospital_motion_slot_params(_wall_count, slot_tables, group_registry)
+        self.events.hospital_dynamic_motion = EventTerm(
+            func=_hospital_events.move_hospital_dynamic_obstacles,
+            mode="interval",
+            interval_range_s=(0.0, 0.0),
+            params={
+                **motion_slot_params,
+                "group_registry": group_registry,
+                "min_inter_obstacle_dist": 0.25,
+                "active_distance": 24.0,
+                "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+                "robot_keepout_radius": 1.25,
+            },
+        )
+
+
+# =============================================================================
+# Hospital ward play environment — Depth Camera Student
+# =============================================================================
+
+# Hospital ward: long main corridor (3× leg_length) with two side branches.
+# Branch 1 (at x=leg_length) is a dead-end arm populated with dynamic obstacles.
+# Branch 2 (at x=2×leg_length) is the goal arm the robot navigates into.
+# Wall slots are derived from the structured corridor specs; remaining slots use
+# the hospital actor palette, so wall count changes do not discard key actors.
+HOSPITAL_WARD_CORRIDOR_KIND = "hospital_ward"
+HOSPITAL_WARD_LEG_LENGTH = 10.0    # total main = 30 m, each branch = 10 m
+HOSPITAL_WARD_CORRIDOR_WIDTH = 3.0  # patient-care corridor with bed/cart passing room
+HOSPITAL_WARD_WALL_THICKNESS = 0.25
+HOSPITAL_WARD_DYNAMIC_OBSTACLE_COUNT = 16  # includes child/dog, pushed wheelchair/cart/gurney, self wheelchair, IV pole
+_HOSPITAL_WARD_WALL_COUNT = 11             # 11 walls (open left entrance, no end cap at x=0)
+HOSPITAL_WARD_EPISODE_LENGTH_S = 140.0
+HOSPITAL_WARD_ENV_SPACING = 46.0
+HOSPITAL_WARD_GOAL_DONE_RADIUS = 0.80
+
+
+@configclass
+class Go2wHospitalWardDepthPlayEnvCfg(Go2wNavDepthRLDistillEnvCfg_PLAY):
+    """Depth-student play/eval env in a hospital ward floor layout.
+
+    The ward has a 30 m main corridor with two perpendicular branches (each 10 m),
+    forming two T-junctions the robot navigates through.  Branch 1 is a dead-end
+    populated with dynamic obstacles that can spill into the main corridor.  Goal
+    is the tip of branch 2.  Corridor width is 3.0 m, wall thickness is 0.25 m.
+    Dynamic actors use the hospital label palette at 0.7× speed.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = HOSPITAL_WARD_EPISODE_LENGTH_S
+        self.scene.env_spacing = HOSPITAL_WARD_ENV_SPACING
+        slot_tables = _hospital_structured_slot_tables(
+            HOSPITAL_WARD_CORRIDOR_KIND,
+            HOSPITAL_WARD_LEG_LENGTH,
+            HOSPITAL_WARD_CORRIDOR_WIDTH,
+            HOSPITAL_WARD_WALL_THICKNESS,
+        )
+        _apply_hospital_obstacle_asset_overrides(self.scene, slot_tables)
+        _wall_count = int(slot_tables["wall_count"])
+        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
+        self.events.reset_obstacles.params = {
+            "obstacle_names": PLAY_OBSTACLE_NAMES,
+            "corridor_kind": HOSPITAL_WARD_CORRIDOR_KIND,
+            "leg_length": HOSPITAL_WARD_LEG_LENGTH,
+            "corridor_width": HOSPITAL_WARD_CORRIDOR_WIDTH,
+            "wall_thickness": HOSPITAL_WARD_WALL_THICKNESS,
+            "dynamic_obstacle_count": HOSPITAL_WARD_DYNAMIC_OBSTACLE_COUNT,
+            "obstacle_z": OBSTACLE_Z,
+            "min_inter_obstacle_dist": 1.00,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "fixed_obstacle_shape_ids": slot_tables["shape_ids"],
+            "fixed_obstacle_widths": slot_tables["widths"],
+            "fixed_obstacle_depths": slot_tables["depths"],
+            "fixed_obstacle_center_zs": slot_tables["center_zs"],
+            "obstacle_labels": slot_tables["labels"],
+            "randomize_obstacle_yaw": NAV_RANDOMIZE_OBSTACLE_YAW,
+            "obstacle_yaw_range": NAV_OBSTACLE_YAW_RANGE,
+            "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+            "dynamic_start_exclusion_radius": 1.8,
+            "dynamic_robot_keepout_radius": 1.25,
+            "lookahead_distance": 1.25,
+            "waypoint_reach_radius": 0.45,
+            "adaptive_lookahead": True,
+            "lookahead_min": 0.6,
+            "curvature_scan_horizon": 2.5,
+            "curvature_threshold": 0.3,
+        }
+
+        self.events.navigation_path_update = _structured_path_update_event()
+        _set_structured_goal_termination(self, HOSPITAL_WARD_GOAL_DONE_RADIUS)
+        self.events.hospital_velocity_resample = None
+        self.events.hospital_group_update = None
+        group_registry = _hospital_group_registry(_wall_count)
+        motion_slot_params = _hospital_motion_slot_params(_wall_count, slot_tables, group_registry)
+        self.events.hospital_dynamic_motion = EventTerm(
+            func=_hospital_events.move_hospital_dynamic_obstacles,
+            mode="interval",
+            interval_range_s=(0.0, 0.0),
+            params={
+                **motion_slot_params,
+                "group_registry": group_registry,
+                "speed_scale": 0.7,
+                "min_inter_obstacle_dist": 0.30,
+                "active_distance": 24.0,
+                "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+                "robot_keepout_radius": 1.25,
+            },
+        )
+
+
+# =============================================================================
+# Hospital full-floor play environment — Depth Camera Student
+# (constants imported from mdp/hospital/floor.py)
+# =============================================================================
+
+
+@configclass
+class Go2wHospitalFloorDepthPlayEnvCfg(Go2wNavDepthRLDistillEnvCfg_PLAY):
+    """Depth-student play/eval env for a combined hospital floor.
+
+    Includes reception queueing, waiting bench occupancy, doorway crossing,
+    ward/service flow with a pushed patient gurney, and a mild ramp connector.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = HOSPITAL_FLOOR_EPISODE_LENGTH_S
+        self.scene.env_spacing = HOSPITAL_FLOOR_ENV_SPACING
+        slot_tables = _hospital_structured_slot_tables(
+            HOSPITAL_FLOOR_CORRIDOR_KIND,
+            HOSPITAL_FLOOR_LEG_LENGTH,
+            HOSPITAL_FLOOR_CORRIDOR_WIDTH,
+            HOSPITAL_FLOOR_WALL_THICKNESS,
+        )
+        wall_count = int(slot_tables["wall_count"])
+        _configure_hospital_structured_depth_play(
+            self,
+            corridor_kind=HOSPITAL_FLOOR_CORRIDOR_KIND,
+            leg_length=HOSPITAL_FLOOR_LEG_LENGTH,
+            corridor_width=HOSPITAL_FLOOR_CORRIDOR_WIDTH,
+            wall_thickness=HOSPITAL_FLOOR_WALL_THICKNESS,
+            dynamic_obstacle_count=HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
+            speed_scale=0.8,
+            semantic_local_poses=_hospital_floor_semantic_local_poses(wall_count, HOSPITAL_FLOOR_LEG_LENGTH),
+            queue_groups=_hospital_floor_queue_groups(wall_count),
+            seated_groups=_hospital_floor_seated_groups(wall_count),
+            ramp_local_pose=HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
+            ramp_b_local_pose=HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
+            robot_start_local_xy=HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
+            min_inter_obstacle_dist=1.05,
+        )
+        _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
+        _include_hospital_ramp_in_depth_camera(self.scene)

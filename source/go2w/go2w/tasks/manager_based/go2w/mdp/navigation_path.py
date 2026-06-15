@@ -101,10 +101,10 @@ def _path_max_angle_ahead(
     progress_s: float,
     horizon_s: float,
 ) -> float:
-    """Return the max absolute turn angle (rad) at any waypoint within horizon_s of progress_s."""
+    """Return cumulative heading change (rad) within horizon_s of progress_s."""
     scan_end = progress_s + horizon_s
     n = int(path_xy.shape[0])
-    max_angle = 0.0
+    total_angle = 0.0
     for i in range(max(0, nearest_idx), n - 2):
         if float(path_s[i].item()) > scan_end:
             break
@@ -114,11 +114,10 @@ def _path_max_angle_ahead(
         len_bc = float(bc.norm().item())
         if len_ab < 1.0e-6 or len_bc < 1.0e-6:
             continue
-        cos_a = float((ab * bc).sum().item()) / (len_ab * len_bc)
-        angle = math.acos(max(-1.0, min(1.0, cos_a)))
-        if angle > max_angle:
-            max_angle = angle
-    return max_angle
+        heading_ab = torch.atan2(ab[1], ab[0])
+        heading_bc = torch.atan2(bc[1], bc[0])
+        total_angle += abs(float(wrap_to_pi(heading_bc - heading_ab).item()))
+    return total_angle
 
 
 def _adaptive_lookahead(
@@ -315,3 +314,31 @@ def update_navigation_path_waypoint(
                     f"path_head_b={float(heading_error_b.item()):+.2f} "
                     f"robot={fmt_xy(robot_xy)} target={fmt_xy(target[:2])} final={fmt_xy(final[:2])}"
                 )
+
+
+def update_navigation_path_waypoint_event(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    lookahead_distance: float = 1.25,
+    waypoint_reach_radius: float = 0.45,
+    adaptive_lookahead: bool = True,
+    lookahead_min: float = 0.6,
+    curvature_scan_horizon: float = 2.5,
+    curvature_threshold: float = 0.3,
+) -> None:
+    """Event-manager wrapper for rolling waypoint updates.
+
+    IsaacLab validates event terms by treating the first two positional
+    arguments as ``env`` and ``env_ids``. Keep ``env_ids`` mandatory here so
+    optional-parameter validation stays aligned with interval events.
+    """
+    update_navigation_path_waypoint(
+        env,
+        env_ids,
+        lookahead_distance=lookahead_distance,
+        waypoint_reach_radius=waypoint_reach_radius,
+        adaptive_lookahead=adaptive_lookahead,
+        lookahead_min=lookahead_min,
+        curvature_scan_horizon=curvature_scan_horizon,
+        curvature_threshold=curvature_threshold,
+    )
