@@ -73,9 +73,11 @@ from .observations import (
     depth_closeness_image,
     lidar_distances,
     local_goal_command_b,
+    obstacle_polar_depth,
+)
+from .observations_obstacle import (
     obstacle_full_geometry_features,
     obstacle_navigation_features,
-    obstacle_polar_depth,
     prev_hlc_actions,
 )
 
