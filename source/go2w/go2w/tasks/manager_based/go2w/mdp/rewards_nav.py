@@ -18,7 +18,8 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
-from .events import ensure_navigation_goal_buffers, _NAV_SCENARIO_CODES
+from .events import ensure_navigation_goal_buffers
+from .nav_scenarios import NAV_SCENARIO_CODES as _NAV_SCENARIO_CODES
 from .obstacle_geometry import (
     DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
     footprint_clearance,
@@ -201,16 +202,22 @@ def _nav_step_cache(env: ManagerBasedRLEnv) -> dict:
     return env._nav_reward_cache
 
 
+def _obstacle_names_key(obstacle_names: list[str]) -> tuple[str, ...]:
+    """Stable cache key for the exact obstacle list used by a reward helper."""
+    return tuple(obstacle_names)
+
+
 def _obstacle_positions_w(env: ManagerBasedRLEnv, obstacle_names: list[str]) -> torch.Tensor:
     """Cached (N, K, 3) world-frame obstacle positions for the current step.
 
     Gathering K scene entities and stacking them is a Python-side loop that runs
     once per obstacle reward term; memoising it removes most of the per-step
-    scene-access overhead. All navigation reward terms use the same obstacle
-    list, so the per-step length-keyed cache never collides.
+    scene-access overhead. The key includes the exact obstacle list so future
+    label-specific reward terms cannot collide when lists share the same length.
     """
     cache = _nav_step_cache(env)
-    cache_key = ("obstacle_pos_w", len(obstacle_names))
+    obstacle_key = _obstacle_names_key(obstacle_names)
+    cache_key = ("obstacle_pos_w", obstacle_key)
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
@@ -240,8 +247,11 @@ def _compute_nav_frontal_geometry(
     dense-recovery terms which all call this with the same arguments).
     """
     cache = _nav_step_cache(env)
+    obstacle_key = _obstacle_names_key(obstacle_names)
     cache_key = (
         "frontal_geom",
+        robot_cfg.name,
+        obstacle_key,
         frontal_half_angle_deg,
         max_distance,
         robot_safety_radius,
@@ -315,7 +325,15 @@ def _compute_goal_path_blockage(
         return torch.zeros(env.num_envs, device=env.device)
 
     cache = _nav_step_cache(env)
-    cache_key = ("goal_path_blockage", corridor_half_width, max_distance, robot_safety_radius)
+    obstacle_key = _obstacle_names_key(obstacle_names)
+    cache_key = (
+        "goal_path_blockage",
+        robot_cfg.name,
+        obstacle_key,
+        corridor_half_width,
+        max_distance,
+        robot_safety_radius,
+    )
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
@@ -410,6 +428,7 @@ def _compute_passable_gap_geometry(
     cache = _nav_step_cache(env)
     cache_key = (
         "passable_gap_geom",
+        robot_cfg.name,
         half_width_margin,
         approach_max_forward,
         approach_back_tol,

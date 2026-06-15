@@ -15,6 +15,7 @@ import math
 import torch
 from isaaclab.utils.math import quat_from_angle_axis
 
+from go2w.tasks.manager_based.go2w.mdp.nav_scenarios import NAV_SCENARIO_NAMES as _NAV_SCENARIO_ID_TO_NAME
 from go2w.tasks.manager_based.go2w.mdp.obstacle_geometry import footprint_clearance
 from go2w.tasks.manager_based.go2w.observation_layout import POLICY_OBS
 
@@ -44,14 +45,6 @@ def _format_eval_metrics(metrics: dict[str, float], completed_episodes: int, avg
             parts.append(f"{key}={metrics[key]:.4f}")
     return " ".join(parts)
 
-
-_NAV_SCENARIO_ID_TO_NAME: dict[int, str] = {
-    0: "empty", 1: "head_on", 2: "left_edge", 3: "right_edge",
-    4: "diag_left", 5: "diag_right", 6: "off_left", 7: "off_right",
-    8: "narrow_gap", 9: "random_fallback",
-    10: "partial_blockage_left_open", 11: "partial_blockage_right_open",
-    12: "cluttered", 13: "narrow_gap_wide", 14: "narrow_gap_barely",
-}
 
 _NAV_OBSTACLE_LABEL_SHORT_NAMES: dict[str, str] = {
     "patient_ambulatory": "PT",

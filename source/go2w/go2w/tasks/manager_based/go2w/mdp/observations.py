@@ -303,5 +303,3 @@ def local_goal_command_b(
             )
 
     return command
-
-

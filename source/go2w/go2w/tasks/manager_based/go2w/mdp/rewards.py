@@ -21,7 +21,8 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
-from .events import ensure_navigation_goal_buffers, _NAV_SCENARIO_NAMES
+from .events import ensure_navigation_goal_buffers
+from .nav_scenarios import NAV_SCENARIO_NAMES as _NAV_SCENARIO_NAMES
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -526,4 +527,3 @@ def goal_reached_and_resample(
                         env._go2w_had_collision_episode[current_mask].float().mean()
                     )
     return reached.float()
-
