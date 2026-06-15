@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import math
+import random
 from typing import TYPE_CHECKING
 
 import torch
@@ -255,6 +256,7 @@ def reset_structured_astar_corridor(
 
     # Spawn dynamic obstacles along all corridor segments (nav path + dead-end branches).
     placed_dynamic: list[tuple[float, float]] = []
+    rng = random
     half_width = corridor_width * 0.5
     all_centerlines = (centerline,) + extra_polylines
     segments = [seg for cl in all_centerlines for seg in zip(cl[:-1], cl[1:])]
