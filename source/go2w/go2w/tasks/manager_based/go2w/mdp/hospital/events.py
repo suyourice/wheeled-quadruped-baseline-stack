@@ -12,19 +12,35 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 
+from ..events import yaw_to_quat_wxyz as _yaw_to_quat_wxyz
 from ..obstacle_geometry import obstacle_effective_radius
 from ..structured_corridor import nearest_polyline_tangent_local, project_polyline_corridor_local
 from .relations import HOSPITAL_RELATION_SPECS
 from .specs import HOSPITAL_LABEL_SPECS
 
+_MOTION_PROFILE_PARAMS: dict[str, tuple[float, float, float]] = {
+    "burst_runner":   (0.45, 2.2, 0.85),
+    "queue_wait":     (0.02, 0.35, 0.08),
+    "door_crossing":  (0.35, 1.2, 0.90),
+    "leashed_pet":    (0.30, 1.8, 0.65),
+    "wander":         (0.30, 1.8, 0.65),
+    "pushed_payload": (0.10, 1.2, 0.30),
+    "careful_roll":   (0.10, 1.2, 0.30),
+    "slow_walk":      (0.14, 1.4, 0.35),
+    "careful_walk":   (0.14, 1.4, 0.35),
+    "cleaning_pass":  (0.12, 1.6, 0.35),
+}
 
-def _yaw_to_quat_wxyz(yaw: torch.Tensor) -> torch.Tensor:
-    """Return a wxyz quaternion for a planar yaw tensor."""
-    half_yaw = yaw * 0.5
-    quat = torch.zeros(*yaw.shape, 4, device=yaw.device, dtype=yaw.dtype)
-    quat[..., 0] = torch.cos(half_yaw)
-    quat[..., 3] = torch.sin(half_yaw)
-    return quat
+_WANDER_FRACTION: dict[str, float] = {
+    "burst_runner":  0.80,
+    "queue_wait":    0.0,
+    "door_crossing": 0.55,
+    "leashed_pet":   0.45,
+    "wander":        0.45,
+    "careful_walk":  0.12,
+    "slow_walk":     0.12,
+    "cleaning_pass": 0.20,
+}
 
 
 def _motion_profile_params(label: str) -> tuple[float, float, float]:
@@ -32,22 +48,7 @@ def _motion_profile_params(label: str) -> tuple[float, float, float]:
     spec = HOSPITAL_LABEL_SPECS.get(label)
     if spec is None or spec.motion_profile == "static":
         return 0.0, 0.0, 0.0
-    profile = spec.motion_profile
-    if profile == "burst_runner":
-        return 0.45, 2.2, 0.85
-    if profile == "queue_wait":
-        return 0.02, 0.35, 0.08
-    if profile == "door_crossing":
-        return 0.35, 1.2, 0.90
-    if profile in {"leashed_pet", "wander"}:
-        return 0.30, 1.8, 0.65
-    if profile in {"pushed_payload", "careful_roll"}:
-        return 0.10, 1.2, 0.30
-    if profile in {"slow_walk", "careful_walk"}:
-        return 0.14, 1.4, 0.35
-    if profile == "cleaning_pass":
-        return 0.12, 1.6, 0.35
-    return 0.20, 1.6, 0.45
+    return _MOTION_PROFILE_PARAMS.get(spec.motion_profile, (0.20, 1.6, 0.45))
 
 
 def _wander_fraction(label: str) -> float:
@@ -55,20 +56,7 @@ def _wander_fraction(label: str) -> float:
     spec = HOSPITAL_LABEL_SPECS.get(label)
     if spec is None:
         return 0.0
-    profile = spec.motion_profile
-    if profile == "burst_runner":
-        return 0.80
-    if profile == "queue_wait":
-        return 0.0
-    if profile == "door_crossing":
-        return 0.55
-    if profile in {"leashed_pet", "wander"}:
-        return 0.45
-    if profile in {"careful_walk", "slow_walk"}:
-        return 0.12
-    if profile == "cleaning_pass":
-        return 0.20
-    return 0.08
+    return _WANDER_FRACTION.get(spec.motion_profile, 0.08)
 
 
 def _local_offset_to_world(

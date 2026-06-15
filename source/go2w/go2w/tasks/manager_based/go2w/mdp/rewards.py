@@ -22,12 +22,6 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
 from .events import ensure_navigation_goal_buffers, _NAV_SCENARIO_NAMES
-from .obstacle_geometry import (
-    DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
-    footprint_clearance,
-    obstacle_active_mask,
-    obstacle_risk_radius,
-)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -232,85 +226,6 @@ def goal_progress_dense(
     hlc_action = env.action_manager.get_term("llc_cmd").processed_actions
     env.extras["log"]["mean_action_vx"] = hlc_action[:, 0].mean()
     env.extras["log"]["mean_action_speed_norm"] = hlc_action[:, :2].norm(dim=-1).mean()
-    return result
-
-
-def obstacle_nav_ttc_penalty(
-    env: ManagerBasedRLEnv,
-    obstacle_names: list[str],
-    safe_ttc: float = 1.5,
-    command_name: str = "base_velocity",
-    obstacle_radius: float = 0.22,
-    robot_half_width: float = 0.30,
-    safety_margin: float = 0.05,
-    robot_front_margin: float = 0.20,
-    lookahead_distance: float = 2.2,
-    sum_clip: float = 1.5,
-    min_command_speed: float = 0.05,
-    passable_gap_relief: float = 0.0,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Soft corridor TTC penalty for the navigation teacher.
-
-    The HLC command defines the intended path in the robot yaw frame. Obstacles
-    near the edge of that path receive a small penalty, while obstacles deeply
-    inside the swept corridor receive a strong penalty. This keeps narrow-gap
-    entries possible while still discouraging direct base collisions.
-    ``obstacle_radius`` is a compatibility fallback only; configured navigation
-    environments use per-slot physical footprint metadata.
-
-        corridor_half_width = robot_half_width + obstacle_risk_radius + safety_margin
-        lateral_risk = smoothstep(clamp((corridor_half_width - lateral) / corridor_half_width))
-        ttc = (forward - obstacle_risk_radius - robot_front_margin) / command_speed
-        penalty = sum(lateral_risk * clamp((safe_ttc - ttc) / safe_ttc, 0, 1))
-    """
-    asset = env.scene[asset_cfg.name]
-    command_xy = env.command_manager.get_command(command_name)[:, :2]      # (N, 2), yaw frame
-    command_speed = command_xy.norm(dim=-1).clamp(min=0.0)                 # (N,)
-    command_dir = command_xy / command_speed.clamp(min=min_command_speed).unsqueeze(-1)
-    moving = command_speed > min_command_speed
-    robot_pos_w = asset.data.root_pos_w[:, :2]                             # (N, 2)
-
-    # Cached (N, K, 3) world-frame obstacle positions, sliced to xy.
-    obs_pos_all = _obstacle_positions_w(env, obstacle_names)[..., :2]      # (N, K, 2)
-    rel_w = obs_pos_all - robot_pos_w.unsqueeze(1)                         # (N, K, 2)
-
-    heading = asset.data.heading_w
-    cos_h = torch.cos(heading).unsqueeze(-1)
-    sin_h = torch.sin(heading).unsqueeze(-1)
-    rel_b_x = cos_h * rel_w[..., 0] + sin_h * rel_w[..., 1]
-    rel_b_y = -sin_h * rel_w[..., 0] + cos_h * rel_w[..., 1]
-    rel_b = torch.stack((rel_b_x, rel_b_y), dim=-1)                        # (N, K, 2)
-
-    forward = (rel_b * command_dir.unsqueeze(1)).sum(dim=-1)               # (N, K)
-    lateral = torch.abs(
-        command_dir[:, 0:1] * rel_b[..., 1] - command_dir[:, 1:2] * rel_b[..., 0]
-    )                                                                       # (N, K)
-
-    center_distance = rel_w.norm(dim=-1)
-    active_obstacles = obstacle_active_mask(env, obstacle_names, center_distance, lookahead_distance + 10.0)
-    radii = obstacle_risk_radius(env, obstacle_names, center_distance, fallback_radius=obstacle_radius)
-    corridor_half_width = robot_half_width + radii + safety_margin
-    intrusion = torch.minimum((corridor_half_width - lateral).clamp(min=0.0), corridor_half_width)
-    lateral_alpha = intrusion / corridor_half_width
-    lateral_risk = lateral_alpha * lateral_alpha * (3.0 - 2.0 * lateral_alpha)
-
-    forward_clearance = forward - radii - robot_front_margin
-    ttc = forward_clearance / command_speed.clamp(min=min_command_speed).unsqueeze(-1)
-    ttc_risk = ((safe_ttc - ttc) / safe_ttc).clamp(min=0.0, max=1.0)
-
-    active = (
-        moving.unsqueeze(-1)
-        & (forward > 0.0)
-        & (forward_clearance < lookahead_distance)
-        & active_obstacles
-    )
-    penalty = lateral_risk * ttc_risk * active.to(lateral_risk.dtype)
-    result = penalty.sum(dim=1).clamp(max=sum_clip)
-
-    if passable_gap_relief > 0.0:
-        relief = _passable_gap_relief(env, asset_cfg, passable_gap_relief)
-        result = result * (1.0 - relief)
     return result
 
 
