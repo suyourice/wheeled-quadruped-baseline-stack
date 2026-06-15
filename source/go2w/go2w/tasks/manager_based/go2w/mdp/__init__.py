@@ -95,6 +95,16 @@ from .rewards import (
     goal_progress_dense,
     goal_reached_and_resample,
     joint_deviation_l1_command_gated,
+    navigation_path_final_goal_reached,
+    obstacle_contact_penalty,
+    obstacle_contact_termination,
+    obstacle_nav_ttc_penalty,
+    track_ang_vel_z_world_exp,
+    track_lin_vel_xy_yaw_frame_exp,
+    wheel_contact_penalty,
+    wheel_vel_zero_cmd,
+)
+from .rewards_nav import (
     nav_clearance_penalty,
     nav_dense_recovery_reward,
     nav_frontal_blocked_lateral_escape_reward,
@@ -104,14 +114,6 @@ from .rewards import (
     nav_open_path_goal_heading_reward,
     nav_open_path_straightness_reward,
     nav_passable_gap_traversal_reward,
-    navigation_path_final_goal_reached,
-    obstacle_contact_penalty,
-    obstacle_contact_termination,
-    obstacle_nav_ttc_penalty,
-    track_ang_vel_z_world_exp,
-    track_lin_vel_xy_yaw_frame_exp,
-    wheel_contact_penalty,
-    wheel_vel_zero_cmd,
 )
 
 # -- Terminations --------------------------------------------------------------
