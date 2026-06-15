@@ -338,6 +338,54 @@ class ObstacleEventCfg(EventCfg):
     )
 
 
+def _retarget_nav_rewards_to_play_obstacles(rewards: NavTeacherRewardsCfg) -> None:
+    """Use the full play obstacle slot list for footprint-aware reward terms."""
+    reward_names = (
+        "nav_clearance",
+        "nav_lateral_escape",
+        "nav_open_path_straightness",
+        "nav_open_path_goal_heading",
+        "nav_impossible_gap",
+        "obstacle_ttc",
+        "nav_dense_recovery",
+        "nav_grazing",
+    )
+    for reward_name in reward_names:
+        getattr(rewards, reward_name).params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+
+
+def _configure_play_common(cfg) -> None:
+    """Apply play-mode settings shared by all PLAY environment configs."""
+    cfg.scene.num_envs = 16
+    cfg.scene.env_spacing = 5.0
+    cfg.events.push_robot = None
+    cfg.events.add_base_mass = None
+    _retarget_nav_rewards_to_play_obstacles(cfg.rewards)
+    cfg.commands.base_velocity.debug_vis = True
+    cfg.events.reset_obstacles.params = {
+        **_NAV_RESET_PARAMS_BASE,
+        "obstacle_names": PLAY_OBSTACLE_NAMES,
+        "min_obstacles": PLAY_NUM_OBSTACLES,
+        "max_obstacles": PLAY_NUM_OBSTACLES,
+        "empty_env_fraction": 0.0,
+        "min_inter_obstacle_dist": PLAY_MIN_INTER_OBSTACLE_DIST,
+        "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+        "fixed_obstacle_shape_ids": PLAY_OBSTACLE_SHAPE_IDS,
+        "fixed_obstacle_widths": PLAY_OBSTACLE_WIDTHS,
+        "fixed_obstacle_depths": PLAY_OBSTACLE_DEPTHS,
+        "randomize_physical_obstacle_slots": True,
+        "physical_slot_randomization_start_iteration": 0,
+        "physical_slot_randomization_warmup_iterations": 0,
+    }
+
+
+def _configure_play_obstacle_obs(obs_group) -> None:
+    """Redirect privileged obstacle obs to the smaller PLAY obstacle set."""
+    obs_group.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+    obs_group.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+    obs_group.obstacle_full_geometry.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+
+
 # =============================================================================
 # Environment configs
 # =============================================================================
