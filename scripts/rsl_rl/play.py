@@ -8,6 +8,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import math
 import random
 import sys
 
@@ -27,6 +28,12 @@ DEFAULT_DYNAMIC_OBSTACLE_LATERAL_EXTENT = 0.30
 DEFAULT_DYNAMIC_OBSTACLE_SPEED_CHANGE_INTERVAL = (0.8, 2.5)
 DEFAULT_DYNAMIC_OBSTACLE_WANDER_FRACTION = 0.35
 DEFAULT_RANDOM_OBSTACLE_FOOTPRINT_RANGE = (0.12, 0.60)
+NAV_LIVE_LABEL_INTERVAL = 3
+NAV_LIVE_LABEL_SCALE = 0.040
+NAV_LIVE_LABEL_MAX = 40
+NAV_LIVE_LABEL_MIN_Z = 3.10
+DEPTH_VIDEO_ENV = 0
+DEPTH_VIDEO_SCALE = 4
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play an RL agent with RSL-RL.")
@@ -151,7 +158,7 @@ parser.add_argument(
     "--structured_env",
     "--structured-env",
     dest="structured_env",
-    choices=["none", "l_corridor", "serpentine_corridor"],
+    choices=["none", "l_corridor", "serpentine_corridor", "t_corridor", "hospital_ward"],
     default="none",
     help="Navigation play tasks only: replace random reset with a known structured scene.",
 )
@@ -258,14 +265,6 @@ parser.add_argument(
     type=float,
     default=0.3,
     help="Turn-angle threshold (rad) above which lookahead starts shrinking. Default: 0.3",
-)
-parser.add_argument(
-    "--heading_cap",
-    "--heading-cap",
-    dest="heading_cap",
-    type=float,
-    default=0.6,
-    help="Max heading command magnitude (rad) fed to the policy. Default: 0.6",
 )
 parser.add_argument(
     "--corner_rounding",
@@ -460,6 +459,14 @@ parser.add_argument(
 )
 parser.add_argument("--nav_log_env", "--nav-log-env", dest="nav_log_env", type=int, default=0)
 parser.add_argument(
+    "--nav_live_obstacle_labels",
+    "--nav-live-obstacle-labels",
+    dest="nav_live_obstacle_labels",
+    action="store_true",
+    default=False,
+    help="Navigation play: draw live viewport-only labels above active obstacles.",
+)
+parser.add_argument(
     "--nav_contact_debug",
     "--nav-contact-debug",
     dest="nav_contact_debug",
@@ -504,22 +511,6 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Save the student depth camera view as an MP4 video alongside the log.",
-)
-parser.add_argument(
-    "--depth_video_env",
-    "--depth-video-env",
-    dest="depth_video_env",
-    type=int,
-    default=0,
-    help="Env index whose depth camera to record. Default: 0.",
-)
-parser.add_argument(
-    "--depth_video_scale",
-    "--depth-video-scale",
-    dest="depth_video_scale",
-    type=int,
-    default=4,
-    help="Integer upscale factor applied to the 128x72 depth image. Default: 4 -> 512x288.",
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument(
@@ -601,7 +592,9 @@ class _TeeStream:
         return getattr(self._streams[0], name)
 
 import gymnasium as gym
+import numpy as np
 import torch
+from matplotlib import colormaps as _cmaps
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
@@ -636,6 +629,11 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import go2w.tasks  # noqa: F401
 from go2w.tasks.manager_based.go2w import mdp as go2w_mdp
 from go2w.tasks.manager_based.go2w.go2w_obstacle_env_cfg import OBSTACLE_SIZE, make_play_obstacle_cfg
+from go2w.tasks.manager_based.go2w.mdp.hospital.specs import (
+    NAV_WAYPOINT_COMMAND_MIN_FORWARD_PLAY,
+    NAV_WAYPOINT_COMMAND_MAX_LATERAL_PLAY,
+    NAV_WAYPOINT_COMMAND_MAX_HEADING_PLAY,
+)
 from go2w.tasks.manager_based.go2w.mdp.obstacle_geometry import (
     OBSTACLE_SHAPE_CONE,
     OBSTACLE_SHAPE_CUBOID,
@@ -907,7 +905,7 @@ def _override_structured_navigation_play(
     """Configure known structured navigation play scenes."""
     if args_cli.structured_env == "none":
         return
-    if args_cli.structured_env not in ("l_corridor", "serpentine_corridor"):
+    if args_cli.structured_env not in ("l_corridor", "serpentine_corridor", "t_corridor", "hospital_ward"):
         raise ValueError(f"Unsupported --structured_env={args_cli.structured_env!r}.")
 
     if args_cli.corridor_width <= 0.8:
@@ -934,12 +932,19 @@ def _override_structured_navigation_play(
 
     obstacle_names = list(reset_params.get("obstacle_names", []))
 
+    # Prefer env-cfg corridor dimensions so task-specific envs (e.g. hospital_ward)
+    # use their own configured values.  CLI args act as fallback for generic envs.
+    _eff_width = reset_params.get("corridor_width", args_cli.corridor_width)
+    _eff_leg = reset_params.get("leg_length", args_cli.corridor_leg_length)
+    _eff_thickness = reset_params.get("wall_thickness", args_cli.corridor_wall_thickness)
+    _eff_turn = reset_params.get("corridor_turn_length", args_cli.corridor_turn_length)
+
     wall_specs = go2w_mdp.structured_corridor_wall_specs(
         args_cli.structured_env,
-        args_cli.corridor_leg_length,
-        args_cli.corridor_width,
-        args_cli.corridor_wall_thickness,
-        args_cli.corridor_turn_length,
+        _eff_leg,
+        _eff_width,
+        _eff_thickness,
+        _eff_turn,
     )
     wall_count = len(wall_specs)
     if len(obstacle_names) < wall_count:
@@ -991,10 +996,10 @@ def _override_structured_navigation_play(
         "dynamic_obstacle_names": obstacle_names[wall_count: wall_count + dynamic_count],
         "dynamic_obstacle_indices": list(range(wall_count, wall_count + dynamic_count)),
         "dynamic_obstacle_count": dynamic_count,
-        "corridor_width": args_cli.corridor_width,
-        "leg_length": args_cli.corridor_leg_length,
-        "corridor_turn_length": args_cli.corridor_turn_length,
-        "wall_thickness": args_cli.corridor_wall_thickness,
+        "corridor_width": _eff_width,
+        "leg_length": _eff_leg,
+        "corridor_turn_length": _eff_turn,
+        "wall_thickness": _eff_thickness,
         "grid_resolution": args_cli.astar_grid_resolution,
         "robot_inflation": 0.50,
         "lookahead_distance": args_cli.astar_lookahead_distance,
@@ -1026,22 +1031,47 @@ def _override_structured_navigation_play(
             func=go2w_mdp.navigation_path_final_goal_reached,
             params={"position_threshold": args_cli.structured_goal_done_radius},
         )
-    obs_cfg = getattr(env_cfg, "observations", None)
-    if obs_cfg is not None:
-        for group_name in vars(obs_cfg):
-            group = getattr(obs_cfg, group_name)
-            goal_term = getattr(group, "goal_command", None)
-            if goal_term is not None and hasattr(goal_term, "params"):
-                goal_term.params["command_max_heading"] = args_cli.heading_cap
+    # Write effective values back so callers (logging, plot script) see the real dims.
+    args_cli.corridor_width = _eff_width
+    args_cli.corridor_leg_length = _eff_leg
+    args_cli.corridor_wall_thickness = _eff_thickness
+    if _eff_turn is not None:
+        args_cli.corridor_turn_length = _eff_turn
+
     print(
         "[INFO] Structured navigation play: "
         f"env={args_cli.structured_env}, wall_slots={wall_count}, dynamic_slots={dynamic_count}, "
-        f"width={args_cli.corridor_width:.2f}, leg_length={args_cli.corridor_leg_length:.2f}, "
-        f"turn_length={args_cli.corridor_turn_length}, "
+        f"width={_eff_width:.2f}, leg_length={_eff_leg:.2f}, "
+        f"turn_length={_eff_turn}, "
         f"A*_resolution={args_cli.astar_grid_resolution:.2f}, lookahead={args_cli.astar_lookahead_distance:.2f}, "
         f"reach_radius={args_cli.astar_waypoint_reach_radius:.2f}, "
         f"done_radius={args_cli.structured_goal_done_radius:.2f}"
     )
+
+
+def _override_navigation_play_goal_command_params(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    args_cli: argparse.Namespace,
+) -> dict[str, float]:
+    """Apply play-time local goal command caps before the observation manager is built."""
+    overrides = {
+        "command_min_forward": NAV_WAYPOINT_COMMAND_MIN_FORWARD_PLAY,
+        "command_max_lateral": NAV_WAYPOINT_COMMAND_MAX_LATERAL_PLAY,
+        "command_max_heading": NAV_WAYPOINT_COMMAND_MAX_HEADING_PLAY,
+        "command_turn_slowdown_heading": 0.45,
+        "command_turn_slowdown_min_forward": 0.25,
+    }
+    obs_cfg = getattr(env_cfg, "observations", None)
+    if obs_cfg is None:
+        return overrides
+
+    for obs_group in vars(obs_cfg).values():
+        if not hasattr(obs_group, "__dict__"):
+            continue
+        for term in vars(obs_group).values():
+            if hasattr(term, "func") and getattr(term.func, "__name__", "") == "local_goal_command_b":
+                term.params.update(overrides)
+    return overrides
 
 
 def _override_play_episode_length(
@@ -1253,6 +1283,385 @@ _NAV_SCENARIO_ID_TO_NAME: dict[int, str] = {
     12: "cluttered", 13: "narrow_gap_wide", 14: "narrow_gap_barely",
 }
 
+_NAV_OBSTACLE_LABEL_SHORT_NAMES: dict[str, str] = {
+    "patient_ambulatory": "PT",
+    "patient_with_iv": "PT_IV",
+    "wheelchair_patient": "WC",
+    "gurney_patient": "BED",
+    "reception_desk": "DESK",
+    "queue_patient": "Q_PT",
+    "queue_visitor": "Q_VIS",
+    "seated_patient": "S_PT",
+    "seated_visitor": "S_VIS",
+    "doorway_patient": "D_PT",
+    "doorway_staff": "D_STAFF",
+    "cleaning_machine": "CLEAN",
+    "fallen_object": "FALL",
+    "elderly": "ELDER",
+    "adult": "ADULT",
+    "child": "CHILD",
+    "staff": "STAFF",
+    "visitor": "VIS",
+    "cart": "CART",
+    "wheelchair": "WC_S",
+    "gurney": "BED",
+    "iv_pole": "IV",
+    "dog": "DOG",
+    "chair": "CHAIR",
+    "bench": "BENCH",
+    "trash_bin": "TRASH",
+    "table": "TABLE",
+}
+
+
+def _short_obstacle_label(label: str) -> str:
+    """Return a compact viewport/debug-map label."""
+    return _NAV_OBSTACLE_LABEL_SHORT_NAMES.get(label, label).upper()
+
+
+_BITMAP_FONT_5X7: dict[str, tuple[str, ...]] = {
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01111", "10000", "10000", "10000", "10000", "10000", "01111"),
+    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01111", "10000", "10000", "10111", "10001", "10001", "01111"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+    "J": ("00111", "00010", "00010", "00010", "00010", "10010", "01100"),
+    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "V": ("10001", "10001", "10001", "10001", "01010", "01010", "00100"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "10101", "01010"),
+    "X": ("10001", "01010", "00100", "00100", "00100", "01010", "10001"),
+    "Y": ("10001", "01010", "00100", "00100", "00100", "00100", "00100"),
+    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "10000", "11110", "00001", "00001", "11110"),
+    "6": ("01110", "10000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00001", "01110"),
+    "_": ("00000", "00000", "00000", "00000", "00000", "00000", "11111"),
+    "-": ("00000", "00000", "00000", "11111", "00000", "00000", "00000"),
+}
+
+
+class _LiveObstacleLabelDrawer:
+    """Draw viewport-only bitmap labels over obstacle tops using Isaac debug draw."""
+
+    def __init__(self, scale: float, max_labels: int):
+        self.scale = max(scale, 0.018)
+        self.max_labels = max(0, max_labels)
+        self.enabled = False
+        self._draw = None
+        try:
+            from isaacsim.util.debug_draw import _debug_draw
+
+            self._draw = _debug_draw.acquire_debug_draw_interface()
+            self.enabled = True
+        except Exception as exc:
+            print(f"[WARN] Live obstacle labels disabled: debug draw unavailable ({exc}).")
+
+    def clear(self) -> None:
+        if self._draw is None:
+            return
+        try:
+            self._draw.clear_points()
+        except Exception:
+            pass
+
+    def update(self, base_env, env_index: int) -> None:
+        if not self.enabled or self._draw is None or self.max_labels <= 0:
+            return
+        records = _get_nav_obstacle_records(base_env, env_index, include_walls=False)[: self.max_labels]
+        shadow_points: list[tuple[float, float, float]] = []
+        obstacle_points: list[tuple[float, float, float]] = []
+        zone_points: list[tuple[float, float, float]] = []
+        situation_points: list[tuple[float, float, float]] = []
+
+        # XY positions of already-placed labels — used to stagger z when labels are close.
+        _placed_xy: list[tuple[float, float]] = []
+        _stagger_step = self.scale * 9.5   # ~one font row + gap per stagger level
+        _min_sep = self.scale * 22.0       # ~4-char label width + margin
+
+        def _stagger_z(x: float, y: float, base_z: float) -> float:
+            count = sum(1 for px, py in _placed_xy if math.hypot(x - px, y - py) < _min_sep)
+            return base_z + count * _stagger_step
+
+        def add_label(
+            label: str,
+            x: float,
+            y: float,
+            center_z: float,
+            scale: float,
+            target: list[tuple[float, float, float]],
+        ) -> None:
+            base_z = max(NAV_LIVE_LABEL_MIN_Z, center_z + 0.28, 2.0 * center_z + 0.03)
+            z = _stagger_z(x, y, base_z)
+            _placed_xy.append((x, y))
+            points = self._label_points(label, x, y, center_z, scale, z_override=z)
+            shadow_points.extend((px + scale * 0.16, py - scale * 0.16, pz - 0.004) for px, py, pz in points)
+            target.extend(points)
+
+        for rec in records:
+            add_label(rec["short_label"], rec["x"], rec["y"], rec["z"], self.scale, obstacle_points)
+        for ann in _get_hospital_live_annotations(base_env, env_index):
+            target = zone_points if ann["kind"] == "zone" else situation_points
+            add_label(
+                ann["label"],
+                ann["x"],
+                ann["y"],
+                ann.get("z", 0.95),
+                self.scale * ann.get("scale", 1.0),
+                target,
+            )
+        try:
+            self._draw.clear_points()
+            if shadow_points:
+                self._draw.draw_points(shadow_points, [(0.0, 0.0, 0.0, 1.0)] * len(shadow_points), [6] * len(shadow_points))
+            if obstacle_points:
+                self._draw.draw_points(obstacle_points, [(1.0, 1.0, 1.0, 1.0)] * len(obstacle_points), [4] * len(obstacle_points))
+            if zone_points:
+                self._draw.draw_points(zone_points, [(0.20, 0.92, 1.0, 1.0)] * len(zone_points), [4] * len(zone_points))
+            if situation_points:
+                self._draw.draw_points(situation_points, [(1.0, 0.82, 0.18, 1.0)] * len(situation_points), [4] * len(situation_points))
+        except Exception as exc:
+            self.enabled = False
+            print(f"[WARN] Live obstacle labels disabled after draw failure: {exc}")
+
+    def _label_points(self, label: str, x: float, y: float, center_z: float, scale: float, z_override: float | None = None) -> list[tuple[float, float, float]]:
+        chars = [ch if ch in _BITMAP_FONT_5X7 else "_" for ch in label.upper()]
+        if not chars:
+            return []
+        char_stride = 6
+        total_cols = len(chars) * char_stride - 1
+        z = z_override if z_override is not None else max(NAV_LIVE_LABEL_MIN_Z, center_z + 0.28, 2.0 * center_z + 0.03)
+        points: list[tuple[float, float, float]] = []
+        for char_idx, ch in enumerate(chars):
+            bitmap = _BITMAP_FONT_5X7.get(ch)
+            if bitmap is None:
+                continue
+            col_base = char_idx * char_stride
+            for row_idx, row in enumerate(bitmap):
+                for col_idx, bit in enumerate(row):
+                    if bit != "1":
+                        continue
+                    px = x + (col_base + col_idx - total_cols * 0.5) * scale
+                    py = y + (3.0 - row_idx) * scale
+                    points.append((px, py, z))
+        return points
+
+
+def _obstacle_label_map(base_env, obstacle_names: list[str]) -> dict[str, str]:
+    """Resolve obstacle_name -> semantic label from reset or hospital motion config."""
+    label_by_name: dict[str, str] = {}
+    try:
+        reset_params = base_env.cfg.events.reset_obstacles.params
+        reset_labels = list(reset_params.get("obstacle_labels", []))
+        if len(reset_labels) == len(obstacle_names):
+            label_by_name.update(dict(zip(obstacle_names, reset_labels)))
+    except Exception:
+        pass
+
+    try:
+        hospital_motion = getattr(base_env.cfg.events, "hospital_dynamic_motion", None)
+        motion_params = getattr(hospital_motion, "params", None) if hospital_motion is not None else None
+        if motion_params is not None:
+            motion_names = list(motion_params.get("obstacle_names", []))
+            motion_labels = list(motion_params.get("obstacle_labels", []))
+            if len(motion_names) == len(motion_labels):
+                label_by_name.update(dict(zip(motion_names, motion_labels)))
+    except Exception:
+        pass
+    return label_by_name
+
+
+def _nav_debug_corridor_plot_args(base_env, args_cli: argparse.Namespace) -> list[str]:
+    """Build corridor overlay args for plot_nav_debug from CLI or env cfg."""
+    corridor_kind = None
+    leg_length = args_cli.corridor_leg_length
+    corridor_width = args_cli.corridor_width
+    clearance_cost_weight = args_cli.astar_clearance_cost_weight
+    clearance_cost_sigma = args_cli.astar_clearance_cost_sigma
+    corner_rounding = args_cli.corner_rounding
+    corner_radius = args_cli.corner_radius
+
+    if args_cli.structured_env != "none":
+        corridor_kind = args_cli.structured_env
+    else:
+        try:
+            reset_params = base_env.cfg.events.reset_obstacles.params
+            corridor_kind = reset_params.get("corridor_kind", None)
+            leg_length = reset_params.get("leg_length", leg_length)
+            corridor_width = reset_params.get("corridor_width", corridor_width)
+            clearance_cost_weight = reset_params.get("clearance_cost_weight", clearance_cost_weight)
+            clearance_cost_sigma = reset_params.get("clearance_cost_sigma", clearance_cost_sigma)
+            corner_rounding = reset_params.get("corner_rounding", corner_rounding)
+            corner_radius = reset_params.get("corner_radius", corner_radius)
+        except Exception:
+            corridor_kind = None
+
+    if corridor_kind is None or str(corridor_kind).lower() == "none":
+        return []
+    args = [
+        "--corridor", str(corridor_kind),
+        "--leg_length", str(leg_length),
+        "--corridor_width", str(corridor_width),
+        "--alpha", str(clearance_cost_weight),
+        "--sigma", str(clearance_cost_sigma),
+    ]
+    if corner_rounding:
+        args.extend(["--corner_rounding", "--corner_radius", str(corner_radius)])
+    return args
+
+
+def _get_nav_obstacle_records(base_env, env_index: int, include_walls: bool = False) -> list[dict]:
+    """Collect active obstacle positions and semantic labels for one env."""
+    if base_env is None:
+        return []
+    try:
+        reset_params = base_env.cfg.events.reset_obstacles.params
+        obstacle_names = list(reset_params.get("obstacle_names", []))
+    except Exception:
+        return []
+    if not obstacle_names:
+        return []
+
+    ei = max(0, min(env_index, base_env.num_envs - 1))
+    label_by_name = _obstacle_label_map(base_env, obstacle_names)
+    active_mask = getattr(base_env, "_go2w_obstacle_active_mask", None)
+    widths = getattr(base_env, "_go2w_obstacle_width", None)
+    depths = getattr(base_env, "_go2w_obstacle_depth", None)
+    shape_ids = getattr(base_env, "_go2w_obstacle_shape_id", None)
+
+    records: list[dict] = []
+    for idx, name in enumerate(obstacle_names):
+        label = label_by_name.get(name, "obstacle")
+        if label == "wall" and not include_walls:
+            continue
+        try:
+            pos = base_env.scene[name].data.root_pos_w[ei]
+        except Exception:
+            continue
+
+        x, y, z = pos[0].item(), pos[1].item(), pos[2].item()
+        if abs(x) > 500.0 or abs(y) > 500.0:
+            continue
+        if active_mask is not None and active_mask.shape[1] > idx and not bool(active_mask[ei, idx].item()):
+            continue
+
+        width = float(widths[ei, idx].item()) if widths is not None and widths.shape[1] > idx else 0.0
+        depth = float(depths[ei, idx].item()) if depths is not None and depths.shape[1] > idx else 0.0
+        shape_id = int(shape_ids[ei, idx].item()) if shape_ids is not None and shape_ids.shape[1] > idx else -1
+        records.append({
+            "name": name,
+            "label": label,
+            "short_label": _short_obstacle_label(label),
+            "x": x,
+            "y": y,
+            "z": z,
+            "width": width,
+            "depth": depth,
+            "shape_id": shape_id,
+        })
+    return records
+
+
+def _get_hospital_live_annotations(base_env, env_index: int) -> list[dict]:
+    """Return viewport-only semantic floor/situation labels for the hospital floor."""
+    if base_env is None:
+        return []
+    try:
+        reset_params = base_env.cfg.events.reset_obstacles.params
+        corridor_kind = str(reset_params.get("corridor_kind", "")).lower()
+    except Exception:
+        return []
+    if corridor_kind != "hospital_floor":
+        return []
+    required = (
+        "_go2w_structured_corridor_start_xy",
+        "_go2w_structured_corridor_yaw",
+        "_go2w_structured_corridor_leg_length",
+    )
+    if any(not hasattr(base_env, attr) for attr in required):
+        return []
+
+    ei = max(0, min(env_index, base_env.num_envs - 1))
+    try:
+        origin = base_env._go2w_structured_corridor_start_xy[ei]
+        yaw = float(base_env._go2w_structured_corridor_yaw[ei].item())
+        leg_length = float(base_env._go2w_structured_corridor_leg_length[ei].item())
+    except Exception:
+        return []
+    if leg_length <= 0.0:
+        return []
+
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+
+    def local(label: str, kind: str, x: float, y: float, scale: float = 0.90) -> dict:
+        world_x = float(origin[0].item()) + x * cos_yaw - y * sin_yaw
+        world_y = float(origin[1].item()) + x * sin_yaw + y * cos_yaw
+        return {"label": label, "kind": kind, "x": world_x, "y": world_y, "z": 0.95, "scale": scale}
+
+    L = leg_length
+    zones = (
+        local("RECEPTION", "zone", 0.72 * L, -0.55 * L, 0.95),
+        local("WAITING", "zone", 1.05 * L, -0.20 * L, 0.95),
+        local("MAIN", "zone", 1.40 * L, 0.00, 0.95),
+        local("SERVICE", "zone", 2.05 * L, -0.50 * L, 0.95),
+        local("WARD", "zone", 2.00 * L, 0.52 * L, 0.95),
+        local("ROOMS", "zone", 2.75 * L, 1.24 * L, 0.95),
+        local("IMAGING", "zone", 2.60 * L, 0.72 * L, 0.95),
+        local("RAMP", "zone", 3.20 * L, L, 0.95),
+        local("PHARM", "zone", 3.84 * L, 0.72 * L, 0.95),
+        local("ELEV", "zone", 3.95 * L, 1.22 * L, 0.95),
+    )
+    situations = (
+        local("QUEUE", "situation", 0.82 * L, -0.24 * L, 0.80),
+        local("SEATED", "situation", 1.02 * L, -0.08 * L, 0.80),
+        local("LEASH", "situation", 1.34 * L, 0.95, 0.80),
+        local("WC_PASS", "situation", 1.58 * L, -0.95, 0.80),
+        local("IV_WALK", "situation", 1.84 * L, 1.24, 0.80),
+        local("CART_PUSH", "situation", 2.08 * L, -0.33 * L, 0.80),
+        local("BED_PUSH", "situation", 2.58 * L, L - 0.06, 0.80),
+        local("DOOR_XING", "situation", 2.78 * L, 1.36 * L, 0.80),
+        local("CLEAN", "situation", 3.28 * L, 0.70 * L, 0.80),
+    )
+    return list(zones + situations)
+
+
+def _print_nav_obstacle_label_log(base_env, step_count: int, env_index: int) -> None:
+    """Emit a parseable labeled obstacle snapshot for top-down plots."""
+    records = _get_nav_obstacle_records(base_env, env_index, include_walls=False)
+    parts = [
+        (
+            f"{rec['name']}:{rec['short_label']}:{rec['x']:+.3f}:{rec['y']:+.3f}:"
+            f"{rec['width']:.3f}:{rec['depth']:.3f}"
+        )
+        for rec in records
+    ]
+    print(
+        "[GO2W_NAV_OBSTACLES] "
+        f"step={step_count} env={env_index} active_count={len(records)} "
+        f"obstacles={';'.join(parts)}"
+    )
+
 
 def _get_nav_env_info(base_env, env_index: int, last_hlc_cmd: torch.Tensor | None) -> dict:
     """Collect nav task state for the watched env. Returns empty dict if not a nav task."""
@@ -1276,22 +1685,10 @@ def _get_nav_env_info(base_env, env_index: int, last_hlc_cmd: torch.Tensor | Non
         cmd = last_hlc_cmd[ei]
         info["hlc_cmd"] = (cmd[0].item(), cmd[1].item(), cmd[2].item())
 
-    # Active obstacle positions (filter out obstacles parked >100 m away)
-    obstacle_names: list[str] = []
-    try:
-        obstacle_names = base_env.cfg.events.reset_obstacles.params.get("obstacle_names", [])
-    except Exception:
-        pass
-    active_obs = []
-    for name in obstacle_names:
-        try:
-            pos = base_env.scene[name].data.root_pos_w[ei]
-            x, y = pos[0].item(), pos[1].item()
-            if abs(x) < 500.0 and abs(y) < 500.0:
-                active_obs.append((x, y))
-        except Exception:
-            pass
+    obstacle_records = _get_nav_obstacle_records(base_env, ei, include_walls=False)
+    active_obs = [(rec["x"], rec["y"]) for rec in obstacle_records]
     info["obstacles"] = active_obs
+    info["obstacle_records"] = obstacle_records
 
     return info
 
@@ -1444,10 +1841,15 @@ def _print_nav_episode_log(
         hlc_str = f"  hlc_cmd: vx={vx:+.3f} vy={vy:+.3f} yaw={yaw:+.3f}\n"
 
     obs_lines = ""
-    obstacles = nav.get("obstacles", [])
-    if obstacles:
-        obs_parts = [f"    [{x:+.2f}, {y:+.2f}]" for x, y in obstacles]
-        obs_lines = "  obstacles (" + str(len(obstacles)) + " active):\n" + "\n".join(obs_parts) + "\n"
+    obstacle_records = nav.get("obstacle_records", [])
+    if obstacle_records:
+        obs_parts = [
+            f"    {rec['short_label']:<12} [{rec['x']:+.2f}, {rec['y']:+.2f}]"
+            for rec in obstacle_records[:48]
+        ]
+        if len(obstacle_records) > len(obs_parts):
+            obs_parts.append(f"    ... {len(obstacle_records) - len(obs_parts)} more")
+        obs_lines = "  obstacles (" + str(len(obstacle_records)) + " active):\n" + "\n".join(obs_parts) + "\n"
     else:
         obs_lines = "  obstacles: none active\n"
 
@@ -1595,6 +1997,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _override_random_navigation_play_obstacle_shapes(env_cfg, args_cli, env_seed)
     _override_structured_navigation_play(env_cfg, args_cli)
     _override_dynamic_navigation_play(env_cfg, args_cli)
+    _nav_play_overrides = _override_navigation_play_goal_command_params(env_cfg, args_cli)
     if args_cli.no_astar and args_cli.structured_env == "none":
         raise ValueError("--no_astar requires --structured_env to be set.")
     if args_cli.no_astar:
@@ -1640,7 +2043,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "video_length": args_cli.video_length,
             "disable_logger": True,
         }
-        print("[INFO] Recording videos during training.")
+        print("[INFO] Recording videos during play.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
@@ -1745,8 +2148,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _nav_path_marker = None
     _nav_has_goal_markers = hasattr(_base_env, "_go2w_goal_pos_w") and hasattr(_base_env, "_go2w_start_pos_w")
     _nav_has_astar_markers = (
-        args_cli.structured_env != "none"
-        and not args_cli.no_astar
+        not args_cli.no_astar
         and hasattr(_base_env, "_go2w_navigation_path_w")
         and hasattr(_base_env, "_go2w_navigation_path_count")
     )
@@ -1812,19 +2214,50 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         os.environ.setdefault("GO2W_NAV_DEBUG", "1")
         print(f"[INFO] Play output dir: {_out_dir}")
 
+    print(f"[INFO] Nav command play values: {_nav_play_overrides}")
+
+    _obstacle_label_logging = (
+        args_cli.nav_live_obstacle_labels
+        or "Hospital" in str(args_cli.task)
+    )
+    if _obstacle_label_logging:
+        print("[INFO] Obstacle label logging enabled for top-down debug plots.")
+
+    _live_label_drawer = None
+    if args_cli.nav_live_obstacle_labels:
+        if getattr(args_cli, "headless", False):
+            print("[WARN] --nav_live_obstacle_labels requested in headless mode; viewport labels may not be visible.")
+        _live_label_drawer = _LiveObstacleLabelDrawer(
+            scale=NAV_LIVE_LABEL_SCALE,
+            max_labels=NAV_LIVE_LABEL_MAX,
+        )
+        if _live_label_drawer.enabled:
+            print(
+                "[INFO] Live obstacle labels enabled: "
+                f"interval={NAV_LIVE_LABEL_INTERVAL}, "
+                f"scale={NAV_LIVE_LABEL_SCALE:.3f}, max={NAV_LIVE_LABEL_MAX}"
+            )
+
+    # Auto-enable depth video when --play_name is set and the env has a depth camera.
+    _has_depth_camera = (
+        hasattr(_base_env.scene, "sensors") and "depth_camera" in _base_env.scene.sensors
+    )
+    if args_cli.play_name and _has_depth_camera and not args_cli.depth_video:
+        args_cli.depth_video = True
+        print("[INFO] --play_name: depth camera found — auto-enabling depth video recording.")
+
     # depth video writer setup
     _depth_video_frames: list = []
     if args_cli.depth_video:
-        if not hasattr(_base_env.scene, "sensors") or "depth_camera" not in _base_env.scene.sensors:
+        if not _has_depth_camera:
             print("[WARN] --depth_video: no 'depth_camera' sensor found; depth video disabled.")
             args_cli.depth_video = False
         else:
             print(
-                f"[INFO] Depth video: recording env={args_cli.depth_video_env}, "
-                f"scale={args_cli.depth_video_scale}x -> "
-                f"{128 * args_cli.depth_video_scale}x{72 * args_cli.depth_video_scale} MP4"
+                f"[INFO] Depth video: recording env={DEPTH_VIDEO_ENV}, "
+                f"scale={DEPTH_VIDEO_SCALE}x -> "
+                f"{128 * DEPTH_VIDEO_SCALE}x{72 * DEPTH_VIDEO_SCALE} MP4"
             )
-            pass
 
     # simulate environment
     if args_cli.nav_contact_debug and args_cli.nav_contact_debug_steps <= 0:
@@ -1875,13 +2308,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _depth_raw = _depth_sensor.data.output["distance_to_image_plane"]
             if _depth_raw.ndim == 4:
                 _depth_raw = _depth_raw.squeeze(-1)
-            _depth_frame = _depth_raw[args_cli.depth_video_env].float().cpu().numpy()
+            _depth_frame = _depth_raw[DEPTH_VIDEO_ENV].float().cpu().numpy()
             _closeness = (1.0 - _depth_frame / 6.0).clip(0.0, 1.0)
-            import numpy as np
-            from matplotlib import colormaps as _cmaps
             _viridis = _cmaps["viridis"]
             _colored = (_viridis(_closeness)[:, :, :3] * 255).astype(np.uint8)
-            _scale = args_cli.depth_video_scale
+            _scale = DEPTH_VIDEO_SCALE
             _scaled = np.repeat(np.repeat(_colored, _scale, axis=0), _scale, axis=1)
             _depth_video_frames.append(_scaled)
 
@@ -1922,6 +2353,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         orientations=orientations,
                         scales=scales,
                     )
+        if _live_label_drawer is not None and step_count % NAV_LIVE_LABEL_INTERVAL == 0:
+            _live_label_drawer.update(_base_env, args_cli.nav_log_env)
 
         episode_lengths += 1
         done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
@@ -1977,6 +2410,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _print_navigation_play_log(
                 obs, dones, step_count, args_cli.nav_log_env, _base_env, last_hlc_cmd
             )
+            if _obstacle_label_logging:
+                _print_nav_obstacle_label_log(_base_env, step_count, args_cli.nav_log_env)
         if args_cli.nav_contact_debug:
             _print_nav_contact_debug(_base_env, step_count, args_cli.nav_log_env, last_hlc_cmd)
             if step_count + 1 >= args_cli.nav_contact_debug_steps:
@@ -2017,19 +2452,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _imageio.mimwrite(_depth_video_path, _depth_video_frames, fps=int(1.0 / dt), quality=8)
         print(f"[INFO] Depth video saved: {_depth_video_path}  ({len(_depth_video_frames)} frames)")
 
+    # Write session manifest when --play_name is set.
+    if _out_dir is not None:
+        import json as _json
+        _manifest = {
+            "task": args_cli.task,
+            "checkpoint": getattr(args_cli, "checkpoint", None),
+            "num_envs": args_cli.num_envs,
+            "steps": step_count,
+            "total_episodes": sum(termination_counts.values()) if termination_counts else None,
+            "termination_counts": dict(termination_counts) if termination_counts else {},
+        }
+        _manifest_path = os.path.join(_out_dir, "session_manifest.json")
+        with open(_manifest_path, "w") as _mf:
+            _json.dump(_manifest, _mf, indent=2)
+        print(f"[INFO] Session manifest saved: {_manifest_path}")
+
     # Auto-generate nav debug plot when --play_name is set.
-    if _out_dir is not None and args_cli.structured_env != "none":
+    if _out_dir is not None and _nav_has_goal_markers:
         _nav_log = os.path.join(_out_dir, "nav_debug.log")
         if _out_log_file is not None:
             _out_log_file.flush()
         _plot_cmd = [
             sys.executable, "scripts/plot_nav_debug.py", _nav_log,
-            "--corridor", args_cli.structured_env,
-            "--leg_length", str(args_cli.corridor_leg_length),
-            "--corridor_width", str(args_cli.corridor_width),
-            "--alpha", str(args_cli.astar_clearance_cost_weight),
             "--output_dir", _out_dir,
         ]
+        _plot_cmd.extend(_nav_debug_corridor_plot_args(_base_env, args_cli))
         print(f"[INFO] Generating nav debug plot ...")
         sys.stdout.flush()
         result = subprocess.run(_plot_cmd, capture_output=True, text=True)
@@ -2041,6 +2489,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if _out_log_file is not None:
         sys.stdout = sys.__stdout__
         _out_log_file.close()
+
+    if _live_label_drawer is not None:
+        _live_label_drawer.clear()
 
     # close the simulator
     env.close()
