@@ -243,34 +243,6 @@ def _load_locomotion_checkpoint(runner: OnPolicyRunner, ckpt_path: str, device: 
     print(f"[INFO] Loaded locomotion checkpoint from: {ckpt_path}")
 
 
-def _load_distillation_teacher_locomotion_checkpoint(
-    runner: DistillationRunner, ckpt_path: str, device: str
-) -> None:
-    """Initialize distillation teacher/student frozen LLCs from a flat locomotion checkpoint."""
-    teacher_target = getattr(runner.alg.teacher, "frozen_actor", None)
-    if teacher_target is None:
-        raise ValueError(
-            "--locomotion_checkpoint for DistillationRunner requires a teacher with a frozen_actor "
-            "(e.g. the geometric steering teacher)."
-        )
-
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    actor_key, actor_sd = find_state_dict(
-        ckpt,
-        ("actor_state_dict", "model_state_dict", "policy_state_dict"),
-        "actor",
-    )
-    load_padded_state_dict(teacher_target, actor_sd, device, "teacher frozen actor", strip_distribution=True)
-    runner.alg.teacher_loaded = True
-    print(f"[INFO] Loaded distillation teacher frozen actor from '{actor_key}'")
-
-    student_target = getattr(runner.alg.student, "frozen_actor", None)
-    if student_target is not None:
-        load_padded_state_dict(student_target, actor_sd, device, "student frozen actor", strip_distribution=True)
-        print(f"[INFO] Loaded distillation student frozen actor from '{actor_key}'")
-
-    print(f"[INFO] Loaded locomotion checkpoint for rule-based teacher from: {ckpt_path}")
-
 
 def _build_teacher_for_eval(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
     """Instantiate the active distillation teacher for direct evaluation."""
@@ -483,27 +455,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
 
-    # Legacy PPO/distillation paths load locomotion weights into model modules.
+    # PPO paths load locomotion weights into model modules.
     # HLC navigation tasks load the same checkpoint inside FrozenLLCActionTerm before gym.make().
     if args_cli.locomotion_checkpoint is not None and not uses_frozen_llc_action:
-        if isinstance(runner, DistillationRunner):
-            _load_distillation_teacher_locomotion_checkpoint(runner, args_cli.locomotion_checkpoint, agent_cfg.device)
-        elif isinstance(runner, OnPolicyRunner):
+        if isinstance(runner, OnPolicyRunner):
             _load_locomotion_checkpoint(runner, args_cli.locomotion_checkpoint, agent_cfg.device)
         else:
-            raise ValueError("--locomotion_checkpoint is only supported for OnPolicyRunner/DistillationRunner tasks")
-
-    if (
-        isinstance(runner, DistillationRunner)
-        and hasattr(runner.alg.teacher, "frozen_actor")
-        and args_cli.teacher_checkpoint is None
-        and args_cli.locomotion_checkpoint is None
-        and not agent_cfg.resume
-    ):
-        raise ValueError(
-            "Rule-based obstacle distillation requires --locomotion_checkpoint to initialize the frozen LLC teacher, "
-            "or --teacher_checkpoint/--resume to load an existing distillation checkpoint."
-        )
+            raise ValueError("--locomotion_checkpoint is only supported for OnPolicyRunner tasks")
 
     # load the checkpoint
     if resume_path is not None:
@@ -515,20 +473,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             ckpt = torch.load(resume_path, weights_only=False)
             if "teacher_state_dict" in ckpt or "student_state_dict" in ckpt:
                 runner.alg.load(ckpt, load_cfg=None, strict=True)
-            elif "actor_state_dict" in ckpt and hasattr(runner.alg.teacher, "frozen_actor"):
-                ckpt["actor_state_dict"] = {
-                    k: v for k, v in ckpt["actor_state_dict"].items()
-                    if not k.startswith("distribution.")
-                }
-                load_padded_state_dict(
-                    runner.alg.teacher.frozen_actor,
-                    ckpt["actor_state_dict"],
-                    agent_cfg.device,
-                    "teacher frozen actor",
-                    strip_distribution=False,
-                )
-                runner.alg.teacher_loaded = True
-                print("[INFO] Loaded rule-based teacher frozen actor from actor_state_dict checkpoint")
             elif "actor_state_dict" in ckpt:
                 ckpt["actor_state_dict"] = {
                     k: v for k, v in ckpt["actor_state_dict"].items()
