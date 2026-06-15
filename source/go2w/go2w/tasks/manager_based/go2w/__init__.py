@@ -126,3 +126,47 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
+
+# =============================================================================
+# Hospital play environment (test Nav Teacher in hospital-style corridors)
+# =============================================================================
+
+gym.register(
+    id="Nav-Teacher-Hospital-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wHospitalPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-Hospital-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wHospitalDepthPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-Hospital-Ward-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wHospitalWardDepthPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-Hospital-Floor-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wHospitalFloorDepthPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
+    },
+)
