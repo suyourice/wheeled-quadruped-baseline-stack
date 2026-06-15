@@ -82,11 +82,11 @@ from .observations import (
 # -- Events (local custom) -----------------------------------------------------
 from .events import (
     move_dynamic_play_obstacles,
-    reset_navigation_goals_and_obstacles,
     reset_obstacles_curriculum,
-    reset_structured_astar_corridor,
     update_locomotion_curriculum,
 )
+from .events_nav import reset_navigation_goals_and_obstacles
+from .events_structured import reset_structured_astar_corridor
 
 # -- Rewards (local custom) ----------------------------------------------------
 from .rewards import (
