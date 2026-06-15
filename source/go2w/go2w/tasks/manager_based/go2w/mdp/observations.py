@@ -153,31 +153,10 @@ def obstacle_polar_depth(
 def _compute_navigation_waypoint_world(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("lidar"),
     lookahead_distance: float = 1.25,
     goal_snap_distance: float = 1.0,
-    use_lidar_refinement: bool = True,
-    lidar_max_distance: float = 20.0,
-    local_planner_forward_padding: float = 0.35,
-    local_planner_corridor_half_width: float = 0.65,
-    local_planner_candidate_offsets: tuple[float, ...] = (0.0, 0.55, -0.55, 0.9, -0.9),
-    local_planner_min_forward_distance: float = 0.1,
-    local_planner_min_hit_height: float = -0.15,
-    local_planner_activation_threshold: float = 0.12,
-    local_planner_lateral_penalty: float = 0.08,
-    local_planner_min_improvement: float = 0.03,
-    local_planner_max_blend: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute a rolling local waypoint and optionally refine it with LiDAR.
-
-    The active task keeps a single final goal for success bookkeeping, but the
-    policy should react to a shorter-horizon subgoal. We therefore project the
-    current robot position onto the sampled start-goal segment and look ahead by
-    a fixed distance along that segment. The lightweight local planner then
-    scores straight/side detour waypoint candidates using LiDAR corridor
-    occupancy. Close to the end, the waypoint snaps to the true goal pose so
-    heading alignment is still learned.
-    """
+    """Project robot onto start-goal segment, look ahead by lookahead_distance, snap to goal when close."""
     ensure_navigation_goal_buffers(env)
     robot = env.scene[robot_cfg.name]
 
@@ -209,205 +188,27 @@ def _compute_navigation_waypoint_world(
         goal_heading_w,
         path_heading_w,
     )
-    if use_lidar_refinement:
-        waypoint_pos_w, waypoint_heading_w = _refine_waypoint_with_lidar(
-            env=env,
-            robot=robot,
-            waypoint_pos_w=waypoint_pos_w,
-            waypoint_heading_w=waypoint_heading_w,
-            remaining_goal_distance=remaining_goal_distance,
-            sensor_cfg=sensor_cfg,
-            max_distance=lidar_max_distance,
-            forward_padding=local_planner_forward_padding,
-            corridor_half_width=local_planner_corridor_half_width,
-            candidate_offsets=local_planner_candidate_offsets,
-            min_forward_distance=local_planner_min_forward_distance,
-            min_hit_height=local_planner_min_hit_height,
-            activation_threshold=local_planner_activation_threshold,
-            lateral_penalty=local_planner_lateral_penalty,
-            min_improvement=local_planner_min_improvement,
-            max_blend=local_planner_max_blend,
-            goal_snap_distance=goal_snap_distance,
-        )
     return waypoint_pos_w, waypoint_heading_w
-
-
-def _refine_waypoint_with_lidar(
-    *,
-    env: ManagerBasedRLEnv,
-    robot,
-    waypoint_pos_w: torch.Tensor,
-    waypoint_heading_w: torch.Tensor,
-    remaining_goal_distance: torch.Tensor,
-    sensor_cfg: SceneEntityCfg,
-    max_distance: float,
-    forward_padding: float,
-    corridor_half_width: float,
-    candidate_offsets: tuple[float, ...],
-    min_forward_distance: float,
-    min_hit_height: float,
-    activation_threshold: float,
-    lateral_penalty: float,
-    min_improvement: float,
-    max_blend: float,
-    goal_snap_distance: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Choose a LiDAR-scored local detour waypoint when the straight corridor is blocked."""
-    try:
-        sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
-    except KeyError:
-        return waypoint_pos_w, waypoint_heading_w
-
-    if len(candidate_offsets) == 0:
-        return waypoint_pos_w, waypoint_heading_w
-
-    root_pos_w = robot.data.root_pos_w[:, :3]
-    target_vec_w = waypoint_pos_w - root_pos_w
-    target_vec_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), target_vec_w)
-    target_xy_b = target_vec_b[:, :2]
-    target_dist = torch.norm(target_xy_b, dim=-1).clamp_min(1.0e-6)
-
-    default_dir = torch.zeros_like(target_xy_b)
-    default_dir[:, 0] = 1.0
-    target_dir = torch.where(
-        target_dist.unsqueeze(-1) > 0.2,
-        target_xy_b / target_dist.unsqueeze(-1),
-        default_dir,
-    )
-    target_left = torch.stack((-target_dir[:, 1], target_dir[:, 0]), dim=-1)
-
-    offsets = torch.as_tensor(candidate_offsets, device=target_xy_b.device, dtype=target_xy_b.dtype)
-    candidate_xy_b = target_xy_b.unsqueeze(1) + offsets.view(1, -1, 1) * target_left.unsqueeze(1)
-    candidate_dist = torch.norm(candidate_xy_b, dim=-1).clamp_min(1.0e-6)
-    candidate_dir = candidate_xy_b / candidate_dist.unsqueeze(-1)
-    candidate_left = torch.stack((-candidate_dir[..., 1], candidate_dir[..., 0]), dim=-1)
-
-    hit_positions = sensor.data.ray_hits_w
-    sensor_pos = sensor.data.pos_w
-    rel_hit_w = hit_positions - sensor_pos.unsqueeze(1)
-    finite_hits = torch.isfinite(rel_hit_w).all(dim=-1)
-    safe_rel_hit_w = torch.where(finite_hits.unsqueeze(-1), rel_hit_w, torch.zeros_like(rel_hit_w))
-
-    num_envs, num_rays, _ = safe_rel_hit_w.shape
-    rel_hit_yaw = quat_apply_inverse(
-        yaw_quat(robot.data.root_quat_w).unsqueeze(1).expand(-1, num_rays, -1).reshape(-1, 4),
-        safe_rel_hit_w.reshape(-1, 3),
-    ).view(num_envs, num_rays, 3)
-
-    planar_xy = rel_hit_yaw[..., :2]
-    planar_dist = torch.norm(planar_xy, dim=-1)
-    valid = (
-        finite_hits
-        & (planar_dist > 1.0e-4)
-        & (planar_dist < (max_distance - 1.0e-4))
-        & (rel_hit_yaw[..., 2] > min_hit_height)
-    )
-
-    forward = torch.einsum("nrd,nkd->nkr", planar_xy, candidate_dir)
-    lateral = torch.einsum("nrd,nkd->nkr", planar_xy, candidate_left)
-    corridor_length = candidate_dist + forward_padding
-    corridor_mask = (
-        valid.unsqueeze(1)
-        & (forward > min_forward_distance)
-        & (forward < corridor_length.unsqueeze(-1))
-        & (lateral.abs() < corridor_half_width)
-    )
-
-    forward_score = (1.0 - forward / corridor_length.unsqueeze(-1).clamp_min(1.0e-6)).clamp(0.0, 1.0)
-    lateral_score = (1.0 - lateral.abs() / corridor_half_width).clamp(0.0, 1.0)
-    candidate_risk = (corridor_mask.float() * forward_score * lateral_score).amax(dim=-1)
-
-    max_offset = offsets.abs().amax().clamp_min(1.0e-6)
-    candidate_score = candidate_risk + lateral_penalty * (offsets.abs() / max_offset).view(1, -1)
-    best_idx = torch.argmin(candidate_score, dim=1)
-    gather_idx = best_idx.view(-1, 1, 1).expand(-1, 1, 2)
-    best_xy_b = torch.gather(candidate_xy_b, dim=1, index=gather_idx).squeeze(1)
-
-    straight_idx = int(torch.argmin(offsets.abs()).item())
-    straight_risk = candidate_risk[:, straight_idx]
-    best_risk = torch.gather(candidate_risk, dim=1, index=best_idx.view(-1, 1)).squeeze(1)
-    improvement = straight_risk - best_risk
-    should_refine = (
-        (remaining_goal_distance > goal_snap_distance)
-        & (straight_risk > activation_threshold)
-        & (improvement > min_improvement)
-    )
-    blend = torch.where(
-        should_refine,
-        ((straight_risk - activation_threshold) / (1.0 - activation_threshold)).clamp(0.0, max_blend),
-        torch.zeros_like(straight_risk),
-    )
-    refined_xy_b = (1.0 - blend).unsqueeze(-1) * target_xy_b + blend.unsqueeze(-1) * best_xy_b
-
-    yaw = robot.data.heading_w
-    cos_yaw = torch.cos(yaw)
-    sin_yaw = torch.sin(yaw)
-    refined_xy_w = torch.stack(
-        (
-            cos_yaw * refined_xy_b[:, 0] - sin_yaw * refined_xy_b[:, 1],
-            sin_yaw * refined_xy_b[:, 0] + cos_yaw * refined_xy_b[:, 1],
-        ),
-        dim=-1,
-    )
-
-    refined_pos_w = waypoint_pos_w.clone()
-    refined_pos_w[:, :2] = root_pos_w[:, :2] + refined_xy_w
-    refined_heading_w = torch.atan2(refined_xy_w[:, 1], refined_xy_w[:, 0])
-    refined_heading_w = torch.where(should_refine, refined_heading_w, waypoint_heading_w)
-    return refined_pos_w, refined_heading_w
 
 
 def local_goal_command_b(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("lidar"),
     lookahead_distance: float = 1.25,
     goal_snap_distance: float = 1.0,
-    use_lidar_refinement: bool = True,
-    lidar_max_distance: float = 20.0,
-    local_planner_forward_padding: float = 0.35,
-    local_planner_corridor_half_width: float = 0.65,
-    local_planner_candidate_offsets: tuple[float, ...] = (0.0, 0.55, -0.55, 0.9, -0.9),
-    local_planner_min_forward_distance: float = 0.1,
-    local_planner_min_hit_height: float = -0.15,
-    local_planner_activation_threshold: float = 0.12,
-    local_planner_lateral_penalty: float = 0.08,
-    local_planner_min_improvement: float = 0.03,
-    local_planner_max_blend: float = 1.0,
     command_min_forward: float = 0.45,
     command_max_lateral: float = 0.85,
     command_max_heading: float = 0.6,
     command_turn_slowdown_heading: float = math.inf,
     command_turn_slowdown_min_forward: float = 0.0,
 ) -> torch.Tensor:
-    """Return the current rolling local-waypoint command in the robot yaw frame.
-
-    The command is a compact 3-vector:
-      [command_x_b, command_y_b, command_heading_b]
-
-    It starts from the sampled world-frame start/goal task buffers, then the
-    lightweight local planner can move the waypoint sideways when the straight
-    LiDAR corridor is blocked. Path-following mode preserves the signed local
-    target position so the policy can distinguish "ahead" from "behind".
-    """
+    """Return rolling local-waypoint command in robot yaw frame as [cmd_x, cmd_y, cmd_heading]."""
     robot = env.scene[robot_cfg.name]
     waypoint_pos_w, waypoint_heading_w = _compute_navigation_waypoint_world(
         env,
         robot_cfg=robot_cfg,
-        sensor_cfg=sensor_cfg,
         lookahead_distance=lookahead_distance,
         goal_snap_distance=goal_snap_distance,
-        use_lidar_refinement=use_lidar_refinement,
-        lidar_max_distance=lidar_max_distance,
-        local_planner_forward_padding=local_planner_forward_padding,
-        local_planner_corridor_half_width=local_planner_corridor_half_width,
-        local_planner_candidate_offsets=local_planner_candidate_offsets,
-        local_planner_min_forward_distance=local_planner_min_forward_distance,
-        local_planner_min_hit_height=local_planner_min_hit_height,
-        local_planner_activation_threshold=local_planner_activation_threshold,
-        local_planner_lateral_penalty=local_planner_lateral_penalty,
-        local_planner_min_improvement=local_planner_min_improvement,
-        local_planner_max_blend=local_planner_max_blend,
     )
 
     ensure_navigation_goal_buffers(env)

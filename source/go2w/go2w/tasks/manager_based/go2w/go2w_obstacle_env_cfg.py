@@ -782,7 +782,6 @@ class NavTeacherObsCfg:
         goal_command = ObsTerm(
             func=mdp.local_goal_command_b,
             params={
-                "use_lidar_refinement": False,
                 "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
                 "goal_snap_distance": NAV_WAYPOINT_GOAL_SNAP_DISTANCE,
                 "command_min_forward": NAV_WAYPOINT_COMMAND_MIN_FORWARD,
@@ -859,7 +858,6 @@ class NavRLDistillObsCfg:
         goal_command = ObsTerm(
             func=mdp.local_goal_command_b,
             params={
-                "use_lidar_refinement": False,
                 "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
                 "goal_snap_distance": NAV_WAYPOINT_GOAL_SNAP_DISTANCE,
                 "command_min_forward": NAV_WAYPOINT_COMMAND_MIN_FORWARD,
@@ -889,7 +887,6 @@ class NavRLDistillObsCfg:
         goal_command = ObsTerm(
             func=mdp.local_goal_command_b,
             params={
-                "use_lidar_refinement": False,
                 "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
                 "goal_snap_distance": NAV_WAYPOINT_GOAL_SNAP_DISTANCE,
                 "command_min_forward": NAV_WAYPOINT_COMMAND_MIN_FORWARD,
@@ -961,7 +958,6 @@ class NavDepthRLDistillObsCfg:
         goal_command = ObsTerm(
             func=mdp.local_goal_command_b,
             params={
-                "use_lidar_refinement": False,
                 "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
                 "goal_snap_distance": NAV_WAYPOINT_GOAL_SNAP_DISTANCE,
                 "command_min_forward": NAV_WAYPOINT_COMMAND_MIN_FORWARD,
