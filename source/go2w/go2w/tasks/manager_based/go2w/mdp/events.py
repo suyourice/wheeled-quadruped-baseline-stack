@@ -29,7 +29,15 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-_NAV_RANDOM_FALLBACK_SCENARIO_ID = 9
+_NAV_SCENARIO_CODES: dict[str, int] = {
+    "empty": 0, "head_on": 1, "left_edge": 2, "right_edge": 3,
+    "diag_left": 4, "diag_right": 5, "off_left": 6, "off_right": 7,
+    "narrow_gap": 8, "random_fallback": 9,
+    "partial_blockage_left_open": 10, "partial_blockage_right_open": 11,
+    "cluttered": 12, "narrow_gap_wide": 13, "narrow_gap_barely": 14,
+}
+_NAV_SCENARIO_NAMES: dict[int, str] = {v: k for k, v in _NAV_SCENARIO_CODES.items()}
+_NAV_RANDOM_FALLBACK_SCENARIO_ID = _NAV_SCENARIO_CODES["random_fallback"]
 
 
 def _curriculum_progress(
@@ -1629,23 +1637,7 @@ def reset_navigation_goals_and_obstacles(
         "off_right",
         "cluttered",
     )
-    template_codes = {
-        "empty": 0,
-        "head_on": 1,
-        "left_edge": 2,
-        "right_edge": 3,
-        "diag_left": 4,
-        "diag_right": 5,
-        "off_left": 6,
-        "off_right": 7,
-        "narrow_gap": 8,
-        "random_fallback": 9,
-        "partial_blockage_left_open": 10,
-        "partial_blockage_right_open": 11,
-        "cluttered": 12,
-        "narrow_gap_wide": 13,
-        "narrow_gap_barely": 14,
-    }
+    template_codes = _NAV_SCENARIO_CODES
     _special_fixed = {
         "empty", "narrow_gap", "narrow_gap_wide", "narrow_gap_barely",
         "partial_blockage_left_open", "partial_blockage_right_open",

@@ -21,7 +21,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
-from .events import ensure_navigation_goal_buffers
+from .events import ensure_navigation_goal_buffers, _NAV_SCENARIO_NAMES
 from .obstacle_geometry import (
     DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
     footprint_clearance,
@@ -618,14 +618,6 @@ def goal_reached_and_resample(
 # =============================================================================
 
 # Scenario id → name mapping shared by goal-reached and collision logging.
-_NAV_SCENARIO_NAMES: dict[int, str] = {
-    0: "empty", 1: "head_on", 2: "left_edge", 3: "right_edge",
-    4: "diag_left", 5: "diag_right", 6: "off_left", 7: "off_right",
-    8: "narrow_gap", 9: "random_fallback",
-    10: "partial_blockage_left_open", 11: "partial_blockage_right_open",
-    12: "cluttered", 13: "narrow_gap_wide", 14: "narrow_gap_barely",
-}
-
 
 def nav_clearance_penalty(
     env: ManagerBasedRLEnv,
