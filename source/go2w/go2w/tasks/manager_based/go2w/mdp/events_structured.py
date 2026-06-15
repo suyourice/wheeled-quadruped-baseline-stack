@@ -19,9 +19,9 @@ from .events import (
     quat_yaw_wxyz,
     yaw_to_quat_wxyz,
     yaw_pitch_roll_to_quat_wxyz,
-    _separated_parked_positions,
-    _NAV_RANDOM_FALLBACK_SCENARIO_ID,
 )
+from .nav_scenarios import NAV_RANDOM_FALLBACK_SCENARIO_ID as _NAV_RANDOM_FALLBACK_SCENARIO_ID
+from .nav_slotting import _separated_parked_positions
 from .navigation_path import set_navigation_path_w, update_navigation_path_waypoint
 from .obstacle_geometry import set_obstacle_metadata
 from .structured_corridor import (
@@ -398,5 +398,3 @@ def reset_structured_astar_corridor(
         curvature_scan_horizon=curvature_scan_horizon,
         curvature_threshold=curvature_threshold,
     )
-
-

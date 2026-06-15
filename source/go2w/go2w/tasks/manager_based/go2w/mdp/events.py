@@ -12,25 +12,25 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .nav_math import (
+    quat_yaw_wxyz,
+    yaw_pitch_roll_to_quat_wxyz,
+    yaw_pitch_to_quat_wxyz,
+    yaw_to_quat_wxyz,
+)
 from .obstacle_geometry import set_obstacle_metadata
 from .structured_corridor import (
     nearest_polyline_tangent_local,
     project_polyline_corridor_local,
 )
+from .nav_scenarios import (
+    NAV_RANDOM_FALLBACK_SCENARIO_ID as _NAV_RANDOM_FALLBACK_SCENARIO_ID,
+    NAV_SCENARIO_CODES as _NAV_SCENARIO_CODES,
+    NAV_SCENARIO_NAMES as _NAV_SCENARIO_NAMES,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
-
-
-_NAV_SCENARIO_CODES: dict[str, int] = {
-    "empty": 0, "head_on": 1, "left_edge": 2, "right_edge": 3,
-    "diag_left": 4, "diag_right": 5, "off_left": 6, "off_right": 7,
-    "narrow_gap": 8, "random_fallback": 9,
-    "partial_blockage_left_open": 10, "partial_blockage_right_open": 11,
-    "cluttered": 12, "narrow_gap_wide": 13, "narrow_gap_barely": 14,
-}
-_NAV_SCENARIO_NAMES: dict[int, str] = {v: k for k, v in _NAV_SCENARIO_CODES.items()}
-_NAV_RANDOM_FALLBACK_SCENARIO_ID = _NAV_SCENARIO_CODES["random_fallback"]
 
 
 def _curriculum_progress(
@@ -91,62 +91,6 @@ def update_locomotion_curriculum(
                                   lerp(ang_vel_z_initial[1], ang_vel_z_final[1]))
 
 
-def quat_yaw_wxyz(quat: torch.Tensor) -> torch.Tensor:
-    """Return yaw angle from a wxyz quaternion tensor."""
-    w, x, y, z = quat.unbind(dim=-1)
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return torch.atan2(siny_cosp, cosy_cosp)
-
-
-def yaw_to_quat_wxyz(yaw: torch.Tensor) -> torch.Tensor:
-    """Return a wxyz quaternion for a planar yaw angle tensor."""
-    half_yaw = yaw * 0.5
-    quat = torch.zeros(*yaw.shape, 4, device=yaw.device, dtype=yaw.dtype)
-    quat[..., 0] = torch.cos(half_yaw)
-    quat[..., 3] = torch.sin(half_yaw)
-    return quat
-
-
-def yaw_pitch_to_quat_wxyz(yaw: torch.Tensor, pitch: torch.Tensor) -> torch.Tensor:
-    """Return a wxyz quaternion for Rz(yaw) * Ry(pitch)."""
-    half_yaw = yaw * 0.5
-    half_pitch = pitch * 0.5
-    cz = torch.cos(half_yaw)
-    sz = torch.sin(half_yaw)
-    cp = torch.cos(half_pitch)
-    sp = torch.sin(half_pitch)
-    quat = torch.zeros(*yaw.shape, 4, device=yaw.device, dtype=yaw.dtype)
-    quat[..., 0] = cz * cp
-    quat[..., 1] = -sz * sp
-    quat[..., 2] = cz * sp
-    quat[..., 3] = sz * cp
-    return quat
-
-
-def yaw_pitch_roll_to_quat_wxyz(
-    yaw: torch.Tensor,
-    pitch: torch.Tensor,
-    roll: torch.Tensor,
-) -> torch.Tensor:
-    """Return a wxyz quaternion for Rz(yaw) * Ry(pitch) * Rx(roll).
-
-    Used for the ramp hump: with pitch=0 and roll=−π/2 the cylinder axis (Z)
-    is rotated to point perpendicular to the corridor, creating a symmetric
-    speed-hump profile where both entry and exit ends are at ground level.
-    """
-    hz, hp, hr = yaw * 0.5, pitch * 0.5, roll * 0.5
-    cz, sz = torch.cos(hz), torch.sin(hz)
-    cp, sp = torch.cos(hp), torch.sin(hp)
-    cr, sr = torch.cos(hr), torch.sin(hr)
-    quat = torch.zeros(*yaw.shape, 4, device=yaw.device, dtype=yaw.dtype)
-    quat[..., 0] = cz * cp * cr + sz * sp * sr
-    quat[..., 1] = cz * cp * sr - sz * sp * cr
-    quat[..., 2] = cz * sp * cr + sz * cp * sr
-    quat[..., 3] = -cz * sp * sr + sz * cp * cr
-    return quat
-
-
 def ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
     """Create persistent start/goal buffers used by the navigation-distill task."""
     if not hasattr(env, "_go2w_goal_pos_w"):
@@ -176,11 +120,9 @@ def ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
 
 
 def _separated_parked_positions(parked_world: torch.Tensor, num_slots: int) -> torch.Tensor:
-    """Return distant parking poses separated so inactive assets cannot contact each other."""
-    parked_positions = parked_world.unsqueeze(1).expand(-1, num_slots, -1).clone()
-    slot_offsets = torch.arange(num_slots, device=parked_world.device, dtype=parked_world.dtype)
-    parked_positions[:, :, 1] += slot_offsets.unsqueeze(0)
-    return parked_positions
+    from .nav_slotting import _separated_parked_positions as _impl
+
+    return _impl(parked_world, num_slots)
 
 
 def _physical_slot_randomization_mask(
@@ -192,15 +134,9 @@ def _physical_slot_randomization_mask(
     steps_per_iteration: int,
     device: torch.device,
 ) -> bool | torch.Tensor:
-    """Return per-env physical-slot randomization enablement."""
-    if not randomize_slots:
-        return False
-    progress = _curriculum_progress(env, start_iteration, warmup_iterations, steps_per_iteration)
-    if progress <= 0.0:
-        return False
-    if progress >= 1.0:
-        return True
-    return torch.rand(n, device=device) < progress
+    from .nav_slotting import _physical_slot_randomization_mask as _impl
+
+    return _impl(env, n, randomize_slots, start_iteration, warmup_iterations, steps_per_iteration, device)
 
 
 def _assign_logical_positions_to_physical_slots(
@@ -209,22 +145,9 @@ def _assign_logical_positions_to_physical_slots(
     parked_positions: torch.Tensor,
     randomize_slots: bool | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Map sampled layout positions onto physical obstacle assets per environment."""
-    n, k = logical_active.shape
-    device = logical_positions.device
-    logical_to_physical = torch.arange(k, device=device).unsqueeze(0).expand(n, -1)
-    if isinstance(randomize_slots, torch.Tensor):
-        random_perm = torch.rand((n, k), device=device).argsort(dim=1)
-        logical_to_physical = torch.where(randomize_slots.unsqueeze(1), random_perm, logical_to_physical)
-    elif randomize_slots:
-        logical_to_physical = torch.rand((n, k), device=device).argsort(dim=1)
+    from .nav_slotting import _assign_logical_positions_to_physical_slots as _impl
 
-    physical_positions = parked_positions.clone()
-    position_index = logical_to_physical.unsqueeze(-1).expand(-1, -1, logical_positions.shape[-1])
-    physical_positions.scatter_(1, position_index, logical_positions)
-    physical_active = torch.zeros_like(logical_active)
-    physical_active.scatter_(1, logical_to_physical, logical_active)
-    return physical_positions, physical_active, logical_to_physical
+    return _impl(logical_positions, logical_active, parked_positions, randomize_slots)
 
 
 def reset_obstacles_curriculum(
@@ -843,5 +766,3 @@ def move_dynamic_play_obstacles(
         pose[:, 3:7] = yaw_to_quat_wxyz(obstacle_yaws[:, slot_idx])
         env.scene[name].write_root_pose_to_sim(pose, env_ids=env_ids)
         env.scene[name].write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
-
-

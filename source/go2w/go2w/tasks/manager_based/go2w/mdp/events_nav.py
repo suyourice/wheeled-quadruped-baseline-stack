@@ -18,11 +18,15 @@ from .events import (
     ensure_navigation_goal_buffers,
     quat_yaw_wxyz,
     yaw_to_quat_wxyz,
-    _separated_parked_positions,
-    _physical_slot_randomization_mask,
+)
+from .nav_scenarios import (
+    NAV_RANDOM_FALLBACK_SCENARIO_ID as _NAV_RANDOM_FALLBACK_SCENARIO_ID,
+    NAV_SCENARIO_CODES as _NAV_SCENARIO_CODES,
+)
+from .nav_slotting import (
     _assign_logical_positions_to_physical_slots,
-    _NAV_SCENARIO_CODES,
-    _NAV_RANDOM_FALLBACK_SCENARIO_ID,
+    _physical_slot_randomization_mask,
+    _separated_parked_positions,
 )
 from .obstacle_geometry import obstacle_effective_radius, set_obstacle_metadata
 
