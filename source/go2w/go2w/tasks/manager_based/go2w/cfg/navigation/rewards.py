@@ -9,8 +9,8 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
-from . import mdp
-from .mdp.hospital.specs import *  # noqa: F401, F403
+from ... import mdp
+from ...mdp.navigation.hospital.specs import *  # noqa: F401, F403
 
 
 @configclass

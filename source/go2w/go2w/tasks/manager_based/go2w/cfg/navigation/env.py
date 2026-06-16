@@ -33,17 +33,17 @@ from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCameraCfg, Mult
 from isaaclab.sensors.ray_caster import patterns
 from isaaclab.utils import configclass
 
-from . import mdp
-from .mdp.hospital import events as _hospital_events
-from .mdp.hospital import specs as _hospital_specs
-from .mdp.hospital.specs import *  # noqa: F401, F403
-from .mdp.hospital.floor import (
+from ... import mdp
+from ...mdp.navigation.hospital import events as _hospital_events
+from ...mdp.navigation.hospital import specs as _hospital_specs
+from ...mdp.navigation.hospital.specs import *  # noqa: F401, F403
+from ...mdp.navigation.hospital.floor import (
     make_hospital_ramp_cfg as _make_hospital_ramp_cfg,
     make_hospital_ramp_b_cfg as _make_hospital_ramp_b_cfg,
 )
-from .go2w_env_cfg import EventCfg, Go2wEnvCfg, Go2wSceneCfg
-from .obstacle_rewards_cfg import NavTeacherRewardsCfg
-from .obstacle_obs_cfg import NavDepthRLDistillObsCfg, NavRLDistillObsCfg, NavTeacherObsCfg
+from ..locomotion.env import EventCfg, Go2wEnvCfg, Go2wSceneCfg
+from .rewards import NavTeacherRewardsCfg
+from .observations import NavDepthRLDistillObsCfg, NavRLDistillObsCfg, NavTeacherObsCfg
 
 
 # =============================================================================

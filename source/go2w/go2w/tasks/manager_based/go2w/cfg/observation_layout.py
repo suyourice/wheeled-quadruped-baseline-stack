@@ -38,7 +38,7 @@ POLICY_OBS = {
 }
 
 # HLC teacher policy obs - 451D.
-# Defined in NavTeacherObsCfg.PolicyCfg (go2w_obstacle_env_cfg.py).
+# Defined in NavTeacherObsCfg.PolicyCfg (cfg/navigation/env.py).
 HLC_TEACHER_OBS = {
     "proprio":           ObsSlice(0,   9),    # base_lin_vel(3) + projected_gravity(3) + goal_command(3)
     "polar_depth":       ObsSlice(9,   189),  # mdp.obstacle_polar_depth (180 bins)
@@ -48,7 +48,7 @@ HLC_TEACHER_OBS = {
 }
 
 # HLC student obs - 189D.
-# Defined in NavRLDistillObsCfg.StudentCfg (go2w_obstacle_env_cfg.py).
+# Defined in NavRLDistillObsCfg.StudentCfg (cfg/navigation/env.py).
 HLC_STUDENT_OBS = {
     "proprio":      ObsSlice(0,   9),    # base_lin_vel(3) + projected_gravity(3) + goal_command(3)
     "lidar_scan":   ObsSlice(9,   189),  # mdp.lidar_distances (180 bins)

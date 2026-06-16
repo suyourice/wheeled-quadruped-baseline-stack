@@ -15,9 +15,9 @@ import math
 import torch
 from isaaclab.utils.math import quat_from_angle_axis
 
-from go2w.tasks.manager_based.go2w.mdp.nav_scenarios import NAV_SCENARIO_NAMES as _NAV_SCENARIO_ID_TO_NAME
-from go2w.tasks.manager_based.go2w.mdp.obstacle_geometry import footprint_clearance
-from go2w.tasks.manager_based.go2w.observation_layout import POLICY_OBS
+from go2w.tasks.manager_based.go2w.mdp.navigation.scenarios import NAV_SCENARIO_NAMES as _NAV_SCENARIO_ID_TO_NAME
+from go2w.tasks.manager_based.go2w.mdp.navigation.local_planning.obstacle_geometry import footprint_clearance
+from go2w.tasks.manager_based.go2w.cfg.observation_layout import POLICY_OBS
 
 
 NAV_LIVE_LABEL_INTERVAL = 3

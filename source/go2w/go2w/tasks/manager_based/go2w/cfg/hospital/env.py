@@ -14,17 +14,17 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import MultiMeshRayCasterCfg
 from isaaclab.utils import configclass
 
-from . import mdp
-from .go2w_obstacle_env_cfg import (
+from ... import mdp
+from ..navigation.env import (
     Go2wNavDepthRLDistillEnvCfg_PLAY,
     Go2wNavTeacherEnvCfg_PLAY,
     _configure_play_obstacle_obs,
     make_play_obstacle_cfg,
 )
-from .mdp.hospital import events as _hospital_events
-from .mdp.hospital import specs as _hospital_specs
-from .mdp.hospital.specs import *  # noqa: F401, F403
-from .mdp.hospital.floor import (
+from ...mdp.navigation.hospital import events as _hospital_events
+from ...mdp.navigation.hospital import specs as _hospital_specs
+from ...mdp.navigation.hospital.specs import *  # noqa: F401, F403
+from ...mdp.navigation.hospital.floor import (
     HOSPITAL_FLOOR_CORRIDOR_KIND,
     HOSPITAL_FLOOR_CORRIDOR_WIDTH,
     HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,

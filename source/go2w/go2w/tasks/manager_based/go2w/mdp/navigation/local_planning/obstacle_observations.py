@@ -15,7 +15,8 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
-from .events import ensure_navigation_goal_buffers, quat_yaw_wxyz
+from ...common.orientation import quat_yaw_wxyz
+from ..goals import ensure_navigation_goal_buffers
 from .obstacle_geometry import (
     DEFAULT_OBSTACLE_DEPTH,
     DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,

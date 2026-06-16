@@ -21,8 +21,8 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
-from .events import ensure_navigation_goal_buffers
-from .nav_scenarios import NAV_SCENARIO_NAMES as _NAV_SCENARIO_NAMES
+from ..navigation.goals import ensure_navigation_goal_buffers
+from ..navigation.scenarios import NAV_SCENARIO_NAMES as _NAV_SCENARIO_NAMES
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv

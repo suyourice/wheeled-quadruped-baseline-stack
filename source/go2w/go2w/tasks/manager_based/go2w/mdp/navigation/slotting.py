@@ -33,7 +33,7 @@ def _physical_slot_randomization_mask(
     device: torch.device,
 ) -> bool | torch.Tensor:
     """Return per-env physical-slot randomization enablement."""
-    from .events import _curriculum_progress
+    from ..common.curriculum import _curriculum_progress
 
     if not randomize_slots:
         return False

@@ -16,7 +16,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_env_cfg:Go2wEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.cfg.locomotion.env:Go2wEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
     },
 )
@@ -26,7 +26,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_env_cfg:Go2wEnvCfg_PLAY",
+        "env_cfg_entry_point": f"{__name__}.cfg.locomotion.env:Go2wEnvCfg_PLAY",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
     },
 )
@@ -40,7 +40,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_env_cfg:Go2wFastFlatEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.cfg.locomotion.env:Go2wFastFlatEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FastFlatRunnerCfg",
     },
 )
@@ -50,7 +50,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_env_cfg:Go2wFastFlatEnvCfg_PLAY",
+        "env_cfg_entry_point": f"{__name__}.cfg.locomotion.env:Go2wFastFlatEnvCfg_PLAY",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FastFlatRunnerCfg",
     },
 )
@@ -64,7 +64,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavTeacherEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavTeacherEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
     },
 )
@@ -74,7 +74,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavTeacherEnvCfg_PLAY",
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavTeacherEnvCfg_PLAY",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
     },
 )
@@ -88,7 +88,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavRLDistillEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavRLDistillEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavRLDistillRunnerCfg",
     },
 )
@@ -98,7 +98,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavRLDistillEnvCfg_PLAY",
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavRLDistillEnvCfg_PLAY",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavRLDistillRunnerCfg",
     },
 )
@@ -112,7 +112,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavDepthRLDistillEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavDepthRLDistillEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
@@ -122,7 +122,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_obstacle_env_cfg:Go2wNavDepthRLDistillEnvCfg_PLAY",
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavDepthRLDistillEnvCfg_PLAY",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
@@ -136,7 +136,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_hospital_env_cfg:Go2wHospitalPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
     },
 )
@@ -146,7 +146,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_hospital_env_cfg:Go2wHospitalDepthPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalDepthPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
@@ -156,7 +156,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_hospital_env_cfg:Go2wHospitalWardDepthPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalWardDepthPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
@@ -166,7 +166,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.go2w_hospital_env_cfg:Go2wHospitalFloorDepthPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorDepthPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
