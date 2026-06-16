@@ -16,8 +16,9 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
-from .debug_utils import fmt_xy, nav_debug_enabled, nav_debug_env_id, nav_debug_interval
-from .events import ensure_navigation_goal_buffers, quat_yaw_wxyz
+from ...common.debug import fmt_xy, nav_debug_enabled, nav_debug_env_id, nav_debug_interval
+from ...common.orientation import quat_yaw_wxyz
+from ..goals import ensure_navigation_goal_buffers
 from .obstacle_geometry import (
     DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
     DEFAULT_OBSTACLE_WIDTH,

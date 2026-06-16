@@ -14,17 +14,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .events import (
-    ensure_navigation_goal_buffers,
-    quat_yaw_wxyz,
-    yaw_to_quat_wxyz,
-    yaw_pitch_roll_to_quat_wxyz,
-)
-from .nav_scenarios import NAV_RANDOM_FALLBACK_SCENARIO_ID as _NAV_RANDOM_FALLBACK_SCENARIO_ID
-from .nav_slotting import _separated_parked_positions
-from .navigation_path import set_navigation_path_w, update_navigation_path_waypoint
-from .obstacle_geometry import set_obstacle_metadata
-from .structured_corridor import (
+from ...common.orientation import quat_yaw_wxyz, yaw_pitch_roll_to_quat_wxyz, yaw_to_quat_wxyz
+from ..goals import ensure_navigation_goal_buffers
+from ..scenarios import NAV_RANDOM_FALLBACK_SCENARIO_ID as _NAV_RANDOM_FALLBACK_SCENARIO_ID
+from ..slotting import _separated_parked_positions
+from ..global_planning.path_state import set_navigation_path_w, update_navigation_path_waypoint
+from ..local_planning.obstacle_geometry import set_obstacle_metadata
+from ..global_planning.corridors import (
     plan_structured_corridor_path,
     structured_corridor_centerline,
     structured_corridor_extra_polylines,

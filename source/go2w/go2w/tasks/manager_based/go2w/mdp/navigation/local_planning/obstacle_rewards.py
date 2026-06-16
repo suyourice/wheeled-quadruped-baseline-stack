@@ -18,8 +18,8 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
-from .events import ensure_navigation_goal_buffers
-from .nav_scenarios import NAV_SCENARIO_CODES as _NAV_SCENARIO_CODES
+from ..goals import ensure_navigation_goal_buffers
+from ..scenarios import NAV_SCENARIO_CODES as _NAV_SCENARIO_CODES
 from .obstacle_geometry import (
     DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
     footprint_clearance,

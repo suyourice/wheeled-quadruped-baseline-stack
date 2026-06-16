@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""MDP sub-module for the Go2-W locomotion task.
+"""Public MDP facade for the Go2-W task family.
 
 All symbols are imported explicitly so that static-analysis tools
 (Pyright, pylance) can resolve them without tracing wildcard imports.
@@ -14,19 +14,19 @@ from isaaclab.envs.mdp import (
     JointPositionActionCfg,
     JointVelocityActionCfg,
 )
-from .actions import FrozenLLCActionTermCfg
+from .navigation.actions import FrozenLLCActionTermCfg
 
 # -- Planning ------------------------------------------------------------------
-from .astar import (
+from .navigation.global_planning.astar import (
     GridMap2D,
     plan_astar_path,
 )
-from .navigation_path import (
+from .navigation.global_planning.path_state import (
     set_navigation_path_w,
     update_navigation_path_waypoint,
     update_navigation_path_waypoint_event,
 )
-from .structured_corridor import (
+from .navigation.global_planning.corridors import (
     structured_corridor_wall_specs,
 )
 
@@ -69,29 +69,29 @@ from isaaclab.envs.mdp import (
 )
 
 # -- Observations (local custom) -----------------------------------------------
-from .observations import (
+from .navigation.local_planning.sensor_observations import (
     depth_closeness_image,
     lidar_distances,
     local_goal_command_b,
     obstacle_polar_depth,
 )
-from .observations_obstacle import (
+from .navigation.local_planning.obstacle_observations import (
     obstacle_full_geometry_features,
     obstacle_navigation_features,
     prev_hlc_actions,
 )
 
 # -- Events (local custom) -----------------------------------------------------
-from .events import (
+from .navigation.reset.random_obstacles import (
     move_dynamic_play_obstacles,
     reset_obstacles_curriculum,
-    update_locomotion_curriculum,
 )
-from .events_nav import reset_navigation_goals_and_obstacles
-from .events_structured import reset_structured_astar_corridor
+from .locomotion.events import update_locomotion_curriculum
+from .navigation.reset.template_obstacles import reset_navigation_goals_and_obstacles
+from .navigation.reset.structured_astar import reset_structured_astar_corridor
 
 # -- Rewards (local custom) ----------------------------------------------------
-from .rewards import (
+from .locomotion.rewards import (
     base_height_l2,
     goal_heading_tanh_reward,
     goal_progress_dense,
@@ -105,7 +105,7 @@ from .rewards import (
     wheel_contact_penalty,
     wheel_vel_zero_cmd,
 )
-from .rewards_nav import (
+from .navigation.local_planning.obstacle_rewards import (
     nav_clearance_penalty,
     obstacle_nav_ttc_penalty,
     nav_dense_recovery_reward,

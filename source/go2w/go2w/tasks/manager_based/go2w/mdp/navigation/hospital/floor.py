@@ -5,9 +5,8 @@
 
 """Hospital full-floor scene configuration: constants, ramp geometry, and semantic placements.
 
-Kept separate from go2w_obstacle_env_cfg to avoid that file growing too large.
-The actual @configclass env classes and _configure_* functions stay in
-go2w_obstacle_env_cfg because they reference the cfg object hierarchy directly.
+Kept separate from cfg/hospital/env.py so the environment classes stay focused on
+the cfg object hierarchy.
 """
 
 from __future__ import annotations
@@ -131,7 +130,7 @@ def hospital_floor_semantic_local_poses(
         slot(27, 1.08 * L, -0.08 * L, 0.0),            # seated visitor
         slot(28, 2.74 * L, 1.18 * L, -math.pi * 0.5),  # doorway patient
         slot(29, 2.80 * L, 1.24 * L, -math.pi * 0.5),  # doorway staff
-        slot(30, 3.22 * L, 1.16 * L, math.pi),         # elevator/service queue
+        slot(30, 3.72 * L, 1.16 * L, math.pi),         # elevator/service queue
         slot(31, 2.16 * L, -0.42 * L, 0.0),            # supply cart in service bay
         slot(12, 2.52 * L, L - 0.42, 0.0),             # staff pushing gurney
         slot(13, 2.62 * L, L - 0.42, 0.0),             # gurney with patient

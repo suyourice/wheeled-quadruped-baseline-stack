@@ -12,9 +12,9 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 
-from ..events import yaw_to_quat_wxyz as _yaw_to_quat_wxyz
-from ..obstacle_geometry import obstacle_effective_radius
-from ..structured_corridor import nearest_polyline_tangent_local, project_polyline_corridor_local
+from ...common.orientation import yaw_to_quat_wxyz as _yaw_to_quat_wxyz
+from ..local_planning.obstacle_geometry import obstacle_effective_radius
+from ..global_planning.corridors import nearest_polyline_tangent_local, project_polyline_corridor_local
 from .relations import HOSPITAL_RELATION_SPECS
 from .specs import HOSPITAL_LABEL_SPECS
 

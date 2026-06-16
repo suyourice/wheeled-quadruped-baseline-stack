@@ -1,0 +1,2 @@
+"""Locomotion environment configurations."""
+

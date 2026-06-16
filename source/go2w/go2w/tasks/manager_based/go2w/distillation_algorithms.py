@@ -12,7 +12,7 @@ import torch.nn as nn
 
 from rsl_rl.algorithms.distillation import Distillation
 
-from .observation_layout import HLC_TEACHER_OBS
+from .cfg.observation_layout import HLC_TEACHER_OBS
 
 
 class SimpleActionDistillation(Distillation):

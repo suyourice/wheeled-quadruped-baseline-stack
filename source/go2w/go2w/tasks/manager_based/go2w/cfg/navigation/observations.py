@@ -11,8 +11,8 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
-from . import mdp
-from .mdp.hospital.specs import *  # noqa: F401, F403
+from ... import mdp
+from ...mdp.navigation.hospital.specs import *  # noqa: F401, F403
 
 
 @configclass

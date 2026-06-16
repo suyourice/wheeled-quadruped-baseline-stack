@@ -12,42 +12,27 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .nav_math import (
+from ...common.curriculum import _curriculum_progress
+from ...common.orientation import (
     quat_yaw_wxyz,
     yaw_pitch_roll_to_quat_wxyz,
     yaw_pitch_to_quat_wxyz,
     yaw_to_quat_wxyz,
 )
-from .obstacle_geometry import set_obstacle_metadata
-from .structured_corridor import (
+from ..local_planning.obstacle_geometry import set_obstacle_metadata
+from ..global_planning.corridors import (
     nearest_polyline_tangent_local,
     project_polyline_corridor_local,
 )
-from .nav_scenarios import (
+from ..scenarios import (
     NAV_RANDOM_FALLBACK_SCENARIO_ID as _NAV_RANDOM_FALLBACK_SCENARIO_ID,
     NAV_SCENARIO_CODES as _NAV_SCENARIO_CODES,
     NAV_SCENARIO_NAMES as _NAV_SCENARIO_NAMES,
 )
+from ..goals import ensure_navigation_goal_buffers
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
-
-
-def _curriculum_progress(
-    env: ManagerBasedRLEnv,
-    start_iteration: int,
-    warmup_iterations: int,
-    steps_per_iteration: int,
-) -> float:
-    """Return curriculum progress t in [0, 1] based on training step counter."""
-    start_steps = start_iteration * steps_per_iteration
-    warmup_steps = warmup_iterations * steps_per_iteration
-    step = env.common_step_counter
-    if step < start_steps:
-        return 0.0
-    if warmup_steps <= 0:
-        return 1.0
-    return max(0.0, min(1.0, (step - start_steps) / warmup_steps))
 
 
 def update_locomotion_curriculum(
@@ -91,36 +76,8 @@ def update_locomotion_curriculum(
                                   lerp(ang_vel_z_initial[1], ang_vel_z_final[1]))
 
 
-def ensure_navigation_goal_buffers(env: ManagerBasedRLEnv) -> None:
-    """Create persistent start/goal buffers used by the navigation-distill task."""
-    if not hasattr(env, "_go2w_goal_pos_w"):
-        env._go2w_goal_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
-        env._go2w_goal_heading_w = torch.zeros(env.num_envs, device=env.device)
-        env._go2w_start_pos_w = torch.zeros(env.num_envs, 3, device=env.device)
-        env._go2w_start_heading_w = torch.zeros(env.num_envs, device=env.device)
-    if not hasattr(env, "_go2w_scenario_template_id"):
-        env._go2w_scenario_template_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-    if not hasattr(env, "_go2w_initial_scenario_template_id"):
-        env._go2w_initial_scenario_template_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-    # Passable narrow-gap metadata: gap centerline in world frame, half width, and
-    # a passable flag set only for the narrow_gap / narrow_gap_wide / narrow_gap_barely
-    # scenarios. Reward helpers use these to encourage decisive gap traversal.
-    if not hasattr(env, "_go2w_gap_center_w"):
-        env._go2w_gap_center_w = torch.zeros(env.num_envs, 2, device=env.device)
-        env._go2w_gap_dir_w = torch.zeros(env.num_envs, 2, device=env.device)
-        env._go2w_gap_half_width = torch.zeros(env.num_envs, device=env.device)
-        env._go2w_gap_passable = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    if not hasattr(env, "_go2w_gap_free_half_width"):
-        env._go2w_gap_free_half_width = torch.zeros(env.num_envs, device=env.device)
-    if not hasattr(env, "_go2w_gap_center_tolerance"):
-        env._go2w_gap_center_tolerance = torch.zeros(env.num_envs, device=env.device)
-    # Per-env stuck counter for cluttered/blocked recovery diagnostics and gating.
-    if not hasattr(env, "_go2w_stuck_counter"):
-        env._go2w_stuck_counter = torch.zeros(env.num_envs, device=env.device)
-
-
 def _separated_parked_positions(parked_world: torch.Tensor, num_slots: int) -> torch.Tensor:
-    from .nav_slotting import _separated_parked_positions as _impl
+    from ..slotting import _separated_parked_positions as _impl
 
     return _impl(parked_world, num_slots)
 
@@ -134,7 +91,7 @@ def _physical_slot_randomization_mask(
     steps_per_iteration: int,
     device: torch.device,
 ) -> bool | torch.Tensor:
-    from .nav_slotting import _physical_slot_randomization_mask as _impl
+    from ..slotting import _physical_slot_randomization_mask as _impl
 
     return _impl(env, n, randomize_slots, start_iteration, warmup_iterations, steps_per_iteration, device)
 
@@ -145,7 +102,7 @@ def _assign_logical_positions_to_physical_slots(
     parked_positions: torch.Tensor,
     randomize_slots: bool | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from .nav_slotting import _assign_logical_positions_to_physical_slots as _impl
+    from ..slotting import _assign_logical_positions_to_physical_slots as _impl
 
     return _impl(logical_positions, logical_active, parked_positions, randomize_slots)
 

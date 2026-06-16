@@ -27,7 +27,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from go2w.assets import GO2W_CFG  # isort:skip
 
-from . import mdp
+from ... import mdp
 
 
 # =============================================================================

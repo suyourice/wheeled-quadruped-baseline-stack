@@ -16,7 +16,7 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import ActionTerm, ActionTermCfg
 from isaaclab.utils import configclass
 
-from .debug_utils import fmt_xy, nav_debug_enabled, nav_debug_env_id, nav_debug_interval
+from ..common.debug import fmt_xy, nav_debug_enabled, nav_debug_env_id, nav_debug_interval
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -29,7 +29,7 @@ class FrozenLLCActionTerm(ActionTerm):
     current robot state, feeds it through the frozen fast-flat MLP, and applies the
     resulting 16D joint targets (wheel velocity + hip/stance position).
 
-    LLC obs layout (60D) matches POLICY_OBS in observation_layout.py:
+    LLC obs layout (60D) matches POLICY_OBS in cfg/observation_layout.py:
         [0:3]  base_lin_vel_b
         [3:6]  base_ang_vel_b
         [6:9]  projected_gravity_b

@@ -42,31 +42,37 @@ import importlib.util as _ilu
 import sys
 import types
 
-# Load mdp modules without triggering the full Isaac Lab package chain.
-# structured_corridor uses `from .astar import ...` so we register a fake
-# "mdp" package and both submodules in sys.modules first.
+# Load MDP planning modules without triggering the full Isaac Lab package chain.
+# corridors uses `from .astar import ...` so we register a fake package path and
+# both submodules in sys.modules first.
 _MDP = Path(__file__).resolve().parent.parent / "source/go2w/go2w/tasks/manager_based/go2w/mdp"
+_GLOBAL_PLANNING = _MDP / "navigation/global_planning"
 
-_mdp_pkg = types.ModuleType("mdp")
-_mdp_pkg.__path__ = [str(_MDP)]
-_mdp_pkg.__package__ = "mdp"
-sys.modules.setdefault("mdp", _mdp_pkg)
+for _pkg_name, _pkg_path in (
+    ("go2w_mdp", _MDP),
+    ("go2w_mdp.navigation", _MDP / "navigation"),
+    ("go2w_mdp.navigation.global_planning", _GLOBAL_PLANNING),
+):
+    _pkg = types.ModuleType(_pkg_name)
+    _pkg.__path__ = [str(_pkg_path)]
+    _pkg.__package__ = _pkg_name
+    sys.modules.setdefault(_pkg_name, _pkg)
 
 
-def _load_mdp(stem: str):
-    name = f"mdp.{stem}"
-    p = _MDP / f"{stem}.py"
+def _load_global_planning(stem: str):
+    name = f"go2w_mdp.navigation.global_planning.{stem}"
+    p = _GLOBAL_PLANNING / f"{stem}.py"
     spec = _ilu.spec_from_file_location(name, p, submodule_search_locations=[])
     assert spec is not None and spec.loader is not None
     mod = _ilu.module_from_spec(spec)
-    mod.__package__ = "mdp"
+    mod.__package__ = "go2w_mdp.navigation.global_planning"
     sys.modules[name] = mod
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
 
 
-_astar_mod    = _load_mdp("astar")
-_corridor_mod = _load_mdp("structured_corridor")
+_astar_mod    = _load_global_planning("astar")
+_corridor_mod = _load_global_planning("corridors")
 
 GridMap2D                      = _astar_mod.GridMap2D
 AStarResult                    = _astar_mod.AStarResult

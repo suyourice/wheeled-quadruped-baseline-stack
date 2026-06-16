@@ -14,21 +14,18 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .events import (
-    ensure_navigation_goal_buffers,
-    quat_yaw_wxyz,
-    yaw_to_quat_wxyz,
-)
-from .nav_scenarios import (
+from ...common.orientation import quat_yaw_wxyz, yaw_to_quat_wxyz
+from ..goals import ensure_navigation_goal_buffers
+from ..scenarios import (
     NAV_RANDOM_FALLBACK_SCENARIO_ID as _NAV_RANDOM_FALLBACK_SCENARIO_ID,
     NAV_SCENARIO_CODES as _NAV_SCENARIO_CODES,
 )
-from .nav_slotting import (
+from ..slotting import (
     _assign_logical_positions_to_physical_slots,
     _physical_slot_randomization_mask,
     _separated_parked_positions,
 )
-from .obstacle_geometry import obstacle_effective_radius, set_obstacle_metadata
+from ..local_planning.obstacle_geometry import obstacle_effective_radius, set_obstacle_metadata
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv

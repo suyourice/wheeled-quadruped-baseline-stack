@@ -624,19 +624,19 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import go2w.tasks  # noqa: F401
 from go2w.tasks.manager_based.go2w import mdp as go2w_mdp
-from go2w.tasks.manager_based.go2w.go2w_obstacle_env_cfg import OBSTACLE_SIZE, make_play_obstacle_cfg
-from go2w.tasks.manager_based.go2w.mdp.hospital.specs import (
+from go2w.tasks.manager_based.go2w.cfg.navigation.env import OBSTACLE_SIZE, make_play_obstacle_cfg
+from go2w.tasks.manager_based.go2w.mdp.navigation.hospital.specs import (
     NAV_WAYPOINT_COMMAND_MIN_FORWARD_PLAY,
     NAV_WAYPOINT_COMMAND_MAX_LATERAL_PLAY,
     NAV_WAYPOINT_COMMAND_MAX_HEADING_PLAY,
 )
-from go2w.tasks.manager_based.go2w.mdp.obstacle_geometry import (
+from go2w.tasks.manager_based.go2w.mdp.navigation.local_planning.obstacle_geometry import (
     OBSTACLE_SHAPE_CONE,
     OBSTACLE_SHAPE_CUBOID,
     OBSTACLE_SHAPE_CYLINDER,
     footprint_clearance,
 )
-from go2w.tasks.manager_based.go2w.observation_layout import POLICY_OBS
+from go2w.tasks.manager_based.go2w.cfg.observation_layout import POLICY_OBS
 
 from play_nav_debug import (  # isort: skip
     NAV_LIVE_LABEL_INTERVAL, NAV_LIVE_LABEL_SCALE, NAV_LIVE_LABEL_MAX,
@@ -692,7 +692,7 @@ def _override_play_obstacle_count(
     if num_obstacles > max_available:
         raise ValueError(
             f"--num_obstacles={num_obstacles} exceeds the play scene capacity ({max_available}). "
-            "Increase PLAY_MAX_OBSTACLES in go2w_obstacle_env_cfg.py if you need more."
+            "Increase PLAY_MAX_OBSTACLES in cfg/navigation/env.py if you need more."
         )
 
     if "start_iteration" in params:

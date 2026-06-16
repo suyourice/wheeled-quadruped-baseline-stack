@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ..obstacle_geometry import (
+from ..local_planning.obstacle_geometry import (
     OBSTACLE_SHAPE_CONE,
     OBSTACLE_SHAPE_CUBOID,
     OBSTACLE_SHAPE_CYLINDER,

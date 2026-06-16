@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 from isaaclab.utils.math import wrap_to_pi
 
-from .debug_utils import fmt_xy, nav_debug_enabled, nav_debug_env_id, nav_debug_interval
+from ...common.debug import fmt_xy, nav_debug_enabled, nav_debug_env_id, nav_debug_interval
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
