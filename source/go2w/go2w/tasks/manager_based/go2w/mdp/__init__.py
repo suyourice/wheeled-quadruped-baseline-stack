@@ -85,8 +85,8 @@ from .navigation.local_planning.obstacle_observations import (
 from .navigation.reset.random_obstacles import (
     move_dynamic_play_obstacles,
     reset_obstacles_curriculum,
+    update_locomotion_curriculum,
 )
-from .locomotion.events import update_locomotion_curriculum
 from .navigation.reset.template_obstacles import reset_navigation_goals_and_obstacles
 from .navigation.reset.structured_astar import reset_structured_astar_corridor
 
