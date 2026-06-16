@@ -198,7 +198,7 @@ def _make_depth_camera_cfg() -> MultiMeshRayCasterCameraCfg:
     return MultiMeshRayCasterCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/Head_upper",
         offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
-            pos=(0.0, 0.0, 0.095),
+            pos=(0.056, 0.047, 0.097),
             rot=D456_CAMERA_PITCH_DOWN_QUAT_WXYZ,
             convention="world",
         ),
