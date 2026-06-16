@@ -39,25 +39,31 @@ import matplotlib.pyplot as plt
 from matplotlib.transforms import Affine2D
 import numpy as np
 
-# ── mdp module loader (no Isaac Lab needed) ───────────────────────────────────
+# ── MDP module loader (no Isaac Lab needed) ───────────────────────────────────
 
 _MDP = Path(__file__).resolve().parent.parent / "source/go2w/go2w/tasks/manager_based/go2w/mdp"
+_GLOBAL_PLANNING = _MDP / "navigation/global_planning"
 
-_mdp_pkg = types.ModuleType("mdp")
-_mdp_pkg.__path__ = [str(_MDP)]
-_mdp_pkg.__package__ = "mdp"
-sys.modules.setdefault("mdp", _mdp_pkg)
+for _pkg_name, _pkg_path in (
+    ("go2w_mdp", _MDP),
+    ("go2w_mdp.navigation", _MDP / "navigation"),
+    ("go2w_mdp.navigation.global_planning", _GLOBAL_PLANNING),
+):
+    _pkg = types.ModuleType(_pkg_name)
+    _pkg.__path__ = [str(_pkg_path)]
+    _pkg.__package__ = _pkg_name
+    sys.modules.setdefault(_pkg_name, _pkg)
 
 
-def _load_mdp(stem: str):
-    name = f"mdp.{stem}"
+def _load_global_planning(stem: str):
+    name = f"go2w_mdp.navigation.global_planning.{stem}"
     if name in sys.modules:
         return sys.modules[name]
-    p = _MDP / f"{stem}.py"
+    p = _GLOBAL_PLANNING / f"{stem}.py"
     spec = _ilu.spec_from_file_location(name, p, submodule_search_locations=[])
     assert spec is not None and spec.loader is not None
     mod = _ilu.module_from_spec(spec)
-    mod.__package__ = "mdp"
+    mod.__package__ = "go2w_mdp.navigation.global_planning"
     sys.modules[name] = mod
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
@@ -166,8 +172,8 @@ def build_corridor_and_path(
     corner_radius: float,
 ):
     """Return (occ_image, extent, astar_raw_path, astar_sparse_path) or raise."""
-    _astar = _load_mdp("astar")
-    _corr  = _load_mdp("structured_corridor")
+    _astar = _load_global_planning("astar")
+    _corr  = _load_global_planning("corridors")
 
     cl = _corr.structured_corridor_centerline(corridor_kind, leg_length, corridor_width)
     grid, start, goal = _corr.build_polyline_corridor_grid(cl, corridor_width, robot_inflation, grid_resolution)
@@ -281,7 +287,7 @@ def plot_combined(
     final_x = records[0]["final_x"]
     final_y = records[0]["final_y"]
 
-    fig = plt.figure(figsize=(20, 11))
+    fig = plt.figure(figsize=(21, 11), constrained_layout=True)
     fig.suptitle(
         f"Navigation debug  env={env_id}  {len(records)} entries",
         fontsize=14,
@@ -456,8 +462,7 @@ def plot_combined(
     ax_look.legend(fontsize=7)
     ax_look.grid(True, alpha=0.3)
 
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     if show:
         plt.show()
     plt.close(fig)
