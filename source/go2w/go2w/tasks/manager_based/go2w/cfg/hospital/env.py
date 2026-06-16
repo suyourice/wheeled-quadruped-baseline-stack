@@ -428,6 +428,51 @@ class Go2wHospitalPlayEnvCfg(Go2wNavTeacherEnvCfg_PLAY):
 
 
 # =============================================================================
+# Hospital play environment — Nav Teacher, full hospital floor
+# =============================================================================
+
+
+@configclass
+class Go2wHospitalFloorPlayEnvCfg(Go2wNavTeacherEnvCfg_PLAY):
+    """Teacher play/eval env for the full hospital floor.
+
+    Same obs as Go2wHospitalPlayEnvCfg (NavTeacherObsCfg, privileged obstacle
+    positions) but uses the full-floor corridor layout instead of the L-corridor.
+    Load any existing Nav Teacher checkpoint directly.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = HOSPITAL_FLOOR_EPISODE_LENGTH_S
+        self.scene.env_spacing = HOSPITAL_FLOOR_ENV_SPACING
+        slot_tables = _hospital_structured_slot_tables(
+            HOSPITAL_FLOOR_CORRIDOR_KIND,
+            HOSPITAL_FLOOR_LEG_LENGTH,
+            HOSPITAL_FLOOR_CORRIDOR_WIDTH,
+            HOSPITAL_FLOOR_WALL_THICKNESS,
+        )
+        wall_count = int(slot_tables["wall_count"])
+        _configure_hospital_structured_depth_play(
+            self,
+            corridor_kind=HOSPITAL_FLOOR_CORRIDOR_KIND,
+            leg_length=HOSPITAL_FLOOR_LEG_LENGTH,
+            corridor_width=HOSPITAL_FLOOR_CORRIDOR_WIDTH,
+            wall_thickness=HOSPITAL_FLOOR_WALL_THICKNESS,
+            dynamic_obstacle_count=HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
+            speed_scale=0.8,
+            semantic_local_poses=_hospital_floor_semantic_local_poses(wall_count, HOSPITAL_FLOOR_LEG_LENGTH),
+            queue_groups=_hospital_floor_queue_groups(wall_count),
+            seated_groups=_hospital_floor_seated_groups(wall_count),
+            ramp_local_pose=HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
+            ramp_b_local_pose=HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
+            robot_start_local_xy=HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
+            min_inter_obstacle_dist=1.05,
+        )
+        _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
+        _configure_play_obstacle_obs(self.observations.policy)
+
+
+# =============================================================================
 # Hospital play environment — Depth Camera Student
 # =============================================================================
 

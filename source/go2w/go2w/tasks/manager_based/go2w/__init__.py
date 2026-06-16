@@ -142,6 +142,16 @@ gym.register(
 )
 
 gym.register(
+    id="Nav-Teacher-Hospital-Floor-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
+    },
+)
+
+gym.register(
     id="Navigation-Depth-Distill-Hospital-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
