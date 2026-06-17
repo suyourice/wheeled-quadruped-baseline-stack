@@ -49,6 +49,13 @@ parser.add_argument(
          "FrozenLLCActionTerm before env creation. Legacy obstacle tasks still use it for model warm-starts.",
 )
 parser.add_argument(
+    "--warm_start_checkpoint",
+    type=str,
+    default=None,
+    help="Path to a PPO checkpoint whose actor/critic weights initialize a fresh OnPolicyRunner run. "
+         "Unlike --resume/--checkpoint, this does not restore optimizer state or learning iteration.",
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
 parser.add_argument(
@@ -85,7 +92,19 @@ def _reject_play_task_for_training(task_name: str | None) -> None:
         )
 
 
+def _reject_conflicting_checkpoint_modes(args: argparse.Namespace) -> None:
+    """Prevent mixing fresh-run warm-start with resume-style loading."""
+    if args.warm_start_checkpoint is not None and (
+        args.resume or args.teacher_checkpoint is not None or args.checkpoint is not None
+    ):
+        raise ValueError(
+            "--warm_start_checkpoint starts a fresh run from copied actor/critic weights. "
+            "Do not combine it with --resume, --teacher_checkpoint, or --checkpoint."
+        )
+
+
 _reject_play_task_for_training(args_cli.task)
+_reject_conflicting_checkpoint_modes(args_cli)
 
 # always enable cameras to record video
 if args_cli.video:
@@ -241,6 +260,31 @@ def _load_locomotion_checkpoint(runner: OnPolicyRunner, ckpt_path: str, device: 
         print(f"[INFO] Loaded critic from '{critic_key}'")
 
     print(f"[INFO] Loaded locomotion checkpoint from: {ckpt_path}")
+
+
+def _warm_start_policy_checkpoint(runner: OnPolicyRunner, ckpt_path: str, device: str) -> None:
+    """Initialize a fresh PPO actor/critic from another PPO checkpoint."""
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    actor_key, actor_sd = find_state_dict(
+        ckpt,
+        ("actor_state_dict", "model_state_dict", "policy_state_dict"),
+        "actor",
+    )
+    actor_target = getattr(runner.alg.actor, "frozen_actor", runner.alg.actor)
+    actor_label = "frozen actor" if actor_target is not runner.alg.actor else "actor"
+    load_padded_state_dict(actor_target, actor_sd, device, f"warm-start {actor_label}", strip_distribution=False)
+    print(f"[INFO] Warm-started actor from '{actor_key}'")
+
+    try:
+        critic_key, critic_sd = find_state_dict(ckpt, ("critic_state_dict", "value_state_dict"), "critic")
+    except ValueError as exc:
+        print(f"[WARN] {exc}; critic remains randomly initialized")
+    else:
+        load_padded_state_dict(runner.alg.critic, critic_sd, device, "warm-start critic")
+        print(f"[INFO] Warm-started critic from '{critic_key}'")
+
+    print(f"[INFO] Warm-started policy weights from: {ckpt_path}")
 
 
 
@@ -427,6 +471,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     elif agent_cfg.class_name == "DistillationRunner" and args_cli.locomotion_checkpoint is None:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
+    if args_cli.warm_start_checkpoint is not None and (
+        resume_path is not None or args_cli.resume or args_cli.checkpoint is not None
+    ):
+        raise ValueError(
+            "--warm_start_checkpoint starts a fresh run from copied actor/critic weights. "
+            "Do not combine it with --resume, --teacher_checkpoint, or --checkpoint."
+        )
+
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
@@ -462,6 +514,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _load_locomotion_checkpoint(runner, args_cli.locomotion_checkpoint, agent_cfg.device)
         else:
             raise ValueError("--locomotion_checkpoint is only supported for OnPolicyRunner tasks")
+
+    if args_cli.warm_start_checkpoint is not None:
+        if isinstance(runner, OnPolicyRunner):
+            _warm_start_policy_checkpoint(runner, args_cli.warm_start_checkpoint, agent_cfg.device)
+        else:
+            raise ValueError("--warm_start_checkpoint is only supported for OnPolicyRunner tasks")
 
     # load the checkpoint
     if resume_path is not None:
