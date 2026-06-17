@@ -71,6 +71,7 @@ from isaaclab.envs.mdp import (
 # -- Observations (local custom) -----------------------------------------------
 from .navigation.local_planning.sensor_observations import (
     depth_closeness_image,
+    depth_closeness_multicam_image,
     lidar_distances,
     local_goal_command_b,
     obstacle_polar_depth,

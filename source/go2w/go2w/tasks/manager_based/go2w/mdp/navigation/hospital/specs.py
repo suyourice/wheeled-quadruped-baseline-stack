@@ -286,6 +286,8 @@ D456_NATIVE_DEPTH_RESOLUTION = (1280, 720)
 DEPTH_IMAGE_WIDTH = 128
 DEPTH_IMAGE_HEIGHT = 72
 DEPTH_HISTORY_LENGTH = 3
+DEPTH_HISTORY_LENGTH_LONG = 8
+DEPTH_CAMERA_SPARSE_STRIDE = 5
 DEPTH_DISTILL_NUM_ENVS = 512
 DEPTH_DISTILL_MIN_OBSTACLES = 6
 DEPTH_DISTILL_MAX_OBSTACLES = 10
@@ -314,6 +316,26 @@ D456_CAMERA_PITCH_DOWN_QUAT_WXYZ = (
     math.sin(_D456_CAMERA_PITCH_HALF_RAD),
     0.0,
 )
+
+
+def _quat_multiply_wxyz(q1, q2):
+    """Quaternion multiplication (w, x, y, z)."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return (
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    )
+
+_D456_YAW_LEFT_QUAT  = (math.cos(math.pi / 4), 0.0, 0.0,  math.sin(math.pi / 4))
+_D456_YAW_RIGHT_QUAT = (math.cos(math.pi / 4), 0.0, 0.0, -math.sin(math.pi / 4))
+_D456_YAW_180_QUAT   = (0.0, 0.0, 0.0, 1.0)
+
+D456_CAMERA_LEFT_QUAT_WXYZ  = _quat_multiply_wxyz(_D456_YAW_LEFT_QUAT,  D456_CAMERA_PITCH_DOWN_QUAT_WXYZ)
+D456_CAMERA_RIGHT_QUAT_WXYZ = _quat_multiply_wxyz(_D456_YAW_RIGHT_QUAT, D456_CAMERA_PITCH_DOWN_QUAT_WXYZ)
+D456_CAMERA_REAR_QUAT_WXYZ  = _quat_multiply_wxyz(_D456_YAW_180_QUAT,   D456_CAMERA_PITCH_DOWN_QUAT_WXYZ)
 
 
 @dataclass(frozen=True)

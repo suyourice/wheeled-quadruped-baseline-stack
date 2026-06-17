@@ -84,6 +84,56 @@ def depth_closeness_image(
     return (1.0 - depth / max_depth).clamp(0.0, 1.0)
 
 
+def depth_closeness_multicam_image(
+    env: ManagerBasedRLEnv,
+    sensor_cfgs: list,
+    data_type: str = "distance_to_image_plane",
+    min_depth: float = 0.60,
+    max_depth: float = 6.0,
+    history_length: int = 3,
+) -> torch.Tensor:
+    """Multi-camera depth history for the CNN student.
+
+    Reads `len(sensor_cfgs)` depth cameras and maintains a rolling buffer with
+    `history_length` timesteps.  Returns (N, n_cams * history_length, H, W).
+    Buffer layout: [cam0_t, cam1_t, ..., cam0_t-1, cam1_t-1, ...].
+    """
+    n_cams = len(sensor_cfgs)
+    buf_key = "_mcam_depth_buf"
+
+    # Compute current closeness frame for each camera.
+    frames = []
+    for sc in sensor_cfgs:
+        sensor = env.scene.sensors[sc.name]
+        depth = sensor.data.output[data_type]
+        if depth.ndim == 4 and depth.shape[-1] == 1:
+            depth = depth.squeeze(-1)
+        depth = torch.nan_to_num(depth, nan=max_depth, posinf=max_depth, neginf=max_depth)
+        frames.append((1.0 - depth.clamp(min_depth, max_depth) / max_depth).clamp(0.0, 1.0))
+
+    N, H, W = frames[0].shape
+
+    # Lazy init.
+    if not hasattr(env, buf_key):
+        buf = torch.zeros(N, n_cams * history_length, H, W, device=frames[0].device)
+        setattr(env, buf_key, buf)
+    buf = getattr(env, buf_key)
+
+    # Reset buffer rows for envs that terminated this step.
+    # Guard: termination_manager is not yet available during obs shape probing at init.
+    if hasattr(env, "termination_manager"):
+        terminated = env.termination_manager.terminated
+        if terminated.any():
+            buf[terminated] = 0.0
+
+    # Shift history back by one slot (n_cams channels) and insert current frames.
+    buf[:, n_cams:] = buf[:, :-n_cams].clone()
+    for i, frame in enumerate(frames):
+        buf[:, i] = frame
+
+    return buf
+
+
 def obstacle_polar_depth(
     env: ManagerBasedRLEnv,
     obstacle_names: list[str],
