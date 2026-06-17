@@ -177,3 +177,27 @@ class NavDepthRLDistillRunnerCfg(NavRLDistillRunnerCfg):
         safety_clearance_threshold=0.65,
         safety_weight_clip=4.0,
     )
+
+
+@configclass
+class NavDepthLongHistRLDistillRunnerCfg(NavDepthRLDistillRunnerCfg):
+    """Distillation runner for 8-frame long-history depth student (abl-D)."""
+
+    experiment_name = "go2w_nav_depth_longhist_distill"
+    wandb_project = "go2w_nav_depth_longhist_distill"
+
+
+@configclass
+class NavDepthSparseRLDistillRunnerCfg(NavDepthRLDistillRunnerCfg):
+    """Distillation runner for sparse-history depth student (abl-B)."""
+
+    experiment_name = "go2w_nav_depth_sparse_distill"
+    wandb_project = "go2w_nav_depth_sparse_distill"
+
+
+@configclass
+class NavDepthMultiCamRLDistillRunnerCfg(NavDepthRLDistillRunnerCfg):
+    """Distillation runner for 4-camera depth student (abl-A)."""
+
+    experiment_name = "go2w_nav_depth_multicam_distill"
+    wandb_project = "go2w_nav_depth_multicam_distill"

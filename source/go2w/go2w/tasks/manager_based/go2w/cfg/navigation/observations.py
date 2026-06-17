@@ -248,3 +248,61 @@ class NavDepthRLDistillObsCfg:
     student_state: StudentStateCfg = StudentStateCfg()
     student_depth: StudentDepthCfg = StudentDepthCfg()
     teacher: NavRLDistillObsCfg.TeacherCfg = NavRLDistillObsCfg.TeacherCfg()
+
+
+@configclass
+class NavDepthRLDistillLongHistObsCfg(NavDepthRLDistillObsCfg):
+    """Depth distillation observations with longer dense history (8 frames = 0.14s)."""
+
+    @configclass
+    class StudentDepthLongHistCfg(ObsGroup):
+        depth_stack = ObsTerm(
+            func=mdp.depth_closeness_image,
+            params={
+                "sensor_cfg": SceneEntityCfg("depth_camera"),
+                "data_type": "distance_to_image_plane",
+                "min_depth": D456_DEPTH_MIN_DISTANCE,
+                "max_depth": D456_DEPTH_MAX_DISTANCE,
+            },
+            history_length=DEPTH_HISTORY_LENGTH_LONG,
+            flatten_history_dim=False,
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    student_depth: StudentDepthLongHistCfg = StudentDepthLongHistCfg()
+
+
+@configclass
+class NavDepthRLDistillMultiCamObsCfg(NavDepthRLDistillObsCfg):
+    """Depth distillation observations with 4 cameras (front/left/right/rear).
+
+    Returns (N, 12, H, W) = 4 cams x 3 frames.  The multicam function manages
+    its own rolling buffer so no ObsTerm history_length is needed.
+    """
+
+    @configclass
+    class StudentDepthMultiCamCfg(ObsGroup):
+        depth_stack = ObsTerm(
+            func=mdp.depth_closeness_multicam_image,
+            params={
+                "sensor_cfgs": [
+                    SceneEntityCfg("depth_camera"),
+                    SceneEntityCfg("depth_camera_left"),
+                    SceneEntityCfg("depth_camera_right"),
+                    SceneEntityCfg("depth_camera_rear"),
+                ],
+                "data_type": "distance_to_image_plane",
+                "min_depth": D456_DEPTH_MIN_DISTANCE,
+                "max_depth": D456_DEPTH_MAX_DISTANCE,
+                "history_length": 3,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    student_depth: StudentDepthMultiCamCfg = StudentDepthMultiCamCfg()

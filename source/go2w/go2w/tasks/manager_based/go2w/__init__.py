@@ -180,3 +180,67 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
     },
 )
+
+# =============================================================================
+# Depth student ablation experiments
+# =============================================================================
+
+gym.register(
+    id="Navigation-Depth-Distill-LongHist-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavDepthLongHistRLDistillEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthLongHistRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-LongHist-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavDepthLongHistRLDistillEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthLongHistRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-Sparse-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavDepthSparseRLDistillEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthSparseRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-Sparse-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavDepthSparseRLDistillEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthSparseRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-4Cam-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavDepthMultiCamRLDistillEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthMultiCamRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-4Cam-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavDepthMultiCamRLDistillEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthMultiCamRLDistillRunnerCfg",
+    },
+)

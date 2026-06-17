@@ -43,7 +43,13 @@ from ...mdp.navigation.hospital.floor import (
 )
 from ..locomotion.env import EventCfg, Go2wEnvCfg, Go2wSceneCfg
 from .rewards import NavTeacherRewardsCfg
-from .observations import NavDepthRLDistillObsCfg, NavRLDistillObsCfg, NavTeacherObsCfg
+from .observations import (
+    NavDepthRLDistillObsCfg,
+    NavDepthRLDistillLongHistObsCfg,
+    NavDepthRLDistillMultiCamObsCfg,
+    NavRLDistillObsCfg,
+    NavTeacherObsCfg,
+)
 
 
 # =============================================================================
@@ -193,13 +199,15 @@ class ObstaclePlaySceneCfg(ObstacleSceneCfg):
         del i
 
 
-def _make_depth_camera_cfg() -> MultiMeshRayCasterCameraCfg:
+def _make_depth_camera_cfg(rot_wxyz=None) -> MultiMeshRayCasterCameraCfg:
     """Create a lightweight D456-like ray-cast depth camera."""
+    if rot_wxyz is None:
+        rot_wxyz = D456_CAMERA_PITCH_DOWN_QUAT_WXYZ
     return MultiMeshRayCasterCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/Head_upper",
         offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
-            pos=(0.0, 0.0, 0.095),
-            rot=D456_CAMERA_PITCH_DOWN_QUAT_WXYZ,
+            pos=(0.056, 0.0, 0.097),
+            rot=rot_wxyz,
             convention="world",
         ),
         data_types=["distance_to_image_plane"],
@@ -553,6 +561,126 @@ class Go2wNavDepthRLDistillEnvCfg_PLAY(Go2wNavDepthRLDistillEnvCfg):
     """Play/eval env for the depth-camera student distillation."""
 
     scene: DepthObstaclePlaySceneCfg = DepthObstaclePlaySceneCfg(num_envs=16, env_spacing=5.0)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_play_common(self)
+        self.events.depth_distill_dynamic_obstacles = None
+        self.observations.student_state.enable_corruption = False
+        self.observations.student_depth.enable_corruption = False
+        _configure_play_obstacle_obs(self.observations.teacher)
+
+
+# =============================================================================
+# 4-camera scene configs
+# =============================================================================
+
+@configclass
+class DepthObstacleMultiCamSceneCfg(ObstacleSceneCfg):
+    """Training scene with four head-mounted depth cameras (front/left/right/rear)."""
+
+    depth_camera       = _make_depth_camera_cfg()
+    depth_camera_left  = _make_depth_camera_cfg(D456_CAMERA_LEFT_QUAT_WXYZ)
+    depth_camera_right = _make_depth_camera_cfg(D456_CAMERA_RIGHT_QUAT_WXYZ)
+    depth_camera_rear  = _make_depth_camera_cfg(D456_CAMERA_REAR_QUAT_WXYZ)
+
+
+@configclass
+class DepthObstacleMultiCamPlaySceneCfg(ObstaclePlaySceneCfg):
+    """Play scene with four head-mounted depth cameras (front/left/right/rear)."""
+
+    depth_camera       = _make_depth_camera_cfg()
+    depth_camera_left  = _make_depth_camera_cfg(D456_CAMERA_LEFT_QUAT_WXYZ)
+    depth_camera_right = _make_depth_camera_cfg(D456_CAMERA_RIGHT_QUAT_WXYZ)
+    depth_camera_rear  = _make_depth_camera_cfg(D456_CAMERA_REAR_QUAT_WXYZ)
+
+
+# =============================================================================
+# Ablation: Long History (8 dense frames)
+# =============================================================================
+
+@configclass
+class Go2wNavDepthLongHistRLDistillEnvCfg(Go2wNavDepthRLDistillEnvCfg):
+    """Depth distillation env with 8-frame dense history (abl-D)."""
+
+    observations: NavDepthRLDistillLongHistObsCfg = NavDepthRLDistillLongHistObsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.depth_camera.update_period = self.decimation * self.sim.dt
+
+
+@configclass
+class Go2wNavDepthLongHistRLDistillEnvCfg_PLAY(Go2wNavDepthLongHistRLDistillEnvCfg):
+    """Play env for depth long-history distillation."""
+
+    scene: DepthObstaclePlaySceneCfg = DepthObstaclePlaySceneCfg(num_envs=16, env_spacing=5.0)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_play_common(self)
+        self.events.depth_distill_dynamic_obstacles = None
+        self.observations.student_state.enable_corruption = False
+        self.observations.student_depth.enable_corruption = False
+        _configure_play_obstacle_obs(self.observations.teacher)
+
+
+# =============================================================================
+# Ablation: Sparse History (stride-5 camera update = 0.10s/frame)
+# =============================================================================
+
+@configclass
+class Go2wNavDepthSparseRLDistillEnvCfg(Go2wNavDepthRLDistillEnvCfg):
+    """Depth distillation env with sparse history (t, t-5, t-10 RL steps = abl-B)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.depth_camera.update_period = (
+            DEPTH_CAMERA_SPARSE_STRIDE * self.decimation * self.sim.dt
+        )
+
+
+@configclass
+class Go2wNavDepthSparseRLDistillEnvCfg_PLAY(Go2wNavDepthSparseRLDistillEnvCfg):
+    """Play env for depth sparse-history distillation."""
+
+    scene: DepthObstaclePlaySceneCfg = DepthObstaclePlaySceneCfg(num_envs=16, env_spacing=5.0)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_play_common(self)
+        self.events.depth_distill_dynamic_obstacles = None
+        self.observations.student_state.enable_corruption = False
+        self.observations.student_depth.enable_corruption = False
+        _configure_play_obstacle_obs(self.observations.teacher)
+
+
+# =============================================================================
+# Ablation: 4-Camera (front / left / right / rear, each 128x72, 3 frames)
+# =============================================================================
+
+@configclass
+class Go2wNavDepthMultiCamRLDistillEnvCfg(Go2wNavDepthRLDistillEnvCfg):
+    """Depth distillation env with 4 cameras, 360° FOV coverage (abl-A)."""
+
+    scene: DepthObstacleMultiCamSceneCfg = DepthObstacleMultiCamSceneCfg(
+        num_envs=DEPTH_DISTILL_NUM_ENVS, env_spacing=8.0
+    )
+    observations: NavDepthRLDistillMultiCamObsCfg = NavDepthRLDistillMultiCamObsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        for cam_attr in ("depth_camera", "depth_camera_left", "depth_camera_right", "depth_camera_rear"):
+            getattr(self.scene, cam_attr).update_period = self.decimation * self.sim.dt
+
+
+@configclass
+class Go2wNavDepthMultiCamRLDistillEnvCfg_PLAY(Go2wNavDepthMultiCamRLDistillEnvCfg):
+    """Play env for depth 4-camera distillation."""
+
+    scene: DepthObstacleMultiCamPlaySceneCfg = DepthObstacleMultiCamPlaySceneCfg(
+        num_envs=16, env_spacing=5.0
+    )
 
     def __post_init__(self):
         super().__post_init__()
