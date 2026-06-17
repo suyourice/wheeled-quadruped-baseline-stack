@@ -59,6 +59,108 @@ PLAY_OBSTACLE_SHAPE_IDS = tuple(_SHAPE_ID_BY_KIND[kind] for kind, _ in PLAY_OBST
 PLAY_OBSTACLE_WIDTHS = tuple(size[0] for _, size in PLAY_OBSTACLE_SPECS)
 PLAY_OBSTACLE_DEPTHS = tuple(size[1] for _, size in PLAY_OBSTACLE_SPECS)
 
+# ── Hospital Training Obstacle Specs ─────────────────────────────────────────
+# 15 slots matching TRAIN_PHYSICAL_OBSTACLE_SLOTS.  Slots 13-14 are long cuboid
+# wall segments used exclusively in corridor scenarios; all other slots cover
+# realistic hospital footprints from IV poles to beds.
+HOSPITAL_TRAIN_OBSTACLE_SPECS: tuple[tuple[str, tuple[float, float]], ...] = (
+    ("cuboid",   (0.30, 0.30)),   # 0  small item
+    ("cylinder", (0.22, 0.22)),   # 1  IV pole
+    ("cuboid",   (0.45, 0.35)),   # 2  standing person
+    ("cylinder", (0.42, 0.42)),   # 3  pole / column
+    ("cone",     (0.54, 0.54)),   # 4  safety cone
+    ("cuboid",   (0.65, 0.50)),   # 5  wheelchair
+    ("cylinder", (0.65, 0.65)),   # 6  large cart / bin
+    ("cuboid",   (0.70, 1.00)),   # 7  wheelchair + person
+    ("cuboid",   (0.85, 0.55)),   # 8  medical cart
+    ("cuboid",   (1.00, 0.65)),   # 9  mobile table
+    ("cuboid",   (1.30, 0.65)),   # 10 equipment stand
+    ("cuboid",   (1.95, 0.90)),   # 11 hospital bed
+    ("cuboid",   (2.60, 0.75)),   # 12 long counter / desk
+    ("cuboid",   (20.00, 0.20)),  # 13 corridor wall A
+    ("cuboid",   (20.00, 0.20)),  # 14 corridor wall B
+)
+HOSPITAL_TRAIN_OBSTACLE_HEIGHTS: tuple[float, ...] = (
+    0.50, 1.45, 1.75, 0.90, 0.75,
+    1.10, 1.00, 1.30, 1.10, 0.90,
+    1.20, 1.20, 1.10,
+    2.40, 2.40,
+)
+assert len(HOSPITAL_TRAIN_OBSTACLE_SPECS) == TRAIN_PHYSICAL_OBSTACLE_SLOTS
+assert len(HOSPITAL_TRAIN_OBSTACLE_HEIGHTS) == TRAIN_PHYSICAL_OBSTACLE_SLOTS
+
+HOSPITAL_TRAIN_OBSTACLE_SHAPE_IDS = tuple(_SHAPE_ID_BY_KIND[k] for k, _ in HOSPITAL_TRAIN_OBSTACLE_SPECS)
+HOSPITAL_TRAIN_OBSTACLE_WIDTHS = tuple(s[0] for _, s in HOSPITAL_TRAIN_OBSTACLE_SPECS)
+HOSPITAL_TRAIN_OBSTACLE_DEPTHS = tuple(s[1] for _, s in HOSPITAL_TRAIN_OBSTACLE_SPECS)
+
+# Fixed slot indices for corridor wall segments.
+HOSPITAL_WALL_SLOT_INDICES: tuple[int, int] = (13, 14)
+HOSPITAL_CORRIDOR_WALL_HEIGHT: float = 2.40
+
+# Corridor half-widths (m) by scenario name.
+HOSPITAL_CORRIDOR_WIDTHS: dict[str, float] = {
+    "corridor_wide":   3.5,
+    "corridor_medium": 2.5,
+    "corridor_narrow": 1.8,
+}
+HOSPITAL_CORRIDOR_SCENARIOS: tuple[str, ...] = (
+    "corridor_wide",
+    "corridor_medium",
+    "corridor_narrow",
+)
+HOSPITAL_CORRIDOR_GOAL_FORWARD: float = 12.0
+HOSPITAL_CORRIDOR_GOAL_LATERAL_RANGE: tuple[float, float] = (-0.25, 0.25)
+HOSPITAL_CORRIDOR_GOAL_HEADING_JITTER_RANGE: tuple[float, float] = (-0.15, 0.15)
+# Maximum interior obstacle footprint width per corridor type.
+# Chosen so robot (0.6 m) can always pass on at least one side (≥ 0.5 m gap).
+HOSPITAL_CORRIDOR_MAX_INTERIOR_WIDTHS: dict[str, float] = {
+    "corridor_wide":   2.5,   # 3.5 - 2×0.5
+    "corridor_medium": 1.5,   # 2.5 - 2×0.5
+    "corridor_narrow": 0.8,   # 1.8 - 2×0.5
+}
+# Iteration at which each corridor type starts placing static interior obstacles.
+HOSPITAL_CORRIDOR_OBS_START_ITERATION: int = 1100
+HOSPITAL_CORRIDOR_OBS_START_ITERATIONS: dict[str, int] = {
+    "corridor_wide": 1100,
+    "corridor_medium": 1300,
+    "corridor_narrow": 1500,
+}
+
+# Hospital nav-teacher curriculum: each key is the iteration at which a new
+# scenario pool becomes active (cumulative additions).
+_HOSP_BASE: tuple[str, ...] = (
+    "head_on", "left_edge", "right_edge",
+    "diag_left", "diag_right", "off_left", "off_right",
+    "narrow_gap",
+)
+_HOSP_FULL: tuple[str, ...] = _HOSP_BASE + (
+    "narrow_gap_wide", "narrow_gap_barely",
+    "partial_blockage_left_open", "partial_blockage_right_open",
+    "cluttered",
+)
+HOSPITAL_NAV_CURRICULUM_PHASE_SCHEDULE: dict[str, tuple[str, ...]] = {
+    "0":   _HOSP_BASE,
+    "200": _HOSP_FULL,
+    "500": _HOSP_FULL + ("corridor_wide",),
+    "700": _HOSP_FULL + ("corridor_wide", "corridor_medium"),
+    "900": _HOSP_FULL + ("corridor_wide", "corridor_medium", "corridor_narrow"),
+}
+
+# Dynamic obstacle parameters for Phase 4 (iter 1700-2000).
+HOSPITAL_DYNAMIC_START_ITERATION: int = 1700
+HOSPITAL_DYNAMIC_WARMUP_ITERATIONS: int = 300
+HOSPITAL_DYNAMIC_SPEED_RANGE: tuple[float, float] = (0.05, 0.50)
+HOSPITAL_DYNAMIC_RESAMPLE_INTERVAL: tuple[float, float] = (2.0, 5.0)
+HOSPITAL_DYNAMIC_LONGITUDINAL_EXTENT: float = 3.0
+HOSPITAL_DYNAMIC_LATERAL_EXTENT: float = 0.60
+HOSPITAL_DYNAMIC_CORRIDOR_SCENARIOS: tuple[str, ...] = HOSPITAL_CORRIDOR_SCENARIOS
+HOSPITAL_DYNAMIC_MAX_OBSTACLE_WIDTHS: dict[str, float] = {
+    "corridor_wide": 2.5,
+    "corridor_medium": 1.5,
+    "corridor_narrow": 0.65,
+}
+HOSPITAL_DYNAMIC_CORRIDOR_LATERAL_MARGIN: float = 0.10
+
 # Hospital play scene: 48 slots with realistic human-scale footprints. The
 # first slots form a dynamic hospital actor palette; structured layouts remap
 # this palette after their wall slots so wall count does not discard patients.

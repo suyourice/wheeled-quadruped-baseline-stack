@@ -64,6 +64,15 @@ class NavTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class NavHospitalTeacherRunnerCfg(NavTeacherRunnerCfg):
+    """Hospital-corridor fine-tuning runner for the RL navigation teacher."""
+
+    max_iterations = 2000
+    experiment_name = "go2w_nav_hospital_teacher_rl"
+    wandb_project = "go2w_nav_hospital_teacher_rl"
+
+
+@configclass
 class SimpleNavDistillAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     """Pure action-MSE distillation algorithm."""
 

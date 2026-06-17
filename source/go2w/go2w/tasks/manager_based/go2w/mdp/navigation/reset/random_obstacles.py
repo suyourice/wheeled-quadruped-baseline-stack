@@ -435,6 +435,11 @@ def move_dynamic_play_obstacles(
     start_iteration: int = 0,
     warmup_iterations: int = 0,
     steps_per_iteration: int = 128,
+    allowed_scenario_names: tuple[str, ...] | list[str] | None = None,
+    corridor_widths: dict[str, float] | None = None,
+    corridor_max_obstacle_widths: dict[str, float] | None = None,
+    obstacle_widths: tuple[float, ...] | list[float] | None = None,
+    corridor_lateral_margin: float = 0.0,
 ) -> None:
     """Move active play obstacles like pedestrians along the current corridor.
 
@@ -491,6 +496,63 @@ def move_dynamic_play_obstacles(
     )
     robot_xy = env.scene["robot"].data.root_pos_w[env_ids, :2]
     active = (positions_xy - robot_xy.unsqueeze(1)).norm(dim=-1) < active_distance
+    blocking = active.clone()
+    env_scenario_ids = None
+    corridor_width_by_env = None
+    has_corridor_width = None
+    slot_widths = None
+
+    if obstacle_widths is not None:
+        if len(obstacle_widths) < n_slots:
+            raise ValueError("obstacle_widths must have at least one entry per dynamic obstacle name.")
+        slot_widths = torch.tensor(obstacle_widths[:n_slots], dtype=positions_xy.dtype, device=device)
+
+    needs_scenario_ids = (
+        allowed_scenario_names is not None
+        or corridor_widths is not None
+        or corridor_max_obstacle_widths is not None
+    )
+    if needs_scenario_ids:
+        if not hasattr(env, "_go2w_scenario_template_id"):
+            return
+        env_scenario_ids = env._go2w_scenario_template_id[env_ids].long()
+
+    if allowed_scenario_names is not None and env_scenario_ids is not None:
+        allowed_ids = []
+        for name in allowed_scenario_names:
+            if name not in _NAV_SCENARIO_CODES:
+                raise ValueError(f"Unknown dynamic obstacle scenario name: {name}")
+            allowed_ids.append(_NAV_SCENARIO_CODES[name])
+        if len(allowed_ids) == 0:
+            return
+        allowed_ids_t = torch.tensor(allowed_ids, dtype=torch.long, device=device)
+        scenario_active = (env_scenario_ids.unsqueeze(1) == allowed_ids_t.unsqueeze(0)).any(dim=1)
+        active &= scenario_active.unsqueeze(1)
+        blocking &= scenario_active.unsqueeze(1)
+
+    if corridor_max_obstacle_widths is not None and env_scenario_ids is not None and slot_widths is not None:
+        max_width_by_env = torch.full((len(env_ids),), float("inf"), dtype=positions_xy.dtype, device=device)
+        for name, max_width in corridor_max_obstacle_widths.items():
+            if name not in _NAV_SCENARIO_CODES:
+                raise ValueError(f"Unknown corridor max-width scenario name: {name}")
+            mask = env_scenario_ids == _NAV_SCENARIO_CODES[name]
+            max_width_by_env = torch.where(mask, torch.full_like(max_width_by_env, float(max_width)), max_width_by_env)
+        active &= slot_widths.unsqueeze(0) <= (max_width_by_env.unsqueeze(1) + 1.0e-6)
+
+    if corridor_widths is not None and env_scenario_ids is not None:
+        corridor_width_by_env = torch.zeros(len(env_ids), dtype=positions_xy.dtype, device=device)
+        has_corridor_width = torch.zeros(len(env_ids), dtype=torch.bool, device=device)
+        for name, corridor_width in corridor_widths.items():
+            if name not in _NAV_SCENARIO_CODES:
+                raise ValueError(f"Unknown corridor-width scenario name: {name}")
+            mask = env_scenario_ids == _NAV_SCENARIO_CODES[name]
+            corridor_width_by_env = torch.where(
+                mask, torch.full_like(corridor_width_by_env, float(corridor_width)), corridor_width_by_env
+            )
+            has_corridor_width |= mask
+
+    if not active.any():
+        return
 
     corridor = env._go2w_goal_pos_w[env_ids, :2] - env._go2w_start_pos_w[env_ids, :2]
     corridor_norm = corridor.norm(dim=-1, keepdim=True)
@@ -616,6 +678,33 @@ def move_dynamic_play_obstacles(
     proposed = torch.where(active.unsqueeze(-1), proposed, positions_xy)
 
     if (
+        corridor_width_by_env is not None
+        and has_corridor_width is not None
+        and slot_widths is not None
+        and has_corridor_width.any()
+    ):
+        corridor_half = corridor_width_by_env * 0.5
+        obstacle_half = slot_widths.unsqueeze(0) * 0.5
+        lateral_limit = (
+            corridor_half.unsqueeze(1) - obstacle_half - max(0.0, corridor_lateral_margin)
+        ).clamp(min=0.0)
+        corridor_normal = torch.stack((-corridor_dir[:, 1], corridor_dir[:, 0]), dim=-1)
+        corridor_start = env._go2w_start_pos_w[env_ids, :2]
+        rel_to_start = proposed - corridor_start.unsqueeze(1)
+        along = (rel_to_start * corridor_dir.unsqueeze(1)).sum(dim=-1)
+        lateral = (rel_to_start * corridor_normal.unsqueeze(1)).sum(dim=-1)
+        lateral_clamped = torch.minimum(torch.maximum(lateral, -lateral_limit), lateral_limit)
+        clamped = (
+            corridor_start.unsqueeze(1)
+            + along.unsqueeze(-1) * corridor_dir.unsqueeze(1)
+            + lateral_clamped.unsqueeze(-1) * corridor_normal.unsqueeze(1)
+        )
+        clamp_active = active & has_corridor_width.unsqueeze(1)
+        hit_corridor_side = clamp_active & ((lateral - lateral_clamped).abs() > 1.0e-5)
+        lat_speed = torch.where(hit_corridor_side, -lat_speed, lat_speed)
+        proposed = torch.where(clamp_active.unsqueeze(-1), clamped, proposed)
+
+    if (
         hasattr(env, "_go2w_structured_corridor_start_xy")
         and hasattr(env, "_go2w_structured_corridor_yaw")
         and hasattr(env, "_go2w_structured_corridor_width")
@@ -691,7 +780,7 @@ def move_dynamic_play_obstacles(
         others = torch.arange(n_slots, device=device) != slot_idx
         conflict = (
             (distances < min_inter_obstacle_dist)
-            & active
+            & blocking
             & others.unsqueeze(0)
         ).any(dim=1)
         conflict &= active[:, slot_idx]

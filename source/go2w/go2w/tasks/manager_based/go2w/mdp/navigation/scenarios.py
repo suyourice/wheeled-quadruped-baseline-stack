@@ -24,6 +24,9 @@ NAV_SCENARIO_CODES: dict[str, int] = {
     "cluttered": 12,
     "narrow_gap_wide": 13,
     "narrow_gap_barely": 14,
+    "corridor_wide": 15,
+    "corridor_medium": 16,
+    "corridor_narrow": 17,
 }
 
 NAV_SCENARIO_NAMES: dict[int, str] = {code: name for name, code in NAV_SCENARIO_CODES.items()}

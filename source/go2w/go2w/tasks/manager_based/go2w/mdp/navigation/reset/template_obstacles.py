@@ -296,6 +296,19 @@ def reset_navigation_goals_and_obstacles(
     passable_gap_robot_width: float = 0.44,
     randomize_obstacle_yaw: bool = False,
     obstacle_yaw_range: tuple[float, float] = (-math.pi, math.pi),
+    # Corridor scenario support (disabled when None).
+    corridor_goal_forward: float | None = None,
+    corridor_goal_lateral_range: tuple[float, float] = (0.0, 0.0),
+    corridor_goal_heading_jitter_range: tuple[float, float] | None = None,
+    corridor_widths: dict[str, float] | None = None,
+    wall_slot_indices: tuple[int, int] | None = None,
+    corridor_max_interior_widths: dict[str, float] | None = None,
+    wall_slot_z: float | None = None,
+    corridor_obs_start_iteration: int = 999999,
+    corridor_obs_start_iterations: dict[str, int] | None = None,
+    corridor_interior_count_range: tuple[int, int] = (1, 4),
+    corridor_probability: float = 0.25,
+    corridor_wall_yaw_aligned: bool = False,
 ) -> None:
     """Sample explicit start-goal local-navigation tasks and place varied obstacles.
 
@@ -432,6 +445,7 @@ def reset_navigation_goals_and_obstacles(
     parked_positions = _separated_parked_positions(parked_world, len(obstacle_names))
     # Keep parking references immutable while layout slots are populated in-place.
     world_positions_per_slot = list(parked_positions.clone().unbind(dim=1))
+    logical_forced_yaws = torch.full((n, len(obstacle_names)), float("nan"), device=device)
 
     # Per-call passable-gap metadata buffers, filled in the narrow-gap branch below.
     # Defaults (zeros / not passable) cover every non-gap scenario.
@@ -456,6 +470,7 @@ def reset_navigation_goals_and_obstacles(
     _special_fixed = {
         "empty", "narrow_gap", "narrow_gap_wide", "narrow_gap_barely",
         "partial_blockage_left_open", "partial_blockage_right_open",
+        "corridor_wide", "corridor_medium", "corridor_narrow",
     }
     valid_fixed_templates = set(template_choices) | _special_fixed | {None}
     if fixed_template not in valid_fixed_templates:
@@ -481,6 +496,7 @@ def reset_navigation_goals_and_obstacles(
         start_x, start_y = robot_local_xy[env_idx]
         goal_x, goal_y = goal_local_xy[env_idx]
         origin_x, origin_y = env_origin_xy[env_idx]
+        start_yaw = yaw_list[env_idx]
         path_dx = goal_x - start_x
         path_dy = goal_y - start_y
         path_len = math.hypot(path_dx, path_dy)
@@ -554,8 +570,10 @@ def reset_navigation_goals_and_obstacles(
         next_slot = 0
         _ng_set = {"narrow_gap", "narrow_gap_wide", "narrow_gap_barely"}
         _pb_set = {"partial_blockage_left_open", "partial_blockage_right_open"}
+        _corridor_set = {"corridor_wide", "corridor_medium", "corridor_narrow"}
         _ng_phase_ok = _phase_active_templates is None or bool(_ng_set & set(_phase_active_templates))
         _pb_phase_ok = _phase_active_templates is None or bool(_pb_set & set(_phase_active_templates))
+        _corr_phase_ok = _phase_active_templates is None or bool(_corridor_set & set(_phase_active_templates))
         use_narrow_gap = fixed_template in _ng_set or (
             fixed_template is None and active_count >= 2
             and _ng_phase_ok and random.random() < narrow_gap_probability
@@ -567,6 +585,20 @@ def reset_navigation_goals_and_obstacles(
                 or (
                     fixed_template is None and active_count >= 2
                     and _pb_phase_ok and random.random() < partial_blockage_probability
+                )
+            )
+        )
+        use_corridor = (
+            not use_narrow_gap
+            and not use_partial_blockage
+            and corridor_widths is not None
+            and wall_slot_indices is not None
+            and (
+                fixed_template in _corridor_set
+                or (
+                    fixed_template is None
+                    and _corr_phase_ok
+                    and random.random() < corridor_probability
                 )
             )
         )
@@ -676,6 +708,98 @@ def reset_navigation_goals_and_obstacles(
                             break
                 next_slot += 1
 
+        elif use_corridor:
+            # Pick corridor type from phase-active options or fixed template.
+            if fixed_template in _corridor_set:
+                _corr_name = fixed_template
+            elif _phase_active_templates is not None:
+                _corr_opts = [t for t in _phase_active_templates if t in _corridor_set]
+                _corr_name = random.choice(_corr_opts) if _corr_opts else random.choice(list(_corridor_set))
+            else:
+                _corr_name = random.choice(list(_corridor_set))
+
+            if corridor_goal_forward is not None:
+                _corr_forward = max(0.0, corridor_goal_forward)
+                _corr_lateral = random.uniform(*corridor_goal_lateral_range)
+                _cos_yaw = math.cos(start_yaw)
+                _sin_yaw = math.sin(start_yaw)
+                path_dx = _corr_forward * _cos_yaw - _corr_lateral * _sin_yaw
+                path_dy = _corr_forward * _sin_yaw + _corr_lateral * _cos_yaw
+                goal_x = start_x + path_dx
+                goal_y = start_y + path_dy
+                goal_pos_w[env_idx, 0] = origin_x + goal_x
+                goal_pos_w[env_idx, 1] = origin_y + goal_y
+                path_len = math.hypot(path_dx, path_dy)
+                if path_len < 1.0e-6:
+                    path_dx = _cos_yaw
+                    path_dy = _sin_yaw
+                    path_len = 1.0
+                path_dir_x = path_dx / path_len
+                path_dir_y = path_dy / path_len
+                normal_x = -path_dir_y
+                normal_y = path_dir_x
+                _heading_jitter_range = corridor_goal_heading_jitter_range or goal_heading_jitter_range
+                _heading_jitter = (
+                    fixed_goal_heading_jitter
+                    if fixed_goal_heading_jitter is not None
+                    else random.uniform(*_heading_jitter_range)
+                )
+                _path_heading = math.atan2(path_dy, path_dx)
+                goal_heading_w[env_idx] = math.atan2(
+                    math.sin(_path_heading + _heading_jitter),
+                    math.cos(_path_heading + _heading_jitter),
+                )
+
+            scenario_code = template_codes[_corr_name]
+            _corr_half = corridor_widths[_corr_name] / 2.0
+            _max_obs_width = (corridor_max_interior_widths or {}).get(_corr_name, _corr_half - 0.5)
+            _w_z = wall_slot_z if wall_slot_z is not None else obstacle_z
+            _current_iter = env.common_step_counter / max(steps_per_iteration, 1)
+            _obs_start_iteration = (corridor_obs_start_iterations or {}).get(
+                _corr_name, corridor_obs_start_iteration
+            )
+
+            # Place corridor walls at their dedicated slot indices (midpoint of path).
+            for _wi, _sign in enumerate((1.0, -1.0)):
+                _ws = wall_slot_indices[_wi]
+                _wx, _wy = _place_from_path(0.5, _sign * _corr_half)
+                world_positions_per_slot[_ws][env_idx, 0] = origin_x + _wx
+                world_positions_per_slot[_ws][env_idx, 1] = origin_y + _wy
+                world_positions_per_slot[_ws][env_idx, 2] = _w_z
+                if corridor_wall_yaw_aligned:
+                    logical_forced_yaws[env_idx, _ws] = math.atan2(path_dir_y, path_dir_x)
+
+            # Interior obstacles once past the obs-start iteration.
+            if _current_iter >= _obs_start_iteration and fixed_obstacle_widths is not None:
+                _wall_set_s = set(wall_slot_indices)
+                _eligible = [
+                    i for i in range(min(len(obstacle_names), len(fixed_obstacle_widths)))
+                    if i not in _wall_set_s and fixed_obstacle_widths[i] <= _max_obs_width
+                ]
+                n_int = random.randint(*corridor_interior_count_range)
+                for _si in random.sample(_eligible, min(n_int, len(_eligible))):
+                    _hw = fixed_obstacle_widths[_si] / 2.0
+                    _lat_lo, _lat_hi = -_corr_half + _hw, _corr_half - _hw
+                    for _ in range(40):
+                        lx, ly = _place_from_path(
+                            random.uniform(0.15, 0.85), random.uniform(_lat_lo, _lat_hi)
+                        )
+                        if (
+                            math.hypot(lx - start_x, ly - start_y) >= start_exclusion_radius
+                            and math.hypot(lx - goal_x, ly - goal_y) >= goal_exclusion_radius
+                            and all(
+                                math.hypot(lx - px, ly - py) >= min_inter_obstacle_dist
+                                for px, py in placed_positions
+                            )
+                        ):
+                            placed_positions.append((lx, ly))
+                            world_positions_per_slot[_si][env_idx, 0] = origin_x + lx
+                            world_positions_per_slot[_si][env_idx, 1] = origin_y + ly
+                            world_positions_per_slot[_si][env_idx, 2] = obstacle_z
+                            break
+
+            next_slot = active_count  # skip generic fill loop
+
         # Place first obstacle for non-special fixed templates (excluding cluttered, which
         # fills all slots uniformly rather than placing a single "anchor" obstacle).
         if fixed_template in template_choices and fixed_template != "cluttered" and next_slot < active_count:
@@ -756,6 +880,8 @@ def reset_navigation_goals_and_obstacles(
 
     # Preserve the sampled episode-start template before successful goals are
     # replaced with random fallback segments later in the same episode.
+    env._go2w_goal_pos_w[env_ids] = goal_pos_w
+    env._go2w_goal_heading_w[env_ids] = goal_heading_w
     env._go2w_initial_scenario_template_id[env_ids] = env._go2w_scenario_template_id[env_ids]
 
     logical_active_mask = torch.stack(
@@ -792,6 +918,8 @@ def reset_navigation_goals_and_obstacles(
         else:
             sampled_yaws = torch.empty(n, len(obstacle_names), device=device).uniform_(*obstacle_yaw_range)
         logical_yaws = torch.where(logical_active_mask, sampled_yaws, logical_yaws)
+    forced_yaw_mask = torch.isfinite(logical_forced_yaws)
+    logical_yaws = torch.where(forced_yaw_mask, logical_forced_yaws, logical_yaws)
     physical_yaws = torch.zeros_like(logical_yaws)
     physical_yaws.scatter_(1, logical_to_physical, logical_yaws)
     world_positions_per_slot = list(physical_positions.unbind(dim=1))

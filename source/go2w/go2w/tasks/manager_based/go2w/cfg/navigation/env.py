@@ -238,6 +238,49 @@ class DepthObstaclePlaySceneCfg(ObstaclePlaySceneCfg):
     depth_camera = _make_depth_camera_cfg()
 
 
+@configclass
+class HospitalTrainObstacleSceneCfg(Go2wSceneCfg):
+    """Training scene with hospital-scale obstacle specs including 20 m corridor walls."""
+
+    replicate_physics: bool = False
+
+    for i, ((shape_kind, footprint_size), height) in enumerate(
+        zip(_hospital_specs.HOSPITAL_TRAIN_OBSTACLE_SPECS, _hospital_specs.HOSPITAL_TRAIN_OBSTACLE_HEIGHTS)
+    ):
+        vars()[f"obstacle_{i}"] = _make_obstacle_cfg(
+            f"obstacle_{i}", i, shape_kind, footprint_size, height
+        )
+    del i, shape_kind, footprint_size, height
+
+    obstacle_contacts = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/obstacle_.*",
+        history_length=3,
+        track_air_time=False,
+    )
+
+    lidar = MultiMeshRayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base",
+        offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.28945, 0.0, -0.046825)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.LidarPatternCfg(
+            channels=LIDAR_CHANNELS,
+            vertical_fov_range=LIDAR_VERTICAL_FOV,
+            horizontal_fov_range=LIDAR_HORIZONTAL_FOV,
+            horizontal_res=LIDAR_HORIZONTAL_RES,
+        ),
+        max_distance=LIDAR_MAX_DISTANCE,
+        mesh_prim_paths=[
+            "/World/ground",
+            MultiMeshRayCasterCfg.RaycastTargetCfg(
+                prim_expr="{ENV_REGEX_NS}/obstacle_.*",
+                track_mesh_transforms=True,
+                is_shared=True,
+            ),
+        ],
+        debug_vis=False,
+    )
+
+
 # =============================================================================
 # Events
 # =============================================================================
@@ -561,3 +604,107 @@ class Go2wNavDepthRLDistillEnvCfg_PLAY(Go2wNavDepthRLDistillEnvCfg):
         self.observations.student_state.enable_corruption = False
         self.observations.student_depth.enable_corruption = False
         _configure_play_obstacle_obs(self.observations.teacher)
+
+
+# =============================================================================
+# Hospital curriculum teacher environments
+# =============================================================================
+
+_HOSPITAL_WALL_Z = OBSTACLE_GROUND_CLEARANCE + _hospital_specs.HOSPITAL_CORRIDOR_WALL_HEIGHT / 2.0
+_HOSPITAL_NAV_RESET_PARAMS = {
+    **_NAV_RESET_PARAMS_BASE,
+    "obstacle_names": OBSTACLE_NAMES,
+    "min_obstacles": 3,
+    "max_obstacles": 8,
+    "empty_env_fraction": 0.05,
+    "min_inter_obstacle_dist": 0.7,
+    "phase_schedule": _hospital_specs.HOSPITAL_NAV_CURRICULUM_PHASE_SCHEDULE,
+    "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+    "fixed_obstacle_shape_ids": _hospital_specs.HOSPITAL_TRAIN_OBSTACLE_SHAPE_IDS,
+    "fixed_obstacle_widths": _hospital_specs.HOSPITAL_TRAIN_OBSTACLE_WIDTHS,
+    "fixed_obstacle_depths": _hospital_specs.HOSPITAL_TRAIN_OBSTACLE_DEPTHS,
+    "randomize_physical_obstacle_slots": False,  # walls must stay at fixed slot indices
+    "corridor_widths": _hospital_specs.HOSPITAL_CORRIDOR_WIDTHS,
+    "wall_slot_indices": _hospital_specs.HOSPITAL_WALL_SLOT_INDICES,
+    "corridor_max_interior_widths": _hospital_specs.HOSPITAL_CORRIDOR_MAX_INTERIOR_WIDTHS,
+    "wall_slot_z": _HOSPITAL_WALL_Z,
+    "corridor_goal_forward": _hospital_specs.HOSPITAL_CORRIDOR_GOAL_FORWARD,
+    "corridor_goal_lateral_range": _hospital_specs.HOSPITAL_CORRIDOR_GOAL_LATERAL_RANGE,
+    "corridor_goal_heading_jitter_range": _hospital_specs.HOSPITAL_CORRIDOR_GOAL_HEADING_JITTER_RANGE,
+    "corridor_obs_start_iteration": _hospital_specs.HOSPITAL_CORRIDOR_OBS_START_ITERATION,
+    "corridor_obs_start_iterations": _hospital_specs.HOSPITAL_CORRIDOR_OBS_START_ITERATIONS,
+    "corridor_interior_count_range": (1, 4),
+    "corridor_probability": 0.30,
+    "corridor_wall_yaw_aligned": True,
+}
+
+
+@configclass
+class Go2wNavHospitalTeacherEnvCfg(Go2wEnvCfg):
+    """HLC nav teacher fine-tuning env with hospital-scale obstacles and corridor curriculum."""
+
+    scene: HospitalTrainObstacleSceneCfg = HospitalTrainObstacleSceneCfg(num_envs=8192, env_spacing=25.0)
+    actions: HLCNavActionsCfg = HLCNavActionsCfg()
+    observations: NavTeacherObsCfg = NavTeacherObsCfg()
+    rewards: NavTeacherRewardsCfg = NavTeacherRewardsCfg()
+    events: ObstacleEventCfg = ObstacleEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = 40.0
+        self.scene.lidar.update_period = self.decimation * self.sim.dt
+
+        self.events.speed_curriculum = None
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.rel_standing_envs = 1.0
+        self.commands.base_velocity.debug_vis = False
+
+        self.events.reset_obstacles.func = mdp.reset_navigation_goals_and_obstacles
+        self.events.reset_obstacles.params = _HOSPITAL_NAV_RESET_PARAMS
+
+        # Phase 4: dynamic obstacles for non-wall slots (slots 0-12 only).
+        self.events.hospital_dynamic_motion = EventTerm(
+            func=mdp.move_dynamic_play_obstacles,
+            mode="interval",
+            interval_range_s=(0.0, 0.0),
+            params={
+                "obstacle_names": list(OBSTACLE_NAMES[:13]),
+                "obstacle_indices": list(range(13)),
+                "obstacle_z": OBSTACLE_Z,
+                "longitudinal_speed_range": _hospital_specs.HOSPITAL_DYNAMIC_SPEED_RANGE,
+                "lateral_speed_max": 0.15,
+                "longitudinal_extent": _hospital_specs.HOSPITAL_DYNAMIC_LONGITUDINAL_EXTENT,
+                "lateral_extent": _hospital_specs.HOSPITAL_DYNAMIC_LATERAL_EXTENT,
+                "min_inter_obstacle_dist": 0.7,
+                "velocity_resample_interval_range": _hospital_specs.HOSPITAL_DYNAMIC_RESAMPLE_INTERVAL,
+                "random_trajectory_fraction": 0.2,
+                "goal_exclusion_radius": NAV_GOAL_EXCLUSION_RADIUS,
+                "start_iteration": _hospital_specs.HOSPITAL_DYNAMIC_START_ITERATION,
+                "warmup_iterations": _hospital_specs.HOSPITAL_DYNAMIC_WARMUP_ITERATIONS,
+                "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
+                "allowed_scenario_names": _hospital_specs.HOSPITAL_DYNAMIC_CORRIDOR_SCENARIOS,
+                "corridor_widths": _hospital_specs.HOSPITAL_CORRIDOR_WIDTHS,
+                "corridor_max_obstacle_widths": _hospital_specs.HOSPITAL_DYNAMIC_MAX_OBSTACLE_WIDTHS,
+                "obstacle_widths": _hospital_specs.HOSPITAL_TRAIN_OBSTACLE_WIDTHS[:13],
+                "corridor_lateral_margin": _hospital_specs.HOSPITAL_DYNAMIC_CORRIDOR_LATERAL_MARGIN,
+            },
+        )
+
+        self.terminations.goal_reached = None
+
+
+@configclass
+class Go2wNavHospitalTeacherEnvCfg_PLAY(Go2wNavHospitalTeacherEnvCfg):
+    """Play/eval env for the hospital curriculum nav teacher."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 16
+        self.scene.env_spacing = 25.0
+        self.events.push_robot = None
+        self.events.add_base_mass = None
+        self.events.hospital_dynamic_motion = None
+        self.observations.policy.enable_corruption = False
+        self.commands.base_velocity.debug_vis = True
