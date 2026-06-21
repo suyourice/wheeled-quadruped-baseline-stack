@@ -47,6 +47,7 @@ docker/artifacts/
 # Doc Outputs
 **/docs/_build/*
 **/generated/*
+!deploy/sim2sim/mujoco/generated/.gitkeep
 
 # Isaac-Sim packman
 _isaac_sim*
@@ -74,3 +75,51 @@ tests/
 # TacSL sensor
 **/tactile_record/*
 **/gelsight_r15_data/*
+
+# Go2W deploy artifacts
+# Keep deploy source code, but ignore large/runtime/generated files.
+
+# Uploaded or temporary archive files
+/*.zip
+
+# Policy checkpoints and exported models
+deploy/checkpoints/*
+!deploy/checkpoints/.gitkeep
+deploy/**/*.pt
+deploy/**/*.pth
+deploy/**/*.onnx
+deploy/**/*.jit
+deploy/**/*.traced
+
+# ROS2 bags and recorded robot data
+deploy/bag/
+deploy/bags/
+deploy/rosbags/
+deploy/recordings/
+deploy/go2w_bag_*/
+**/go2w_bag_*/
+**/*.db3
+**/*.mcap
+
+# Go2W interface dumps and runtime logs
+deploy/go2w_interface_dump_*/
+**/go2w_interface_dump_*/
+deploy/**/*_dump_*/
+deploy/**/*.csv
+deploy/**/*.jsonl
+
+# ROS2 workspace build artifacts inside deploy
+deploy/**/ros2_ws/build/
+deploy/**/ros2_ws/install/
+deploy/**/ros2_ws/log/
+deploy/**/ros2_ws/.colcon/
+
+# MuJoCo runtime artifacts
+deploy/**/mujoco_logs/
+deploy/**/mujoco_videos/
+deploy/**/*.mp4
+deploy/**/*.avi
+
+# Local environment files
+deploy/**/.env
+deploy/**/.env.local
