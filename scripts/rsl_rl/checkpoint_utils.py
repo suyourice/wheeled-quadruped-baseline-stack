@@ -71,6 +71,8 @@ def load_teacher_locomotion_checkpoint(teacher, ckpt_path: str, device: str) -> 
 
 def configure_frozen_llc_action(env_cfg, ckpt_path: str | None, task_name: str = "") -> bool:
     """Inject the fast-flat LLC checkpoint into HLC action configs before env creation."""
+    import os
+
     actions_cfg = getattr(env_cfg, "actions", None)
     llc_cmd_cfg = getattr(actions_cfg, "llc_cmd", None)
     if llc_cmd_cfg is None:
@@ -79,6 +81,11 @@ def configure_frozen_llc_action(env_cfg, ckpt_path: str | None, task_name: str =
         raise ValueError(
             f"Task '{task_name}' uses FrozenLLCActionTerm and requires --locomotion_checkpoint "
             "before gym.make() so the frozen fast-flat LLC can be loaded."
+        )
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(
+            f"Task '{task_name}' uses FrozenLLCActionTerm, but --locomotion_checkpoint does not exist: "
+            f"{ckpt_path}"
         )
     llc_cmd_cfg.llc_checkpoint_path = ckpt_path
     print(f"[INFO] Frozen LLC checkpoint injected into action term: {ckpt_path}")
