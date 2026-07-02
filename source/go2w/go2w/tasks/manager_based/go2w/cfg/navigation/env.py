@@ -31,6 +31,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCameraCfg, MultiMeshRayCasterCfg
 from isaaclab.sensors.ray_caster import patterns
+from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.utils import configclass
 
 from ... import mdp
@@ -41,12 +42,14 @@ from ...mdp.navigation.hospital.floor import (
     make_hospital_ramp_cfg as _make_hospital_ramp_cfg,
     make_hospital_ramp_b_cfg as _make_hospital_ramp_b_cfg,
 )
+from ...mdp.navigation.hospital.terrain import HospitalMazeSubTerrainCfg
 from ..locomotion.env import EventCfg, Go2wEnvCfg, Go2wSceneCfg
-from .rewards import NavTeacherRewardsCfg
+from .rewards import NavHospitalTeacherRewardsCfg, NavTeacherRewardsCfg
 from .observations import (
     NavDepthRLDistillObsCfg,
     NavDepthRLDistillLongHistObsCfg,
     NavDepthRLDistillMultiCamObsCfg,
+    NavHospitalTeacherObsCfg,
     NavRLDistillObsCfg,
     NavTeacherObsCfg,
 )
@@ -187,6 +190,76 @@ class ObstacleSceneCfg(Go2wSceneCfg):
 
 
 @configclass
+class HospitalTeacherSceneCfg(Go2wSceneCfg):
+    """5x5 junction-grid maze scene for hospital teacher training.
+
+    Each tile (48x48m) contains a dense corridor network with 25 junctions.
+    difficulty_range=(0,1) causes each tile to get a random corridor width
+    between 2.8m and 3.4m, baked into the static mesh at scene creation.
+    """
+
+    replicate_physics: bool = False
+
+    terrain: TerrainImporterCfg = TerrainImporterCfg(
+        prim_path="/World/terrain",
+        terrain_type="generator",
+        terrain_generator=TerrainGeneratorCfg(
+            num_rows=64,
+            num_cols=128,
+            size=(48.0, 48.0),
+            curriculum=False,
+            difficulty_range=(0.0, 1.0),
+            sub_terrains={"maze": HospitalMazeSubTerrainCfg()},
+            use_cache=True,
+        ),
+        use_terrain_origins=True,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=0.9,
+            dynamic_friction=0.8,
+            restitution=0.0,
+        ),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.58, 0.60, 0.64)),
+    )
+
+    for i, (shape_kind, footprint_size) in enumerate(HOSPITAL_TRAIN_OBSTACLE_SPECS):
+        label = HOSPITAL_TRAIN_OBSTACLE_LABELS[i]
+        vars()[f"obstacle_{i}"] = _make_obstacle_cfg(
+            f"obstacle_{i}",
+            i,
+            shape_kind,
+            footprint_size,
+            HOSPITAL_TRAIN_OBSTACLE_HEIGHTS[i],
+            HOSPITAL_LABEL_COLORS.get(label, HOSPITAL_DEFAULT_COLOR),
+        )
+    del i, shape_kind, footprint_size, label
+
+    # Wall and actor geometry are sensed with a compact 3-channel 360 ray scan.
+    # The ground plane is intentionally not a target so downward rays encode
+    # walls/actors instead of floor hits.
+    lidar = MultiMeshRayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base",
+        offset=MultiMeshRayCasterCfg.OffsetCfg(pos=HOSPITAL_RAYCAST_SENSOR_OFFSET),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.LidarPatternCfg(
+            channels=HOSPITAL_RAYCAST_CHANNELS,
+            vertical_fov_range=HOSPITAL_RAYCAST_VERTICAL_FOV,
+            horizontal_fov_range=HOSPITAL_RAYCAST_HORIZONTAL_FOV,
+            horizontal_res=HOSPITAL_RAYCAST_HORIZONTAL_RES,
+        ),
+        max_distance=HOSPITAL_RAYCAST_MAX_DISTANCE,
+        mesh_prim_paths=[
+            "/World/terrain",
+            MultiMeshRayCasterCfg.RaycastTargetCfg(
+                prim_expr="{ENV_REGEX_NS}/obstacle_.*",
+                track_mesh_transforms=True,
+                is_shared=True,
+            ),
+        ],
+        debug_vis=False,
+    )
+
+
+@configclass
 class ObstaclePlaySceneCfg(ObstacleSceneCfg):
     """Play scene with configurable obstacle capacity for visual testing."""
 
@@ -244,6 +317,25 @@ class DepthObstaclePlaySceneCfg(ObstaclePlaySceneCfg):
     """Play scene with extra obstacle slots plus a head-mounted depth camera."""
 
     depth_camera = _make_depth_camera_cfg()
+
+
+@configclass
+class ObstaclePlayTerrainWallSceneCfg(ObstaclePlaySceneCfg):
+    """Play scene with all 64 actor slots + TerrainImporter corridor walls.
+
+    ``terrain`` is set by ``_apply_mesh_wall_overrides`` in ``__post_init__``
+    to a ``TerrainImporterCfg`` with a single-corridor sub-terrain, giving
+    proper physics collision without per-env USD replication.
+    """
+
+    terrain: TerrainImporterCfg | None = None
+
+
+@configclass
+class DepthObstaclePlayTerrainWallSceneCfg(DepthObstaclePlaySceneCfg):
+    """Depth-student play scene with all 64 actor slots + TerrainImporter corridor walls."""
+
+    terrain: TerrainImporterCfg | None = None
 
 
 # =============================================================================
@@ -417,7 +509,8 @@ class Go2wNavTeacherEnvCfg(Go2wEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.scene.lidar.update_period = self.decimation * self.sim.dt
+        if self.scene.lidar is not None:
+            self.scene.lidar.update_period = self.decimation * self.sim.dt
 
         # Navigation task: goals are set by the reset event, not velocity commands.
         self.events.speed_curriculum = None
@@ -449,6 +542,51 @@ class Go2wNavTeacherEnvCfg(Go2wEnvCfg):
         # Episode never terminates on goal reached — goal_reached_and_resample
         # resamples the target in-place so navigation continues uninterrupted.
         self.terminations.goal_reached = None
+
+
+@configclass
+class Go2wHospitalTeacherEnvCfg(Go2wNavTeacherEnvCfg):
+    """Scratch PPO teacher trained in static hospital-style corridor mazes."""
+
+    scene: HospitalTeacherSceneCfg = HospitalTeacherSceneCfg(num_envs=8192, env_spacing=48.0)
+    observations: NavHospitalTeacherObsCfg = NavHospitalTeacherObsCfg()
+    rewards: NavHospitalTeacherRewardsCfg = NavHospitalTeacherRewardsCfg()
+    events: ObstacleEventCfg = ObstacleEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = 60.0
+        if self.scene.lidar is not None:
+            self.scene.lidar.update_period = self.decimation * self.sim.dt
+
+        # Keep the static-corridor MVP homogeneous and compatible with the
+        # replicated-physics clone path used for high env counts.
+        self.events.physics_material = None
+        self.events.add_base_mass = None
+        self.events.push_robot = None
+
+        self.events.reset_obstacles.func = mdp.reset_hospital_maze_training
+        self.events.reset_obstacles.params = {
+            "obstacle_names": HOSPITAL_TRAIN_OBSTACLE_NAMES,
+            "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
+            "waypoint_reach_radius": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
+            "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
+            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+            "curriculum_iteration_offset": 0,
+        }
+        self.events.navigation_path_update = EventTerm(
+            func=mdp.update_navigation_path_waypoint_event,
+            mode="interval",
+            interval_range_s=(0.0, 0.0),
+            params={
+                "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
+                "waypoint_reach_radius": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
+                "adaptive_lookahead": True,
+                "lookahead_min": 0.55,
+                "curvature_scan_horizon": 2.5,
+                "curvature_threshold": 0.3,
+            },
+        )
 
 
 @configclass
@@ -593,6 +731,13 @@ class DepthObstacleMultiCamPlaySceneCfg(ObstaclePlaySceneCfg):
     depth_camera_left  = _make_depth_camera_cfg(D456_CAMERA_LEFT_QUAT_WXYZ)
     depth_camera_right = _make_depth_camera_cfg(D456_CAMERA_RIGHT_QUAT_WXYZ)
     depth_camera_rear  = _make_depth_camera_cfg(D456_CAMERA_REAR_QUAT_WXYZ)
+
+
+@configclass
+class DepthObstacleMultiCamPlayTerrainWallSceneCfg(DepthObstacleMultiCamPlaySceneCfg):
+    """4-camera play scene with all 64 actor slots + TerrainImporter corridor walls."""
+
+    terrain: TerrainImporterCfg | None = None
 
 
 # =============================================================================

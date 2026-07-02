@@ -89,6 +89,78 @@ class NavTeacherObsCfg:
 
 
 @configclass
+class NavHospitalTeacherObsCfg:
+    """Scratch hospital teacher observations (~393D).
+
+    proprio/goal(9D) + 3-channel 360 ray scan(216D) + actor nav(16D)
+    + actor geometry(8x16D=128D) + path(10D) + corridor terrain(8D)
+    + prev actions(6D) = 393D.
+    """
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        base_lin_vel      = ObsTerm(func=mdp.base_lin_vel,      noise=Unoise(n_min=-0.1,  n_max=0.1))
+        projected_gravity = ObsTerm(func=mdp.projected_gravity,  noise=Unoise(n_min=-0.05, n_max=0.05))
+
+        goal_command = ObsTerm(
+            func=mdp.local_goal_command_b,
+            params={
+                "lookahead_distance": NAV_WAYPOINT_LOOKAHEAD_DISTANCE,
+                "goal_snap_distance": NAV_WAYPOINT_GOAL_SNAP_DISTANCE,
+                "command_min_forward": NAV_WAYPOINT_COMMAND_MIN_FORWARD,
+                "command_max_lateral": NAV_WAYPOINT_COMMAND_MAX_LATERAL,
+                "command_max_heading": NAV_WAYPOINT_COMMAND_MAX_HEADING,
+            },
+        )
+
+        obstacle_depth = ObsTerm(
+            func=mdp.lidar_distances,
+            params={"sensor_cfg": SceneEntityCfg("lidar"), "max_distance": HOSPITAL_RAYCAST_MAX_DISTANCE},
+        )
+
+        obstacle_nav_features = ObsTerm(
+            func=mdp.obstacle_navigation_features,
+            params={
+                "obstacle_names": HOSPITAL_TRAIN_OBSTACLE_NAMES,
+                "robot_cfg": SceneEntityCfg("robot"),
+                "command_name": "base_velocity",
+                "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
+                "reference_slot_count": HOSPITAL_TRAIN_PHYSICAL_OBSTACLE_SLOTS,
+            },
+        )
+
+        obstacle_full_geometry = ObsTerm(
+            func=mdp.obstacle_full_geometry_features,
+            params={
+                "obstacle_names": HOSPITAL_TRAIN_OBSTACLE_NAMES,
+                "robot_cfg": SceneEntityCfg("robot"),
+                "num_slots": HOSPITAL_TRAIN_PRIVILEGED_NEAREST_SLOTS,
+                "max_distance": 8.0,
+                "max_footprint_size": 3.5,
+                "max_area": 4.0,
+                "max_radius": 2.0,
+                "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
+            },
+        )
+
+        hospital_path = ObsTerm(func=mdp.hospital_path_features)
+        hospital_corridor = ObsTerm(
+            func=mdp.hospital_corridor_features,
+            params={"robot_cfg": SceneEntityCfg("robot")},
+        )
+        prev_actions = ObsTerm(
+            func=mdp.prev_hlc_actions,
+            params={"num_frames": 2, "action_term_name": "llc_cmd"},
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
 class NavRLDistillObsCfg:
     """Distillation observations: student (LiDAR) and teacher (privileged).
 
