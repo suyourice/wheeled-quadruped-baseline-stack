@@ -152,6 +152,26 @@ gym.register(
 )
 
 gym.register(
+    id="Nav-Hospital-Teacher-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wHospitalTeacherEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Nav-Hospital-Teacher-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+gym.register(
     id="Navigation-Depth-Distill-Hospital-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -178,6 +198,41 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorDepthPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
+    },
+)
+
+# =============================================================================
+# Hospital Teacher obs (369D) play environments
+# Structured corridor layouts evaluated with the hospital maze teacher checkpoint.
+# =============================================================================
+
+gym.register(
+    id="Nav-Hospital-Teacher-LCorridor-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherLCorridorPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Nav-Hospital-Teacher-Ward-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherWardPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Nav-Hospital-Teacher-Floor-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherFloorPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
     },
 )
 
@@ -241,6 +296,40 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wNavDepthMultiCamRLDistillEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthMultiCamRLDistillRunnerCfg",
+    },
+)
+
+# =============================================================================
+# Depth student ablation hospital floor play environments
+# =============================================================================
+
+gym.register(
+    id="Navigation-Depth-Distill-Hospital-Floor-LongHist-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorLongHistDepthPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthLongHistRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-Hospital-Floor-Sparse-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorSparseDepthPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthSparseRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Distill-Hospital-Floor-4Cam-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorMultiCamDepthPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthMultiCamRLDistillRunnerCfg",
     },
 )
