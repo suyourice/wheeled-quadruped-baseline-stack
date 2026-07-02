@@ -67,8 +67,8 @@ class NavTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
 class NavHospitalTeacherRunnerCfg(NavTeacherRunnerCfg):
     """Scratch PPO runner for the static hospital-corridor teacher."""
 
-    num_steps_per_env = 128
-    max_iterations = 2000
+    num_steps_per_env = 96
+    max_iterations = 1500
     save_interval = 100
     experiment_name = "go2w_nav_hospital_teacher_rl"
     logger = "wandb"

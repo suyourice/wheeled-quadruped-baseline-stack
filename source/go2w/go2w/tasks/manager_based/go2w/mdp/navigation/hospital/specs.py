@@ -283,10 +283,10 @@ HOSPITAL_TRAIN_MAX_ROUTE_LENGTH = 60.0
 HOSPITAL_TRAIN_OBSTACLE_DENSITY_SCHEDULE = (
     # (start_iteration, target_spacing_m, max_active_obstacles)
     (0,    0.0,  0),
-    (150,  8.0,  5),
-    (400,  5.0,  9),
-    (800,  3.0, 12),
-    (1300, 2.0, 16),
+    (100,  8.0,  5),
+    (280,  5.0,  9),
+    (560,  3.0, 12),
+    (900,  2.0, 12),
 )
 HOSPITAL_TRAIN_LEG_LENGTH = 9.0
 HOSPITAL_TRAIN_TURN_LENGTH = 4.5
