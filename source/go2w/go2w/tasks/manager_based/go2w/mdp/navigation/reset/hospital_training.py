@@ -166,17 +166,30 @@ def _points_from_corridor_samples(
     s: torch.Tensor,
     lateral: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map batched arc-length/lateral samples to local corridor points and tangents."""
-    max_s = (segment_end_s[-1] - 1.0e-6).clamp(min=0.0)
+    """Map batched arc-length/lateral samples to local corridor points and tangents.
+
+    Accepts per-env segment data: segment_* are (n, S, *) with padding, s/lateral are (n,).
+    """
+    n = s.shape[0]
+    device = s.device
+    # segment_end_s: (n, S); last column holds total path length per env
+    max_s = (segment_end_s[:, -1] - 1.0e-6).clamp(min=0.0)  # (n,)
     s = torch.minimum(s.clamp(min=0.0), max_s)
-    seg_idx = torch.searchsorted(segment_end_s, s.contiguous(), right=False)
-    seg_idx = seg_idx.clamp(max=segment_lengths.shape[0] - 1)
-    seg_start_s = segment_end_s[seg_idx] - segment_lengths[seg_idx]
-    t = ((s - seg_start_s) / segment_lengths[seg_idx].clamp(min=1.0e-6)).clamp(0.0, 1.0)
-    a = segment_starts[seg_idx]
-    b = segment_ends[seg_idx]
-    seg = b - a
-    seg_len = segment_lengths[seg_idx].clamp(min=1.0e-6)
+
+    # Batched searchsorted: input (n, S), query (n, 1) → result (n, 1)
+    seg_idx = torch.searchsorted(
+        segment_end_s.contiguous(), s.unsqueeze(1).contiguous(), right=False
+    ).squeeze(1)  # (n,)
+    seg_idx = seg_idx.clamp(max=segment_lengths.shape[1] - 1)
+
+    row = torch.arange(n, device=device)
+    seg_len_sel = segment_lengths[row, seg_idx]                     # (n,)
+    seg_start_s = segment_end_s[row, seg_idx] - seg_len_sel         # (n,)
+    t = ((s - seg_start_s) / seg_len_sel.clamp(min=1.0e-6)).clamp(0.0, 1.0)
+    a = segment_starts[row, seg_idx]                                 # (n, 2)
+    b = segment_ends[row, seg_idx]                                   # (n, 2)
+    seg = b - a                                                      # (n, 2)
+    seg_len = seg_len_sel.clamp(min=1.0e-6)
     center = a + t.unsqueeze(-1) * seg
     ux = seg[:, 0] / seg_len
     uy = seg[:, 1] / seg_len
@@ -189,8 +202,8 @@ def _has_passable_lateral_gap(
     half_width: float,
     candidate_s: torch.Tensor,
     candidate_lateral: torch.Tensor,
-    candidate_cross_half_width: float,
-    candidate_forward_half_length: float,
+    candidate_cross_half_width: torch.Tensor,
+    candidate_forward_half_length: torch.Tensor,
     placed_s: torch.Tensor,
     placed_lateral: torch.Tensor,
     placed_active: torch.Tensor,
@@ -198,7 +211,11 @@ def _has_passable_lateral_gap(
     placed_forward_half_lengths: torch.Tensor,
     actor_idx: int,
 ) -> torch.Tensor:
-    """Return True when any lateral interval remains passable at the candidate station."""
+    """Return True when any lateral interval remains passable at the candidate station.
+
+    candidate_cross_half_width / candidate_forward_half_length: (n,) per-env tensors.
+    placed_cross_half_widths / placed_forward_half_lengths: (n, actor_idx) per-env tensors.
+    """
     n = candidate_s.shape[0]
     device = candidate_s.device
     dtype = candidate_s.dtype
@@ -213,14 +230,14 @@ def _has_passable_lateral_gap(
     ends[:, 0] = candidate_lateral + candidate_cross_half_width + HOSPITAL_TRAIN_ACTOR_LATERAL_MARGIN
 
     if actor_idx > 0:
-        prev_s = placed_s[:, :actor_idx]
-        prev_lateral = placed_lateral[:, :actor_idx]
-        prev_active = placed_active[:, :actor_idx]
-        prev_cross = placed_cross_half_widths[:actor_idx].to(device=device, dtype=dtype).unsqueeze(0)
-        prev_forward = placed_forward_half_lengths[:actor_idx].to(device=device, dtype=dtype).unsqueeze(0)
+        prev_s = placed_s[:, :actor_idx]                              # (n, actor_idx)
+        prev_lateral = placed_lateral[:, :actor_idx]                  # (n, actor_idx)
+        prev_active = placed_active[:, :actor_idx]                    # (n, actor_idx)
+        prev_cross = placed_cross_half_widths[:, :actor_idx]          # (n, actor_idx)
+        prev_forward = placed_forward_half_lengths[:, :actor_idx]     # (n, actor_idx)
         overlap = (
             (candidate_s.unsqueeze(1) - prev_s).abs()
-            <= candidate_forward_half_length + prev_forward + HOSPITAL_TRAIN_ACTOR_LONGITUDINAL_MARGIN
+            <= candidate_forward_half_length.unsqueeze(1) + prev_forward + HOSPITAL_TRAIN_ACTOR_LONGITUDINAL_MARGIN
         ) & prev_active
         prev_starts = prev_lateral - prev_cross - HOSPITAL_TRAIN_ACTOR_LATERAL_MARGIN
         prev_ends = prev_lateral + prev_cross + HOSPITAL_TRAIN_ACTOR_LATERAL_MARGIN
@@ -247,8 +264,8 @@ def _sample_corridor_points_batch(
     segment_lengths: torch.Tensor,
     segment_end_s: torch.Tensor,
     half_width: float,
-    slot_cross_half_width: float,
-    slot_forward_half_length: float,
+    slot_cross_half_width: torch.Tensor,
+    slot_forward_half_length: torch.Tensor,
     start_xy: torch.Tensor,
     goal_xy: torch.Tensor,
     placed_xy: torch.Tensor,
@@ -258,33 +275,45 @@ def _sample_corridor_points_batch(
     placed_cross_half_widths: torch.Tensor,
     placed_forward_half_lengths: torch.Tensor,
     actor_idx: int,
-    actor_count: int,
+    actor_counts: torch.Tensor,
     attempts: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample one actor slot for a full layout group without per-env Python loops."""
+    """Sample one actor slot for all resetting envs in a single batched GPU call.
+
+    All segment_* tensors are (n, S, *) with padding for differing path lengths.
+    slot_cross_half_width / slot_forward_half_length are (n,) per-env tensors because
+    each env uses a different slot permutation.
+    start_xy / goal_xy are (n, 2).
+    actor_counts is (n,) — per-env total actor count for bucket sizing.
+    """
     n = placed_xy.shape[0]
     device = placed_xy.device
     dtype = placed_xy.dtype
-    total_length = segment_end_s[-1].clamp(min=1.0e-6)
-    lateral_limit = max(0.05, half_width - slot_cross_half_width - 0.12)
+
+    # Per-env total path length from the last (non-padded) segment cumsum value.
+    total_length = segment_end_s[:, -1].clamp(min=1.0e-6)                 # (n,)
+    lateral_limit = (half_width - slot_cross_half_width - 0.12).clamp(min=0.05)  # (n,)
+
     result = torch.zeros(n, 2, dtype=dtype, device=device)
     result_yaw = torch.zeros(n, dtype=dtype, device=device)
     result_s = torch.zeros(n, dtype=dtype, device=device)
     result_lateral = torch.zeros(n, dtype=dtype, device=device)
     unresolved = torch.ones(n, dtype=torch.bool, device=device)
-    start_cap = torch.tensor(HOSPITAL_TRAIN_START_EXCLUSION_RADIUS + 0.2, dtype=dtype, device=device)
-    goal_margin = torch.tensor(HOSPITAL_TRAIN_GOAL_EXCLUSION_RADIUS + 0.2, dtype=dtype, device=device)
-    usable_start = torch.minimum(total_length * 0.45, start_cap)
+
+    start_cap = HOSPITAL_TRAIN_START_EXCLUSION_RADIUS + 0.2
+    goal_margin = HOSPITAL_TRAIN_GOAL_EXCLUSION_RADIUS + 0.2
+    usable_start = torch.minimum(total_length * 0.45, total_length.new_full((n,), start_cap))
     usable_end = torch.maximum(usable_start + 1.0e-3, total_length - goal_margin)
     span = (usable_end - usable_start).clamp(min=1.0e-3)
-    bucket = span / max(actor_count, 1)
-    bucket_center = usable_start + bucket * (actor_idx + 0.5)
+    bucket = span / actor_counts.to(dtype=dtype).clamp(min=1.0)           # (n,)
+    bucket_center = usable_start + bucket * (actor_idx + 0.5)             # (n,)
+
+    center_span = torch.minimum(lateral_limit, lateral_limit.new_full((n,), HOSPITAL_TRAIN_CENTER_BLOCK_LATERAL_RANGE))
 
     for _ in range(attempts):
         s = bucket_center + (torch.rand(n, dtype=dtype, device=device) - 0.5) * bucket * 0.85
-        s = s.clamp(min=usable_start, max=usable_end)
+        s = torch.maximum(torch.minimum(s, usable_end), usable_start)
         lateral = (torch.rand(n, dtype=dtype, device=device) * 2.0 - 1.0) * lateral_limit
-        center_span = min(lateral_limit, HOSPITAL_TRAIN_CENTER_BLOCK_LATERAL_RANGE)
         center_lateral = (torch.rand(n, dtype=dtype, device=device) * 2.0 - 1.0) * center_span
         center_mask = torch.rand(n, dtype=dtype, device=device) < HOSPITAL_TRAIN_CENTER_BLOCK_PROBABILITY
         lateral = torch.where(center_mask, center_lateral, lateral)
@@ -308,7 +337,7 @@ def _sample_corridor_points_batch(
         )
         if actor_idx > 0:
             sep = (candidate.unsqueeze(1) - placed_xy[:, :actor_idx]).norm(dim=-1)
-            sep = torch.where(placed_active[:, :actor_idx], sep, torch.full_like(sep, 1.0e6))
+            sep = torch.where(placed_active[:, :actor_idx], sep, sep.new_full(sep.shape, 1.0e6))
             min_sep = sep.min(dim=1).values
             valid &= min_sep >= HOSPITAL_TRAIN_MIN_INTER_ACTOR_DIST
         take = unresolved & valid
@@ -318,15 +347,10 @@ def _sample_corridor_points_batch(
         result_lateral = torch.where(take, lateral, result_lateral)
         unresolved &= ~take
 
-    fraction = (actor_idx + 0.5) / max(actor_count, 1)
-    fallback_s = torch.ones(n, dtype=dtype, device=device) * (
-        usable_start + (usable_end - usable_start) * fraction
-    )
-    fallback_lateral = torch.full(
-        (n,),
-        (1.0 if actor_idx % 2 == 0 else -1.0) * min(lateral_limit * 0.40, 0.30),
-        dtype=dtype,
-        device=device,
+    fraction = (actor_idx + 0.5) / actor_counts.to(dtype=dtype).clamp(min=1.0)
+    fallback_s = usable_start + (usable_end - usable_start) * fraction
+    fallback_lateral = (1.0 if actor_idx % 2 == 0 else -1.0) * torch.minimum(
+        lateral_limit * 0.40, lateral_limit.new_full((n,), 0.30)
     )
     fallback, fallback_yaw = _points_from_corridor_samples(
         segment_starts, segment_ends, segment_lengths, segment_end_s, fallback_s, fallback_lateral
@@ -420,9 +444,6 @@ def reset_hospital_maze_training(
     n = len(env_ids)
     k = len(obstacle_names)
     robot = env.scene["robot"]
-    # terrain.terrain_origins is the (num_rows, num_cols, 3) grid of tile centres.
-    # Flattening gives a 1-to-1 env_id → tile mapping, unlike scene.env_origins
-    # which uses curriculum-style random assignment (multiple envs → same tile).
     env_origins = env.scene.terrain.terrain_origins.reshape(-1, 3)[env_ids]
     current_root_pos = robot.data.root_pos_w[env_ids, :3].clone()
     current_heading = robot.data.heading_w[env_ids].clone()
@@ -432,8 +453,6 @@ def reset_hospital_maze_training(
     )
     target_spacing, actor_count_cap, phase_id = _phase_settings(curriculum_step, steps_per_iteration)
 
-    # layout_id encodes (start_junction_idx * NUM_J + end_junction_idx).
-    # BFS on the junction graph gives the shortest corridor route for any pair.
     _NUM_J = len(MAZE_JUNCTION_NAMES)
     _MIN_PATH_STEPS = HOSPITAL_TRAIN_MIN_PATH_STEPS
     _j_xs = [MAZE_JUNCTIONS[name][0] for name in MAZE_JUNCTION_NAMES]
@@ -486,25 +505,26 @@ def reset_hospital_maze_training(
     env._go2w_hospital_phase_id[env_ids] = phase_indices
     env._go2w_hospital_path_reversed[env_ids] = reversed_flags
 
-    actor_cross_half_widths = [
-        HOSPITAL_TRAIN_OBSTACLE_DEPTHS[idx] * 0.5
-        for idx in range(HOSPITAL_TRAIN_ACTOR_SLOTS)
-    ]
-    actor_forward_half_lengths = [
-        HOSPITAL_TRAIN_OBSTACLE_WIDTHS[idx] * 0.5
-        for idx in range(HOSPITAL_TRAIN_ACTOR_SLOTS)
-    ]
+    dtype = current_root_pos.dtype
     actor_cross_half_widths_t = torch.tensor(
-        actor_cross_half_widths, dtype=current_root_pos.dtype, device=device
+        [HOSPITAL_TRAIN_OBSTACLE_DEPTHS[i] * 0.5 for i in range(HOSPITAL_TRAIN_ACTOR_SLOTS)],
+        dtype=dtype, device=device,
     )
     actor_forward_half_lengths_t = torch.tensor(
-        actor_forward_half_lengths, dtype=current_root_pos.dtype, device=device
+        [HOSPITAL_TRAIN_OBSTACLE_WIDTHS[i] * 0.5 for i in range(HOSPITAL_TRAIN_ACTOR_SLOTS)],
+        dtype=dtype, device=device,
     )
+    center_zs_t = torch.tensor(HOSPITAL_TRAIN_OBSTACLE_CENTER_ZS, dtype=dtype, device=device)
 
+    # -----------------------------------------------------------------------
+    # Phase 1: Python loop — collect per-env path specs (no GPU actor placement)
+    # -----------------------------------------------------------------------
+    layout_specs: list[dict] = []
+    layout_actor_counts: list[int] = []
+    slot_perms: list[torch.Tensor] = []
+    origin_xys: list[torch.Tensor] = []
     _vis_new: list[tuple[int, torch.Tensor]] = []
 
-    # Each env independently gets a BFS-shortest corridor path between its sampled
-    # junction pair. Per-env loop avoids batching assumptions when paths differ.
     for _li in range(n):
         env_id_single = env_ids[_li:_li + 1]
         local_phase = int(phase_indices[_li].item())
@@ -525,15 +545,14 @@ def reset_hospital_maze_training(
         if env_target_spacing > 1.0e-6:
             layout_actor_count = min(env_actor_count_cap, max(0, int(total_length / env_target_spacing)), k)
 
-        fixed_path_local = layout_spec["fixed_path_local"].to(device=device, dtype=current_root_pos.dtype)
+        fixed_path_local = layout_spec["fixed_path_local"].to(device=device, dtype=dtype)
         if reversed_flags[_li]:
             fixed_path_local = torch.flip(fixed_path_local, dims=(0,))
 
-        # env_origins already point to the maze tile centers (via TerrainImporter).
-        origin_xy = env_origins[_li:_li + 1, :2]   # (1, 2)
+        origin_xy = env_origins[_li, :2]   # (2,)
         _N = fixed_path_local.shape[0]
-        path_w = torch.zeros(1, _N, 3, dtype=current_root_pos.dtype, device=device)
-        path_w[0, :, :2] = origin_xy[0] + fixed_path_local[:, :2]
+        path_w = torch.zeros(1, _N, 3, dtype=dtype, device=device)
+        path_w[0, :, :2] = origin_xy + fixed_path_local[:, :2]
         path_w[0, :, 2] = current_root_pos[_li, 2]
 
         if reset_robot_pose:
@@ -550,60 +569,127 @@ def reset_hospital_maze_training(
         env._go2w_navigation_path_direct_goal = True
         set_navigation_path_w(env, env_id_single, path_w)
 
-        centerline_tensor = layout_spec["centerline_tensor"].to(device=device, dtype=current_root_pos.dtype)
+        centerline_tensor = layout_spec["centerline_tensor"].to(device=device, dtype=dtype)
         centerline = layout_spec["centerline"]
-        env._go2w_structured_corridor_start_xy[env_id_single] = origin_xy
+        env._go2w_structured_corridor_start_xy[env_id_single] = origin_xy.unsqueeze(0)
         env._go2w_structured_corridor_yaw[env_id_single] = 0.0
         env._go2w_structured_corridor_width[env_id_single] = env_width
         env._go2w_structured_corridor_leg_length[env_id_single] = total_length
         env._go2w_structured_corridor_centerline_count[env_id_single] = len(centerline)
         env._go2w_structured_corridor_centerline_local[env_id_single] = centerline_tensor.unsqueeze(0)
-        env._go2w_hospital_actor_count[env_id_single] = float(layout_actor_count)
 
-        segments = layout_spec["segments"]
-        segment_tensor = torch.tensor(
-            [(a[0], a[1], b[0], b[1], length) for a, b, length in segments],
-            dtype=current_root_pos.dtype,
-            device=device,
-        )
-        segment_starts_t = segment_tensor[:, 0:2]
-        segment_ends_t = segment_tensor[:, 2:4]
-        segment_lengths_t = segment_tensor[:, 4].clamp(min=1.0e-6)
-        segment_end_s = torch.cumsum(segment_lengths_t, dim=0)
-        start_xy_t = fixed_path_local[0, :2]
-        goal_xy_t = fixed_path_local[-1, :2]
-        half_width = env_width * 0.5
+        layout_specs.append(layout_spec)
+        layout_actor_counts.append(layout_actor_count)
+        slot_perms.append(torch.randperm(k, device=device))
+        origin_xys.append(origin_xy)
 
-        actor_pos_local = torch.zeros(1, max(layout_actor_count, 1), 2, dtype=current_root_pos.dtype, device=device)
-        actor_s_local = torch.zeros(1, max(layout_actor_count, 1), dtype=current_root_pos.dtype, device=device)
-        actor_lat_local = torch.zeros_like(actor_s_local)
-        actor_active_local = torch.zeros(1, max(layout_actor_count, 1), dtype=torch.bool, device=device)
-        slot_perm = torch.randperm(k, device=device)
+    # -----------------------------------------------------------------------
+    # Phase 2: build padded batched segment tensors
+    # -----------------------------------------------------------------------
+    max_actor_count = max(layout_actor_counts) if layout_actor_counts else 0
 
-        for actor_idx in range(layout_actor_count):
-            slot_idx = int(slot_perm[actor_idx].item())
-            actor_xy, actor_yaw_val, actor_s, actor_lat, actor_valid = _sample_corridor_points_batch(
-                segment_starts_t, segment_ends_t, segment_lengths_t, segment_end_s,
+    if max_actor_count > 0:
+        max_seg = max(len(spec["segments"]) for spec in layout_specs)
+
+        seg_starts_list: list[torch.Tensor] = []
+        seg_ends_list: list[torch.Tensor] = []
+        seg_lengths_list: list[torch.Tensor] = []
+        seg_end_s_list: list[torch.Tensor] = []
+        start_xy_list: list[torch.Tensor] = []
+        goal_xy_list: list[torch.Tensor] = []
+
+        for _li, spec in enumerate(layout_specs):
+            segs = spec["segments"]
+            S = len(segs)
+            seg_t = torch.tensor(
+                [(a[0], a[1], b[0], b[1], length) for a, b, length in segs],
+                dtype=dtype, device=device,
+            )  # (S, 5)
+            lengths = seg_t[:, 4].clamp(min=1.0e-6)
+            end_s = torch.cumsum(lengths, dim=0)
+            total_len = end_s[-1].item()
+
+            pad = max_seg - S
+            seg_starts_list.append(torch.nn.functional.pad(seg_t[:, 0:2], (0, 0, 0, pad)))
+            seg_ends_list.append(torch.nn.functional.pad(seg_t[:, 2:4], (0, 0, 0, pad)))
+            # Pad lengths with a small non-zero value to avoid division by zero in lookup.
+            seg_lengths_list.append(torch.nn.functional.pad(lengths, (0, pad), value=1.0e-6))
+            # Pad end_s with total_length so searchsorted always resolves to the last real segment.
+            seg_end_s_list.append(torch.nn.functional.pad(end_s, (0, pad), value=total_len))
+
+            fixed_path = spec["fixed_path_local"]
+            if reversed_flags[_li]:
+                fixed_path = torch.flip(fixed_path, dims=(0,))
+            start_xy_list.append(fixed_path[0, :2].to(dtype=dtype, device=device))
+            goal_xy_list.append(fixed_path[-1, :2].to(dtype=dtype, device=device))
+
+        stacked_seg_starts = torch.stack(seg_starts_list)   # (n, max_seg, 2)
+        stacked_seg_ends = torch.stack(seg_ends_list)        # (n, max_seg, 2)
+        stacked_seg_lengths = torch.stack(seg_lengths_list)  # (n, max_seg)
+        stacked_seg_end_s = torch.stack(seg_end_s_list)      # (n, max_seg)
+        stacked_start_xy = torch.stack(start_xy_list)        # (n, 2)
+        stacked_goal_xy = torch.stack(goal_xy_list)          # (n, 2)
+        stacked_origin_xy = torch.stack(origin_xys)          # (n, 2)
+        slot_perms_t = torch.stack(slot_perms)               # (n, k)
+        layout_actor_counts_t = torch.tensor(layout_actor_counts, dtype=torch.long, device=device)
+
+        # -----------------------------------------------------------------------
+        # Phase 3: batched GPU actor placement — max_actor_count calls total
+        # -----------------------------------------------------------------------
+        half_width = HOSPITAL_TRAIN_CORRIDOR_WIDTH * 0.5
+
+        actor_pos_local = torch.zeros(n, max_actor_count, 2, dtype=dtype, device=device)
+        actor_s_local = torch.zeros(n, max_actor_count, dtype=dtype, device=device)
+        actor_lat_local = torch.zeros(n, max_actor_count, dtype=dtype, device=device)
+        actor_active_local = torch.zeros(n, max_actor_count, dtype=torch.bool, device=device)
+        # Track per-env placed slot dimensions for passable-gap checks.
+        placed_cross_hw = torch.zeros(n, max_actor_count, dtype=dtype, device=device)
+        placed_forward_hl = torch.zeros(n, max_actor_count, dtype=dtype, device=device)
+
+        row_idx = torch.arange(n, device=device)
+
+        for actor_idx in range(max_actor_count):
+            needs_actor = layout_actor_counts_t > actor_idx  # (n,) bool mask
+
+            # Per-env slot index for this actor position (from each env's permutation).
+            slot_idx_per_env = slot_perms_t[:, actor_idx]    # (n,)
+
+            # Per-env actor footprint dimensions.
+            cross_hw = actor_cross_half_widths_t[slot_idx_per_env]    # (n,)
+            forward_hl = actor_forward_half_lengths_t[slot_idx_per_env]  # (n,)
+
+            actor_xy, actor_yaw, actor_s, actor_lat, actor_valid = _sample_corridor_points_batch(
+                stacked_seg_starts, stacked_seg_ends, stacked_seg_lengths, stacked_seg_end_s,
                 half_width,
-                actor_cross_half_widths[slot_idx],
-                actor_forward_half_lengths[slot_idx],
-                start_xy_t, goal_xy_t,
+                cross_hw, forward_hl,
+                stacked_start_xy, stacked_goal_xy,
                 actor_pos_local, actor_s_local, actor_lat_local, actor_active_local,
-                actor_cross_half_widths_t[slot_perm[:layout_actor_count]],
-                actor_forward_half_lengths_t[slot_perm[:layout_actor_count]],
-                actor_idx, layout_actor_count,
+                placed_cross_hw, placed_forward_hl,
+                actor_idx, layout_actor_counts_t,
             )
-            actor_pos_local[0, actor_idx] = actor_xy[0]
-            actor_s_local[0, actor_idx] = actor_s[0]
-            actor_lat_local[0, actor_idx] = actor_lat[0]
-            actor_active_local[0, actor_idx] = actor_valid[0]
-            if actor_valid[0]:
-                positions[_li, slot_idx, :2] = origin_xy[0] + actor_xy[0]
-                positions[_li, slot_idx, 2] = HOSPITAL_TRAIN_OBSTACLE_CENTER_ZS[slot_idx]
-                obstacle_yaws[_li, slot_idx] = actor_yaw_val[0]
-                active_mask[_li, slot_idx] = True
 
-        env._go2w_hospital_actor_count[env_id_single] = float(active_mask[_li].sum().item())
+            # Mask out envs that don't need this actor slot.
+            actor_valid = actor_valid & needs_actor
+
+            actor_pos_local[:, actor_idx] = actor_xy
+            actor_s_local[:, actor_idx] = actor_s
+            actor_lat_local[:, actor_idx] = actor_lat
+            actor_active_local[:, actor_idx] = actor_valid
+            placed_cross_hw[:, actor_idx] = cross_hw
+            placed_forward_hl[:, actor_idx] = forward_hl
+
+            # Scatter valid placements into the world position / yaw buffers.
+            valid_rows = row_idx[actor_valid]
+            valid_slots = slot_idx_per_env[actor_valid]
+            if valid_rows.numel() > 0:
+                positions[valid_rows, valid_slots, :2] = stacked_origin_xy[valid_rows] + actor_xy[actor_valid]
+                positions[valid_rows, valid_slots, 2] = center_zs_t[valid_slots]
+                obstacle_yaws[valid_rows, valid_slots] = actor_yaw[actor_valid]
+                active_mask[valid_rows, valid_slots] = True
+
+        env._go2w_hospital_actor_count[env_ids] = active_mask.sum(dim=1).float()
+    else:
+        env._go2w_hospital_actor_count[env_ids] = 0.0
 
     if _vis_new:
         _update_maze_vis([eid for eid, _ in _vis_new], [p for _, p in _vis_new])
