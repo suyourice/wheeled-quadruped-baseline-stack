@@ -69,6 +69,15 @@ parser.add_argument(
     default=64,
     help="How often to print progress in --teacher_only_eval mode, measured in completed episodes.",
 )
+parser.add_argument(
+    "--hospital_curriculum_iteration_offset",
+    type=int,
+    default=0,
+    help=(
+        "Add this many PPO iterations to the hospital teacher curriculum phase calculation. "
+        "Use it when resuming a checkpoint in a fresh job so the reset curriculum matches the checkpoint age."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -243,6 +252,24 @@ def _load_locomotion_checkpoint(runner: OnPolicyRunner, ckpt_path: str, device: 
     print(f"[INFO] Loaded locomotion checkpoint from: {ckpt_path}")
 
 
+def _apply_hospital_curriculum_offset(env_cfg, iteration_offset: int) -> None:
+    """Inject a hospital teacher curriculum offset without changing the schedule itself."""
+    if iteration_offset < 0:
+        raise ValueError("--hospital_curriculum_iteration_offset must be non-negative.")
+    if iteration_offset == 0:
+        return
+
+    reset_obstacles = getattr(getattr(env_cfg, "events", None), "reset_obstacles", None)
+    params = getattr(reset_obstacles, "params", None)
+    if not isinstance(params, dict) or "curriculum_iteration_offset" not in params:
+        raise ValueError(
+            "--hospital_curriculum_iteration_offset is only supported for hospital teacher tasks "
+            "whose reset_obstacles params include 'curriculum_iteration_offset'."
+        )
+    params["curriculum_iteration_offset"] = int(iteration_offset)
+    print(f"[INFO] Hospital curriculum iteration offset: {iteration_offset}")
+
+
 
 def _build_teacher_for_eval(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
     """Instantiate the active distillation teacher for direct evaluation."""
@@ -353,6 +380,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    # Resize terrain generator grid so tiles match num_envs exactly (no unused tiles).
+    # Finds the largest r ≤ sqrt(n) that divides n; falls back to ceil for non-factorable n.
+    _scene_terrain = getattr(env_cfg.scene, "terrain", None)
+    if _scene_terrain is not None and getattr(_scene_terrain, "use_terrain_origins", False):
+        _tg = getattr(_scene_terrain, "terrain_generator", None)
+        if _tg is not None:
+            import math as _m
+            _n = env_cfg.scene.num_envs
+            _r = _m.isqrt(_n)
+            while _r > 1 and _n % _r != 0:
+                _r -= 1
+            _tg.num_rows = max(1, _r)
+            _tg.num_cols = max(1, _m.ceil(_n / _r))
+            del _m, _n, _r, _tg
+    del _scene_terrain
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
@@ -404,6 +446,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+    _apply_hospital_curriculum_offset(env_cfg, args_cli.hospital_curriculum_iteration_offset)
     uses_frozen_llc_action = configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint, args_cli.task)
 
     # create isaac environment
@@ -481,6 +524,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 runner.alg.load(ckpt, load_cfg=None, strict=True)
         else:
             runner.load(resume_path)
+
+        # For OnPolicyRunner: shrink the remaining-iterations budget so total == max_iterations,
+        # and sync common_step_counter so any curriculum resumes from the right phase.
+        resumed_iter = getattr(runner, "current_learning_iteration", 0)
+        if resumed_iter > 0:
+            remaining = agent_cfg.max_iterations - resumed_iter
+            if remaining <= 0:
+                print(
+                    f"[INFO] Checkpoint already at iteration {resumed_iter} "
+                    f">= max_iterations {agent_cfg.max_iterations}. Nothing to train."
+                )
+                env.close()
+                return
+            agent_cfg.max_iterations = remaining
+            print(f"[INFO] Resumed from iter {resumed_iter}: {remaining} iterations remaining (total={resumed_iter + remaining})")
+
+            if args_cli.hospital_curriculum_iteration_offset == 0:
+                steps_per_iter = runner.cfg.get("num_steps_per_env", 1)
+                env.unwrapped.common_step_counter = resumed_iter * steps_per_iter
+                print(f"[INFO] Set common_step_counter={env.unwrapped.common_step_counter}")
     elif isinstance(runner, DistillationRunner):
         print(
             "[INFO] No distillation checkpoint was loaded for the student/teacher heads. "
