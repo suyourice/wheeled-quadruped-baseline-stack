@@ -22,10 +22,12 @@ from ..goals import ensure_navigation_goal_buffers
 from ..scenarios import NAV_SCENARIO_CODES as _NAV_SCENARIO_CODES
 from .obstacle_geometry import (
     DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
+    OBSTACLE_SHAPE_CUBOID,
     footprint_clearance,
     obstacle_active_mask,
     obstacle_risk_radius,
 )
+from .hospital_metrics import hospital_centerline_metrics
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -226,6 +228,305 @@ def _obstacle_positions_w(env: ManagerBasedRLEnv, obstacle_names: list[str]) -> 
     )  # (N, K, 3)
     cache[cache_key] = pos
     return pos
+
+
+def _hospital_path_progress_delta(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return cached per-step path-progress delta for hospital path rewards."""
+    cache = _nav_step_cache(env)
+    cached = cache.get("hospital_path_progress_delta")
+    if cached is not None:
+        return cached
+    progress = getattr(env, "_go2w_navigation_path_progress_s", None)
+    if progress is None:
+        delta = torch.zeros(env.num_envs, device=env.device)
+        cache["hospital_path_progress_delta"] = delta
+        return delta
+    if (
+        not hasattr(env, "_go2w_hospital_prev_progress_s")
+        or env._go2w_hospital_prev_progress_s.shape != progress.shape
+    ):
+        env._go2w_hospital_prev_progress_s = progress.clone()
+    reset_ids = (env.episode_length_buf == 0).nonzero(as_tuple=False).squeeze(-1)
+    if reset_ids.numel() > 0:
+        env._go2w_hospital_prev_progress_s[reset_ids] = progress[reset_ids]
+    delta = progress - env._go2w_hospital_prev_progress_s
+    env._go2w_hospital_prev_progress_s[:] = progress
+    cache["hospital_path_progress_delta"] = delta
+    return delta
+
+
+def hospital_path_progress_reward(
+    env: ManagerBasedRLEnv,
+    clip: float = 0.6,
+) -> torch.Tensor:
+    """Reward forward progress along the stored A* path."""
+    delta = _hospital_path_progress_delta(env)
+    result = delta.clamp(min=-clip, max=clip) / max(clip, 1.0e-6)
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    env.extras["log"]["hospital_progress_s"] = getattr(
+        env, "_go2w_navigation_path_progress_s", torch.zeros_like(result)
+    ).mean()
+    return result
+
+
+def hospital_backtrack_penalty(
+    env: ManagerBasedRLEnv,
+    clip: float = 0.4,
+) -> torch.Tensor:
+    """Penalise losing progress along the A* path."""
+    delta = _hospital_path_progress_delta(env)
+    return (-delta).clamp(min=0.0, max=clip) / max(clip, 1.0e-6)
+
+
+def hospital_stuck_penalty(
+    env: ManagerBasedRLEnv,
+    min_progress: float = 0.01,
+    min_final_distance: float = 0.8,
+    patience_steps: int = 60,
+) -> torch.Tensor:
+    """Penalise prolonged zero-progress behavior away from the final goal."""
+    delta = _hospital_path_progress_delta(env)
+    final_distance = getattr(
+        env, "_go2w_navigation_path_final_distance", torch.zeros(env.num_envs, device=env.device)
+    )
+    stuck_now = (delta.abs() < min_progress) & (final_distance > min_final_distance)
+    if (
+        not hasattr(env, "_go2w_hospital_stuck_counter")
+        or env._go2w_hospital_stuck_counter.shape != delta.shape
+    ):
+        env._go2w_hospital_stuck_counter = torch.zeros(env.num_envs, device=env.device)
+    env._go2w_hospital_stuck_counter = torch.where(
+        stuck_now,
+        env._go2w_hospital_stuck_counter + 1.0,
+        torch.zeros_like(env._go2w_hospital_stuck_counter),
+    )
+    result = (env._go2w_hospital_stuck_counter >= float(patience_steps)).float()
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    env.extras["log"]["hospital_stuck_rate"] = result.mean()
+    return result
+
+
+def hospital_centerline_deviation_penalty(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    obstacle_names: list[str] | None = None,
+    tolerance: float = 0.15,
+    scale: float = 1.0,
+    actor_relax_clearance: float = 0.5,
+    robot_safety_radius: float = 0.30,
+) -> torch.Tensor:
+    """Penalise drifting away from the corridor centerline.
+
+    When obstacle_names is provided, the penalty is modulated by the nearest
+    actor body clearance: full strength when the corridor is clear, approaching
+    zero when an actor is within actor_relax_clearance of the robot body.
+    This lets the policy deviate from the centerline to avoid actors without
+    fighting a conflicting reward signal.
+    """
+    from .obstacle_geometry import footprint_clearance, obstacle_active_mask
+
+    lateral_error, _, _, _, _ = hospital_centerline_metrics(env, robot_cfg)
+    excess = (lateral_error.abs() - tolerance).clamp(min=0.0)
+    penalty = (excess / max(scale, 1.0e-6)).clamp(0.0, 1.0)
+
+    if obstacle_names:
+        robot = env.scene[robot_cfg.name]
+        obs_pos = _obstacle_positions_w(env, obstacle_names)[..., :2]
+        rel_w = obs_pos - robot.data.root_pos_w[:, :2].unsqueeze(1)
+        center_dists = rel_w.norm(dim=-1)
+        active = obstacle_active_mask(env, obstacle_names, center_dists, actor_relax_clearance + 10.0)
+        clearances = footprint_clearance(env, obstacle_names, center_dists, robot_safety_radius)
+        min_clearance = torch.where(
+            active, clearances, torch.full_like(clearances, actor_relax_clearance)
+        ).min(dim=1).values.clamp(min=0.0)
+        clearance_factor = (min_clearance / max(actor_relax_clearance, 1.0e-6)).clamp(0.0, 1.0)
+        penalty = penalty * clearance_factor
+
+    return penalty
+
+
+def hospital_path_heading_alignment_reward(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward aligning the robot heading with the local corridor/path tangent."""
+    _, heading_error, _, _, _ = hospital_centerline_metrics(env, robot_cfg)
+    return torch.cos(heading_error).clamp(min=0.0)
+
+
+def hospital_wall_clearance_penalty(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    min_wall_clearance: float = 0.50,
+) -> torch.Tensor:
+    """Penalise getting too close to static corridor terrain walls.
+
+    min_wall_clearance is measured from the robot CENTER to the wall surface.
+    Set this to robot_half_width + desired_body_edge_clearance (e.g. 0.30+0.20=0.50m).
+    Penalty is quadratic so it ramps up sharply as the robot approaches the wall.
+    """
+    _, _, _, left_clearance, right_clearance = hospital_centerline_metrics(env, robot_cfg)
+    nearest_wall = torch.minimum(left_clearance, right_clearance)
+    intrusion = (min_wall_clearance - nearest_wall).clamp(min=0.0)
+    result = (intrusion / max(min_wall_clearance, 1.0e-6)).square()
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    env.extras["log"]["hospital_wall_clearance_mean"] = nearest_wall.clamp(min=0.0, max=4.0).mean()
+    return result
+
+
+def _hospital_surface_clearance(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    rel_w: torch.Tensor,
+    center_dists: torch.Tensor,
+    robot_safety_radius: float,
+) -> torch.Tensor:
+    """Return bearing-aware footprint clearance for cuboids and round actors."""
+    meta_shape = (env.num_envs, len(obstacle_names))
+    if (
+        not hasattr(env, "_go2w_obstacle_shape_id")
+        or env._go2w_obstacle_shape_id.shape != meta_shape
+        or not hasattr(env, "_go2w_obstacle_width")
+        or env._go2w_obstacle_width.shape != meta_shape
+        or not hasattr(env, "_go2w_obstacle_depth")
+        or env._go2w_obstacle_depth.shape != meta_shape
+    ):
+        return footprint_clearance(env, obstacle_names, center_dists, robot_safety_radius)
+
+    shape_ids = env._go2w_obstacle_shape_id
+    widths = env._go2w_obstacle_width
+    depths = env._go2w_obstacle_depth
+    yaw = getattr(env, "_go2w_obstacle_yaw", torch.zeros_like(center_dists))
+    bearing_w = torch.atan2(rel_w[..., 1], rel_w[..., 0])
+    bearing_in_obstacle = wrap_to_pi(bearing_w - yaw)
+    cuboid_support = (
+        bearing_in_obstacle.cos().abs() * widths * 0.5
+        + bearing_in_obstacle.sin().abs() * depths * 0.5
+    )
+    round_support = torch.maximum(widths, depths) * 0.5
+    support_radius = torch.where(shape_ids == OBSTACLE_SHAPE_CUBOID, cuboid_support, round_support)
+    margin = float(getattr(env, "_go2w_obstacle_radius_margin", 0.0))
+    return center_dists - support_radius - margin - robot_safety_radius
+
+
+def hospital_priority_clearance_penalty(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    min_safe_dist: float = 0.22,
+    robot_safety_radius: float = 0.30,
+    max_logged_clearance: float = 8.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Priority-weighted unsafe closeness penalty for hospital actor obstacles."""
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, device=env.device)
+    robot = env.scene[asset_cfg.name]
+    obs_pos = _obstacle_positions_w(env, obstacle_names)[..., :2]
+    rel_w = obs_pos - robot.data.root_pos_w[:, :2].unsqueeze(1)
+    center_dists = rel_w.norm(dim=-1)
+    active = obstacle_active_mask(env, obstacle_names, center_dists, min_safe_dist + 100.0)
+    clearances = _hospital_surface_clearance(
+        env, obstacle_names, rel_w, center_dists, robot_safety_radius
+    )
+    priority = getattr(env, "_go2w_obstacle_priority", torch.ones_like(center_dists))
+    intrusion = ((min_safe_dist - clearances) / max(min_safe_dist, 1.0e-6)).clamp(0.0, 1.0)
+    risk = intrusion.square() * priority.clamp(0.0, 1.0) * active.float()
+    result = risk.max(dim=1).values
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    nearest_clearance = torch.where(
+        active, clearances, torch.full_like(clearances, max_logged_clearance)
+    ).min(dim=1).values
+    env.extras["log"]["hospital_clearance_mean"] = nearest_clearance.clamp(
+        min=0.0, max=max_logged_clearance
+    ).mean()
+    return result
+
+
+def hospital_priority_ttc_penalty(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    safe_ttc: float = 1.0,
+    command_name: str = "base_velocity",
+    robot_half_width: float = 0.30,
+    safety_margin: float = 0.05,
+    robot_front_margin: float = 0.20,
+    lookahead_distance: float = 2.2,
+    sum_clip: float = 1.5,
+    min_command_speed: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Priority-weighted TTC proxy for the hospital teacher."""
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, device=env.device)
+    asset = env.scene[asset_cfg.name]
+    command_xy = env.command_manager.get_command(command_name)[:, :2]
+    command_speed = command_xy.norm(dim=-1).clamp(min=0.0)
+    command_dir = command_xy / command_speed.clamp(min=min_command_speed).unsqueeze(-1)
+    moving = command_speed > min_command_speed
+    robot_pos_w = asset.data.root_pos_w[:, :2]
+
+    obs_pos = _obstacle_positions_w(env, obstacle_names)[..., :2]
+    rel_w = obs_pos - robot_pos_w.unsqueeze(1)
+    heading = asset.data.heading_w
+    cos_h = torch.cos(heading).unsqueeze(-1)
+    sin_h = torch.sin(heading).unsqueeze(-1)
+    rel_b = torch.stack(
+        (
+            cos_h * rel_w[..., 0] + sin_h * rel_w[..., 1],
+            -sin_h * rel_w[..., 0] + cos_h * rel_w[..., 1],
+        ),
+        dim=-1,
+    )
+    forward = (rel_b * command_dir.unsqueeze(1)).sum(dim=-1)
+    lateral = (
+        command_dir[:, 0:1] * rel_b[..., 1] - command_dir[:, 1:2] * rel_b[..., 0]
+    ).abs()
+    center_dists = rel_w.norm(dim=-1)
+    active = obstacle_active_mask(env, obstacle_names, center_dists, lookahead_distance + 10.0)
+    class_ids = getattr(env, "_go2w_obstacle_class_id", torch.ones_like(center_dists, dtype=torch.long))
+    active = active & (class_ids != 0)
+    radii = obstacle_risk_radius(env, obstacle_names, center_dists)
+    corridor_half_width = robot_half_width + radii + safety_margin
+    lateral_alpha = ((corridor_half_width - lateral) / corridor_half_width.clamp(min=1.0e-6)).clamp(0.0, 1.0)
+    lateral_risk = lateral_alpha.square() * (3.0 - 2.0 * lateral_alpha)
+    forward_clearance = forward - radii - robot_front_margin
+    ttc = forward_clearance / command_speed.clamp(min=min_command_speed).unsqueeze(-1)
+    ttc_risk = ((safe_ttc - ttc) / max(safe_ttc, 1.0e-6)).clamp(0.0, 1.0)
+    priority = getattr(env, "_go2w_obstacle_priority", torch.ones_like(center_dists))
+    penalty = lateral_risk * ttc_risk * priority.clamp(0.0, 1.0)
+    penalty = penalty * (moving.unsqueeze(-1) & (forward > 0.0) & active).float()
+    return penalty.sum(dim=1).clamp(max=sum_clip)
+
+
+def hospital_low_obstacle_grazing_penalty(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    graze_distance: float = 0.08,
+    robot_safety_radius: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Extra penalty for grazing low static obstacles."""
+    if len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, device=env.device)
+    robot = env.scene[asset_cfg.name]
+    obs_pos = _obstacle_positions_w(env, obstacle_names)[..., :2]
+    rel_w = obs_pos - robot.data.root_pos_w[:, :2].unsqueeze(1)
+    center_dists = rel_w.norm(dim=-1)
+    active = obstacle_active_mask(env, obstacle_names, center_dists, graze_distance + 100.0)
+    low_flag = getattr(env, "_go2w_obstacle_low_flag", torch.zeros_like(center_dists, dtype=torch.bool))
+    clearances = _hospital_surface_clearance(
+        env, obstacle_names, rel_w, center_dists, robot_safety_radius
+    )
+    risk = ((graze_distance - clearances) / max(graze_distance, 1.0e-6)).clamp(0.0, 1.0)
+    result = (risk * active.float() * low_flag.float()).max(dim=1).values
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    env.extras["log"]["hospital_low_obstacle_graze_rate"] = (result > 0.0).float().mean()
+    return result
 
 
 def _compute_nav_frontal_geometry(
@@ -493,17 +794,18 @@ def nav_frontal_blocked_lateral_escape_reward(
     goal_path_corridor_half_width: float = 0.7,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Reward lateral escape velocity when both the frontal corridor and the direct
-    goal path are blocked.
+    """Reward lateral escape velocity when the frontal corridor or direct goal
+    path is blocked.
 
-    Adds a goal_path_blockage gate on top of the original frontal-only gating so
-    that lateral escape is suppressed when the straight robot→goal path is clear —
-    preventing the policy from swerving sideways on open ground.
+    The gate is permissive once either the robot's forward sector or the
+    robot-to-goal corridor is obstructed.  If one side is clearly more blocked,
+    reward motion toward the more open side.  If the obstacle is centered and
+    both sides look similar, reward either lateral direction.
 
     Convention:
       - preferred_side_hint > 0 → go right (left has more obstacles)
       - preferred_side_hint < 0 → go left  (right has more obstacles)
-      - reward = frontal_gate × goal_path_gate × clamp(0, aligned_lateral / 2.0)
+      - preferred_side_hint = 0 → either lateral direction is useful
 
     Returns a value in [0, 1].
     """
@@ -523,24 +825,29 @@ def nav_frontal_blocked_lateral_escape_reward(
     ).clamp(0.0, 1.0)
 
     side_diff = left_blockage - right_blockage
+    has_preferred_side = side_diff.abs() > side_diff_deadband
     preferred_sign = torch.where(
-        side_diff.abs() > side_diff_deadband,
+        has_preferred_side,
         torch.sign(side_diff),
         torch.zeros_like(side_diff),
     )
     aligned_lateral = -preferred_sign * vel_yaw[:, 1]
+    directed_lateral_score = (aligned_lateral / 2.0).clamp(0.0, 1.0)
+    centered_lateral_score = (vel_yaw[:, 1].abs() / 2.0).clamp(0.0, 1.0)
+    lateral_score = torch.where(has_preferred_side, directed_lateral_score, centered_lateral_score)
 
     frontal_gate = (
         (frontal_blockage - min_blockage_for_reward)
         / (1.0 - min_blockage_for_reward + 1.0e-6)
     ).clamp(0.0, 1.0)
+    blocked_gate = torch.maximum(frontal_gate, goal_path_gate)
 
-    reward = frontal_gate * goal_path_gate * (aligned_lateral / 2.0).clamp(0.0, 1.0)
+    reward = blocked_gate * lateral_score
 
     if "log" not in env.extras:
         env.extras["log"] = {}
     env.extras["log"]["lateral_escape_activation_rate"] = (
-        (frontal_gate * goal_path_gate > 0.05).float().mean()
+        (blocked_gate > 0.05).float().mean()
     )
     env.extras["log"]["goal_path_blockage_mean"] = goal_path_blockage.mean()
     return reward
@@ -887,13 +1194,16 @@ def nav_dense_recovery_reward(
 
     # Productive recovery directions.
     side_diff = left_blockage - right_blockage
+    has_preferred_side = side_diff.abs() > side_diff_deadband
     preferred_sign = torch.where(
-        side_diff.abs() > side_diff_deadband,
+        has_preferred_side,
         torch.sign(side_diff),
         torch.zeros_like(side_diff),
     )
     aligned_lateral = -preferred_sign * vel_yaw[:, 1]
-    lateral_score = (aligned_lateral / max(vel_ref, 1.0e-6)).clamp(0.0, 1.0)
+    directed_lateral_score = (aligned_lateral / max(vel_ref, 1.0e-6)).clamp(0.0, 1.0)
+    centered_lateral_score = (vel_yaw[:, 1].abs() / max(vel_ref, 1.0e-6)).clamp(0.0, 1.0)
+    lateral_score = torch.where(has_preferred_side, directed_lateral_score, centered_lateral_score)
 
     both_sides_blocked = (torch.minimum(left_blockage, right_blockage) > side_blocked_threshold).float()
     backward_score = both_sides_blocked * (-vel_yaw[:, 0] / max(vel_ref, 1.0e-6)).clamp(0.0, 1.0)

@@ -77,6 +77,9 @@ from .navigation.local_planning.sensor_observations import (
     obstacle_polar_depth,
 )
 from .navigation.local_planning.obstacle_observations import (
+    hospital_corridor_features,
+    hospital_path_features,
+    hospital_semantic_obstacle_features,
     obstacle_full_geometry_features,
     obstacle_navigation_features,
     prev_hlc_actions,
@@ -89,6 +92,7 @@ from .navigation.reset.random_obstacles import (
     update_locomotion_curriculum,
 )
 from .navigation.reset.template_obstacles import reset_navigation_goals_and_obstacles
+from .navigation.reset.hospital_training import reset_hospital_maze_training
 from .navigation.reset.structured_astar import reset_structured_astar_corridor
 
 # -- Rewards (local custom) ----------------------------------------------------
@@ -107,6 +111,15 @@ from .locomotion.rewards import (
     wheel_vel_zero_cmd,
 )
 from .navigation.local_planning.obstacle_rewards import (
+    hospital_backtrack_penalty,
+    hospital_centerline_deviation_penalty,
+    hospital_low_obstacle_grazing_penalty,
+    hospital_path_heading_alignment_reward,
+    hospital_path_progress_reward,
+    hospital_priority_clearance_penalty,
+    hospital_priority_ttc_penalty,
+    hospital_stuck_penalty,
+    hospital_wall_clearance_penalty,
     nav_clearance_penalty,
     obstacle_nav_ttc_penalty,
     nav_dense_recovery_reward,

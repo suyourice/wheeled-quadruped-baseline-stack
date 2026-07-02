@@ -142,6 +142,8 @@ def structured_corridor_centerline(
 ) -> tuple[WorldPoint, ...]:
     """Return a corridor-local centerline for a named structured scene."""
     kind = corridor_kind.lower()
+    if kind == "straight_corridor":
+        return ((0.0, 0.0), (leg_length, 0.0))
     if kind == "l_corridor":
         return ((0.0, 0.0), (leg_length, 0.0), (leg_length, leg_length))
     if kind == "t_corridor":

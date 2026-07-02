@@ -76,6 +76,9 @@ def reset_structured_astar_corridor(
     lookahead_min: float = 0.6,
     curvature_scan_horizon: float = 2.5,
     curvature_threshold: float = 0.3,
+    skip_wall_placement: bool = False,
+    use_env_origin: bool = False,
+    reset_robot_pose: bool = False,
 ) -> None:
     """Reset play envs into a known structured corridor with an A* waypoint path."""
     del dynamic_obstacle_names, dynamic_obstacle_indices, obstacle_labels
@@ -96,7 +99,7 @@ def reset_structured_astar_corridor(
         wall_thickness,
         corridor_turn_length,
     )
-    if len(obstacle_names) < len(wall_specs):
+    if not skip_wall_placement and len(obstacle_names) < len(wall_specs):
         raise ValueError(
             f"Structured {structured_kind} requires at least {len(wall_specs)} obstacle slots for wall segments."
         )
@@ -137,6 +140,14 @@ def reset_structured_astar_corridor(
         - robot_start_local[0] * sin_yaw
         - robot_start_local[1] * cos_yaw
     )
+
+    # For mesh-wall environments: use fixed env origin as corridor origin (mesh is at origin).
+    if use_env_origin:
+        _env_origins = env.scene.env_origins[env_ids]
+        layout_origin_xy = _env_origins[:, :2].clone()
+        yaw = torch.zeros(n, dtype=start_pos_w.dtype, device=device)
+        cos_yaw = torch.ones(n, dtype=start_pos_w.dtype, device=device)
+        sin_yaw = torch.zeros(n, dtype=start_pos_w.dtype, device=device)
 
     env._go2w_start_pos_w[env_ids] = start_pos_w
     env._go2w_start_heading_w[env_ids] = start_heading_w
@@ -213,7 +224,7 @@ def reset_structured_astar_corridor(
     env._go2w_navigation_path_direct_goal = True
     set_navigation_path_w(env, env_ids, path_w)
 
-    wall_count = len(wall_specs)
+    wall_count = 0 if skip_wall_placement else len(wall_specs)
     dynamic_count = max(0, min(dynamic_obstacle_count, k - wall_count))
     active_mask = torch.zeros(n, k, dtype=torch.bool, device=device)
     active_mask[:, : wall_count + dynamic_count] = True
@@ -242,13 +253,14 @@ def reset_structured_astar_corridor(
     parked_positions = _separated_parked_positions(parked_world, k)
     positions = parked_positions.clone()
 
-    for slot_idx, (local_x, local_y, local_yaw, _, _) in enumerate(wall_specs):
-        wx = layout_origin_xy[:, 0] + local_x * cos_yaw - local_y * sin_yaw
-        wy = layout_origin_xy[:, 1] + local_x * sin_yaw + local_y * cos_yaw
-        positions[:, slot_idx, 0] = wx
-        positions[:, slot_idx, 1] = wy
-        positions[:, slot_idx, 2] = center_z_values[slot_idx]
-        obstacle_yaws[:, slot_idx] = yaw + local_yaw
+    if not skip_wall_placement:
+        for slot_idx, (local_x, local_y, local_yaw, _, _) in enumerate(wall_specs):
+            wx = layout_origin_xy[:, 0] + local_x * cos_yaw - local_y * sin_yaw
+            wy = layout_origin_xy[:, 1] + local_x * sin_yaw + local_y * cos_yaw
+            positions[:, slot_idx, 0] = wx
+            positions[:, slot_idx, 1] = wy
+            positions[:, slot_idx, 2] = center_z_values[slot_idx]
+            obstacle_yaws[:, slot_idx] = yaw + local_yaw
 
     # Spawn dynamic obstacles along all corridor segments (nav path + dead-end branches).
     placed_dynamic: list[tuple[float, float]] = []
@@ -330,6 +342,20 @@ def reset_structured_astar_corridor(
         pose[:, 3:7] = yaw_to_quat_wxyz(obstacle_yaws[:, slot_idx])
         env.scene[name].write_root_pose_to_sim(pose, env_ids=env_ids)
         env.scene[name].write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+
+    if reset_robot_pose and use_env_origin:
+        robot_pose = torch.zeros(n, 7, device=device)
+        robot_pose[:, 0] = layout_origin_xy[:, 0] + robot_start_local[0]
+        robot_pose[:, 1] = layout_origin_xy[:, 1] + robot_start_local[1]
+        robot_pose[:, 2] = start_pos_w[:, 2]
+        path_delta = path_w[:, 1, :2] - path_w[:, 0, :2]
+        start_yaw_mesh = torch.atan2(path_delta[:, 1], path_delta[:, 0])
+        robot_pose[:, 3:7] = yaw_to_quat_wxyz(start_yaw_mesh)
+        robot = env.scene["robot"]
+        robot.write_root_pose_to_sim(robot_pose, env_ids=env_ids)
+        robot.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+        env._go2w_start_pos_w[env_ids] = robot_pose[:, :3]
+        env._go2w_start_heading_w[env_ids] = start_yaw_mesh
 
     if ramp_asset_name is not None:
         ramp = env.scene[ramp_asset_name]
