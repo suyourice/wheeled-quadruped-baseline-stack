@@ -1363,6 +1363,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    # Resize terrain generator grid so tiles match num_envs exactly (same logic as train.py).
+    _scene_terrain = getattr(env_cfg.scene, "terrain", None)
+    if _scene_terrain is not None and getattr(_scene_terrain, "use_terrain_origins", False):
+        _tg = getattr(_scene_terrain, "terrain_generator", None)
+        if _tg is not None:
+            import math as _m
+            _n = env_cfg.scene.num_envs
+            _r = _m.isqrt(_n)
+            while _r > 1 and _n % _r != 0:
+                _r -= 1
+            _tg.num_rows = max(1, _r)
+            _tg.num_cols = max(1, _m.ceil(_n / _r))
+            del _m, _n, _r, _tg
+    del _scene_terrain
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
     _override_play_episode_length(env_cfg, args_cli)
     _override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
