@@ -184,6 +184,24 @@ def set_obstacle_metadata(
     env._go2w_obstacle_radius_margin = max(0.0, obstacle_radius_margin)
 
 
+def _meta_slice(stored: "torch.Tensor", target_shape: tuple) -> "torch.Tensor | None":
+    """Return stored metadata sliced to target_shape if compatible, else None.
+
+    Handles the common case where metadata is stored for all obstacle slots (e.g.
+    64) but an observation term queries a subset (e.g. 16 training slots).  As
+    long as the batch dim matches and the stored slot count is >= the requested
+    count, we return the leading slice so the correct per-slot values are used
+    instead of falling back to default constants.
+    """
+    if stored.shape == target_shape:
+        return stored
+    if stored.shape[0] == target_shape[0] and len(stored.shape) == len(target_shape):
+        if all(stored.shape[i] >= target_shape[i] for i in range(1, len(target_shape))):
+            slices = (slice(None),) + tuple(slice(0, target_shape[i]) for i in range(1, len(target_shape)))
+            return stored[slices]
+    return None
+
+
 def obstacle_active_mask(
     env: ManagerBasedRLEnv,
     obstacle_names: list[str],
@@ -191,11 +209,11 @@ def obstacle_active_mask(
     max_distance: float,
 ) -> torch.Tensor:
     """Return metadata activity when available, with parked-position fallback."""
-    if (
-        hasattr(env, "_go2w_obstacle_active_mask")
-        and env._go2w_obstacle_active_mask.shape == center_distances.shape
-    ):
-        return env._go2w_obstacle_active_mask
+    stored = getattr(env, "_go2w_obstacle_active_mask", None)
+    if stored is not None:
+        sliced = _meta_slice(stored, center_distances.shape)
+        if sliced is not None:
+            return sliced
     return center_distances < max_distance
 
 
@@ -206,11 +224,11 @@ def obstacle_effective_radius(
     fallback_radius: float = DEFAULT_OBSTACLE_EFFECTIVE_RADIUS,
 ) -> torch.Tensor:
     """Return physical footprint radii aligned with an obstacle tensor."""
-    if (
-        hasattr(env, "_go2w_obstacle_effective_radius")
-        and env._go2w_obstacle_effective_radius.shape == reference.shape
-    ):
-        return env._go2w_obstacle_effective_radius
+    stored = getattr(env, "_go2w_obstacle_effective_radius", None)
+    if stored is not None:
+        sliced = _meta_slice(stored, reference.shape)
+        if sliced is not None:
+            return sliced
     return torch.full_like(reference, fallback_radius)
 
 

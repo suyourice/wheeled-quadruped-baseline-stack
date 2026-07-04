@@ -165,7 +165,30 @@ def reset_structured_astar_corridor(
         env._go2w_structured_corridor_waypoint_clearance = torch.zeros(env.num_envs, device=device)
     if not hasattr(env, "_go2w_structured_corridor_waypoint_clearance"):
         env._go2w_structured_corridor_waypoint_clearance = torch.zeros(env.num_envs, device=device)
-    centerline_count = len(centerline)
+    local_path = plan_structured_corridor_path(
+        structured_kind,
+        leg_length,
+        corridor_width,
+        robot_inflation,
+        grid_resolution,
+        corridor_turn_length,
+        clearance_cost_weight=clearance_cost_weight,
+        clearance_cost_sigma=clearance_cost_sigma,
+        corner_rounding=corner_rounding,
+        corner_radius=corner_radius,
+    )
+    path_count = len(local_path)
+    path_local = torch.tensor(local_path, dtype=start_pos_w.dtype, device=device)
+    # Resample path to a compact centerline for observation metrics and markers.
+    # The full dense path is kept for navigation waypoints.
+    _CENTERLINE_MAX = 32
+    if path_count > _CENTERLINE_MAX:
+        cl_idx = torch.linspace(0, path_count - 1, _CENTERLINE_MAX, device=device).long()
+        centerline_2d = path_local[cl_idx, :2]
+        centerline_count = _CENTERLINE_MAX
+    else:
+        centerline_2d = path_local[:, :2]
+        centerline_count = path_count
     if (
         not hasattr(env, "_go2w_structured_corridor_centerline_local")
         or env._go2w_structured_corridor_centerline_local.shape != (env.num_envs, centerline_count, 2)
@@ -178,8 +201,7 @@ def reset_structured_astar_corridor(
     env._go2w_structured_corridor_leg_length[env_ids] = leg_length
     env._go2w_structured_corridor_width[env_ids] = corridor_width
     env._go2w_structured_corridor_waypoint_clearance[env_ids] = robot_inflation
-    centerline_tensor = torch.tensor(centerline, dtype=start_pos_w.dtype, device=device)
-    env._go2w_structured_corridor_centerline_local[env_ids] = centerline_tensor.unsqueeze(0).expand(n, -1, -1)
+    env._go2w_structured_corridor_centerline_local[env_ids] = centerline_2d.unsqueeze(0).expand(n, -1, -1)
     extra_polylines = structured_corridor_extra_polylines(structured_kind, leg_length, corridor_width)
     if (
         not hasattr(env, "_go2w_structured_corridor_extra_polyline_count")
@@ -201,20 +223,6 @@ def reset_structured_astar_corridor(
             )
         env._go2w_structured_corridor_extra_polylines_local[env_ids] = extra_tensor.unsqueeze(0).expand(n, -1, -1, -1)
 
-    local_path = plan_structured_corridor_path(
-        structured_kind,
-        leg_length,
-        corridor_width,
-        robot_inflation,
-        grid_resolution,
-        corridor_turn_length,
-        clearance_cost_weight=clearance_cost_weight,
-        clearance_cost_sigma=clearance_cost_sigma,
-        corner_rounding=corner_rounding,
-        corner_radius=corner_radius,
-    )
-    path_count = len(local_path)
-    path_local = torch.tensor(local_path, dtype=start_pos_w.dtype, device=device)
     dx = path_local[:, 0].unsqueeze(0)
     dy = path_local[:, 1].unsqueeze(0)
     path_w = torch.zeros(n, path_count, 3, dtype=start_pos_w.dtype, device=device)

@@ -225,7 +225,7 @@ def hospital_maze_sub_terrain(
     ry = cfg.rail_y    # = 20.0
     sp = cfg.spacing   # = 10.0
 
-    hw_min, hw_max = cfg.half_width_range   # (1.4, 1.7) → corridor 2.8–3.4 m
+    hw_min, hw_max = cfg.half_width_range   # (1.4, 1.8) -> corridor 2.8-3.6 m
 
     n_junc = round(2 * rx / sp) + 1            # = 5
     col_hws = _rand_corridor_widths(difficulty,        n_junc, hw_min, hw_max)
@@ -272,7 +272,7 @@ class HospitalMazeSubTerrainCfg(SubTerrainBaseCfg):
     function: Callable = hospital_maze_sub_terrain
     size: tuple[float, float] = (48.0, 48.0)
     wall_height: float = HOSPITAL_TRAIN_WALL_HEIGHT
-    half_width_range: tuple[float, float] = (1.4, 1.7)   # hw range → corridor 2.8–3.4 m
+    half_width_range: tuple[float, float] = (1.4, 1.8)   # hw range -> corridor 2.8-3.6 m
     rail_x: float = 20.0
     rail_y: float = 20.0
     spacing: float = 10.0

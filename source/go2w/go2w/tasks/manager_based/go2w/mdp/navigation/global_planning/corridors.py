@@ -369,14 +369,18 @@ def hospital_floor_wall_specs(
     hw = corridor_width * 0.5
     L = leg_length
     rects = (
-        (0.0, 2.0 * L, -hw, hw),                       # entrance/main corridor
-        (2.0 * L - hw, 2.0 * L + hw, 0.0, L),           # ward branch
-        (2.0 * L, 4.2 * L, L - hw, L + hw),             # long service/ramp connector
-        (0.45 * L, 1.05 * L, -0.65 * L, 0.0),           # reception + waiting bay
-        (1.65 * L, 2.35 * L, -0.70 * L, 0.0),           # emergency/service bay
-        (2.55 * L, 2.95 * L, L, 1.45 * L),              # room doorway spur
-        (2.40 * L, 4.08 * L, 0.58 * L, L),              # imaging/ramp/pharmacy clinical bay
-        (3.70 * L, 4.15 * L, L, 1.38 * L),              # elevator/exit alcove
+        (0.0, 2.0 * L, -hw, hw),                            # entrance/main corridor
+        (2.0 * L - hw, 2.0 * L + hw, 0.0, L + hw),             # ward branch (full height to north wall)
+        (2.0 * L, 4.2 * L, L - hw, L + hw),                 # long service/ramp connector
+        (0.45 * L, 1.05 * L, -0.65 * L, 0.0),               # reception + waiting bay
+        (1.65 * L, 2.35 * L, -0.70 * L, 0.0),               # emergency/service bay
+        (2.55 * L, 2.95 * L, L, 1.45 * L),                  # room doorway spur (north)
+        # Three individual south doorways replacing the single wide clinical bay rect.
+        # Each spur x-centre matches the corresponding extra_polyline branch.
+        (2.60 * L - hw, 2.60 * L + hw, 0.58 * L, L),        # imaging / check bay doorway
+        (3.28 * L - hw, 3.28 * L + hw, 0.62 * L, L),        # ramp landing / rehab doorway
+        (3.84 * L - hw, 3.84 * L + hw, 0.58 * L, L),        # pharmacy / meds bay doorway
+        (3.70 * L, 4.15 * L, L, 1.38 * L),                  # elevator/exit alcove
     )
     return _rect_union_wall_specs(rects, wall_thickness)
 
@@ -568,9 +572,8 @@ def plan_structured_corridor_path(
     so collision safety is preserved.
     """
     centerline = structured_corridor_centerline(corridor_kind, leg_length, corridor_width, turn_length)
-    extra = structured_corridor_extra_polylines(corridor_kind, leg_length, corridor_width)
     grid, start_xy, goal_xy = build_polyline_corridor_grid(
-        centerline, corridor_width, robot_inflation, grid_resolution, extra_free_polylines=extra
+        centerline, corridor_width, robot_inflation, grid_resolution, extra_free_polylines=()
     )
     result = plan_astar_path(
         grid,

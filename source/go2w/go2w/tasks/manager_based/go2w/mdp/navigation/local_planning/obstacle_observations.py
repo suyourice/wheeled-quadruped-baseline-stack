@@ -34,6 +34,7 @@ from .obstacle_geometry import (
     OBSTACLE_SHAPE_CONE,
     OBSTACLE_SHAPE_CUBOID,
     OBSTACLE_SHAPE_CYLINDER,
+    _meta_slice,
     obstacle_active_mask,
     obstacle_risk_radius,
 )
@@ -146,25 +147,32 @@ def obstacle_full_geometry_features(
     active = gather_slots(active).float()
 
     meta_shape = (env.num_envs, len(obstacle_names))
-    if hasattr(env, "_go2w_obstacle_shape_id") and env._go2w_obstacle_shape_id.shape == meta_shape:
-        shape_ids = gather_slots(env._go2w_obstacle_shape_id)
-    else:
-        shape_ids = torch.full((N, selected_slots), OBSTACLE_SHAPE_CUBOID, dtype=torch.long, device=device)
-    if hasattr(env, "_go2w_obstacle_width") and env._go2w_obstacle_width.shape == meta_shape:
-        widths = gather_slots(env._go2w_obstacle_width)
-    else:
-        widths = torch.full((N, selected_slots), DEFAULT_OBSTACLE_WIDTH, device=device)
-    if hasattr(env, "_go2w_obstacle_depth") and env._go2w_obstacle_depth.shape == meta_shape:
-        depths = gather_slots(env._go2w_obstacle_depth)
-    else:
-        depths = torch.full((N, selected_slots), DEFAULT_OBSTACLE_DEPTH, device=device)
-    if hasattr(env, "_go2w_obstacle_effective_radius") and env._go2w_obstacle_effective_radius.shape == meta_shape:
-        effective_radius = gather_slots(env._go2w_obstacle_effective_radius)
-    else:
-        effective_radius = torch.full((N, selected_slots), DEFAULT_OBSTACLE_EFFECTIVE_RADIUS, device=device)
 
-    if hasattr(env, "_go2w_obstacle_yaw") and env._go2w_obstacle_yaw.shape == meta_shape:
-        obstacle_yaw_w = gather_slots(env._go2w_obstacle_yaw)
+    def gather_meta(attr_name: str, fallback: torch.Tensor) -> torch.Tensor:
+        stored = getattr(env, attr_name, None)
+        sliced = _meta_slice(stored, meta_shape) if stored is not None else None
+        return gather_slots(sliced) if sliced is not None else fallback
+
+    shape_ids = gather_meta(
+        "_go2w_obstacle_shape_id",
+        torch.full((N, selected_slots), OBSTACLE_SHAPE_CUBOID, dtype=torch.long, device=device),
+    )
+    widths = gather_meta(
+        "_go2w_obstacle_width",
+        torch.full((N, selected_slots), DEFAULT_OBSTACLE_WIDTH, device=device),
+    )
+    depths = gather_meta(
+        "_go2w_obstacle_depth",
+        torch.full((N, selected_slots), DEFAULT_OBSTACLE_DEPTH, device=device),
+    )
+    effective_radius = gather_meta(
+        "_go2w_obstacle_effective_radius",
+        torch.full((N, selected_slots), DEFAULT_OBSTACLE_EFFECTIVE_RADIUS, device=device),
+    )
+    yaw_stored = getattr(env, "_go2w_obstacle_yaw", None)
+    yaw_sliced = _meta_slice(yaw_stored, meta_shape) if yaw_stored is not None else None
+    if yaw_sliced is not None:
+        obstacle_yaw_w = gather_slots(yaw_sliced)
     else:
         obs_quat_all = torch.stack([env.scene[n].data.root_quat_w for n in obstacle_names], dim=1)
         obstacle_yaw_w = gather_slots(quat_yaw_wxyz(obs_quat_all.reshape(N * K, 4)).reshape(N, K))
@@ -463,7 +471,6 @@ def hospital_corridor_features(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     max_lateral_error: float = 2.0,
-    max_clearance: float = 2.0,
     max_front_distance: float = 8.0,
 ) -> torch.Tensor:
     """Return corridor-following features for the hospital teacher."""
@@ -473,6 +480,7 @@ def hospital_corridor_features(
     lateral_error, heading_error, curvature, left_clearance, right_clearance = hospital_centerline_metrics(
         env, robot_cfg
     )
+    corridor_width = env._go2w_structured_corridor_width.clamp(min=0.1)  # (N,)
     final_dist = torch.zeros(env.num_envs, device=env.device)
     if hasattr(env, "_go2w_navigation_path_final_distance"):
         final_dist = env._go2w_navigation_path_final_distance.clamp(min=0.0, max=max_front_distance)
@@ -484,8 +492,8 @@ def hospital_corridor_features(
             heading_error.sin(),
             heading_error.cos(),
             (curvature / math.pi).clamp(0.0, 1.0),
-            (left_clearance / max_clearance).clamp(0.0, 1.0),
-            (right_clearance / max_clearance).clamp(0.0, 1.0),
+            (left_clearance / corridor_width).clamp(0.0, 1.0),
+            (right_clearance / corridor_width).clamp(0.0, 1.0),
             final_dist / max_front_distance,
         ],
         dim=-1,
@@ -523,30 +531,23 @@ def hospital_semantic_obstacle_features(
     meta_shape = (env.num_envs, len(obstacle_names))
     active_s = gather_slots(active).float()
 
-    if hasattr(env, "_go2w_obstacle_class_id") and env._go2w_obstacle_class_id.shape == meta_shape:
-        class_ids = gather_slots(env._go2w_obstacle_class_id).clamp(min=0, max=HOSPITAL_CLASS_COUNT - 1)
-    else:
-        class_ids = torch.zeros((N, selected_slots), dtype=torch.long, device=device)
-    if hasattr(env, "_go2w_obstacle_priority") and env._go2w_obstacle_priority.shape == meta_shape:
-        priority = gather_slots(env._go2w_obstacle_priority)
-    else:
-        priority = torch.full((N, selected_slots), 0.5, device=device)
-    if hasattr(env, "_go2w_obstacle_height") and env._go2w_obstacle_height.shape == meta_shape:
-        height = gather_slots(env._go2w_obstacle_height)
-    else:
-        height = torch.zeros((N, selected_slots), device=device)
-    if hasattr(env, "_go2w_obstacle_top_z") and env._go2w_obstacle_top_z.shape == meta_shape:
-        top_z = gather_slots(env._go2w_obstacle_top_z)
-    else:
-        top_z = height
-    if hasattr(env, "_go2w_obstacle_low_flag") and env._go2w_obstacle_low_flag.shape == meta_shape:
-        low_flag = gather_slots(env._go2w_obstacle_low_flag).float()
-    else:
-        low_flag = torch.zeros_like(height)
-    if hasattr(env, "_go2w_obstacle_dynamic_mask") and env._go2w_obstacle_dynamic_mask.shape == meta_shape:
-        dynamic_flag = gather_slots(env._go2w_obstacle_dynamic_mask).float()
-    else:
-        dynamic_flag = torch.zeros_like(height)
+    def gather_meta(attr_name: str, fallback: torch.Tensor) -> torch.Tensor:
+        stored = getattr(env, attr_name, None)
+        sliced = _meta_slice(stored, meta_shape) if stored is not None else None
+        return gather_slots(sliced) if sliced is not None else fallback
+
+    class_ids = gather_meta(
+        "_go2w_obstacle_class_id",
+        torch.zeros((N, selected_slots), dtype=torch.long, device=device),
+    ).clamp(min=0, max=HOSPITAL_CLASS_COUNT - 1)
+    priority = gather_meta(
+        "_go2w_obstacle_priority",
+        torch.full((N, selected_slots), 0.5, device=device),
+    )
+    height = gather_meta("_go2w_obstacle_height", torch.zeros((N, selected_slots), device=device))
+    top_z = gather_meta("_go2w_obstacle_top_z", height)
+    low_flag = gather_meta("_go2w_obstacle_low_flag", torch.zeros_like(height)).float()
+    dynamic_flag = gather_meta("_go2w_obstacle_dynamic_mask", torch.zeros_like(height)).float()
 
     obs_vel_w = torch.stack(
         [env.scene[n].data.root_lin_vel_w[:, :3] for n in obstacle_names], dim=1

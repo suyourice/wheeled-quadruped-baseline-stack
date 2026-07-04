@@ -51,50 +51,49 @@ def hospital_centerline_metrics(
     )
 
     centerline = env._go2w_structured_corridor_centerline_local
+    P = centerline.shape[1]
     count = getattr(
         env,
         "_go2w_structured_corridor_centerline_count",
-        torch.full((n_envs,), centerline.shape[1], dtype=torch.long, device=device),
+        torch.full((n_envs,), P, dtype=torch.long, device=device),
     )
-    best_abs = torch.full((n_envs,), float("inf"), device=device)
-    best_signed = torch.zeros(n_envs, device=device)
-    best_heading = torch.zeros(n_envs, device=device)
-    best_segment_idx = torch.zeros(n_envs, dtype=torch.long, device=device)
 
-    for segment_idx in range(centerline.shape[1] - 1):
-        valid = count > segment_idx + 1
-        a = centerline[:, segment_idx]
-        b = centerline[:, segment_idx + 1]
-        seg = b - a
-        seg_len_sq = (seg * seg).sum(dim=-1).clamp(min=1.0e-8)
-        u = ((local_xy - a) * seg).sum(dim=-1) / seg_len_sq
-        closest = a + u.clamp(0.0, 1.0).unsqueeze(-1) * seg
-        delta = local_xy - closest
-        seg_len = seg_len_sq.sqrt()
-        nx = -seg[:, 1] / seg_len
-        ny = seg[:, 0] / seg_len
-        signed = delta[:, 0] * nx + delta[:, 1] * ny
-        abs_signed = signed.abs()
-        update = valid & (abs_signed < best_abs)
-        best_abs = torch.where(update, abs_signed, best_abs)
-        best_signed = torch.where(update, signed, best_signed)
-        best_heading = torch.where(update, torch.atan2(seg[:, 1], seg[:, 0]), best_heading)
-        best_segment_idx = torch.where(
-            update,
-            torch.full_like(best_segment_idx, segment_idx),
-            best_segment_idx,
-        )
+    # Vectorised projection over all P-1 segments simultaneously.
+    a = centerline[:, :-1]
+    b = centerline[:, 1:]
+    seg = b - a
+    seg_len_sq = (seg * seg).sum(dim=-1).clamp(min=1.0e-8)
 
-    curvature = torch.zeros(n_envs, device=device)
-    for segment_idx in range(centerline.shape[1] - 2):
-        a = centerline[:, segment_idx]
-        b = centerline[:, segment_idx + 1]
-        c = centerline[:, segment_idx + 2]
-        h0 = torch.atan2(b[:, 1] - a[:, 1], b[:, 0] - a[:, 0])
-        h1 = torch.atan2(c[:, 1] - b[:, 1], c[:, 0] - b[:, 0])
-        turn = wrap_to_pi(h1 - h0).abs()
-        mask = (best_segment_idx == segment_idx) & (count > segment_idx + 2)
-        curvature = torch.where(mask, turn, curvature)
+    robot_exp = local_xy.unsqueeze(1)
+    u = ((robot_exp - a) * seg).sum(dim=-1) / seg_len_sq
+    closest = a + u.clamp(0.0, 1.0).unsqueeze(-1) * seg
+    delta = robot_exp - closest
+
+    seg_len = seg_len_sq.sqrt()
+    nx = -seg[..., 1] / seg_len
+    ny = seg[..., 0] / seg_len
+    signed = delta[..., 0] * nx + delta[..., 1] * ny
+    abs_signed = signed.abs()
+
+    seg_idx_range = torch.arange(P - 1, device=device).unsqueeze(0)
+    valid = count.unsqueeze(1) > seg_idx_range + 1
+    abs_signed_masked = torch.where(valid, abs_signed, torch.full_like(abs_signed, float("inf")))
+
+    _, best_seg_idx = abs_signed_masked.min(dim=1)
+    row = torch.arange(n_envs, device=device)
+    best_signed = signed[row, best_seg_idx]
+    best_heading = torch.atan2(seg[row, best_seg_idx, 1], seg[row, best_seg_idx, 0])
+
+    # Curvature: turn angle at the corner after the best segment.
+    if P >= 3:
+        h0 = torch.atan2(seg[:, :-1, 1], seg[:, :-1, 0])
+        h1 = torch.atan2(seg[:, 1:, 1], seg[:, 1:, 0])
+        curvature_all = wrap_to_pi(h1 - h0).abs()
+        curv_idx = best_seg_idx.clamp(max=P - 3)
+        curv_valid = (count > best_seg_idx + 2) & (best_seg_idx < P - 2)
+        curvature = torch.where(curv_valid, curvature_all[row, curv_idx], torch.zeros(n_envs, device=device))
+    else:
+        curvature = torch.zeros(n_envs, device=device)
 
     if hasattr(env, "_go2w_hospital_path_reversed"):
         best_heading = torch.where(

@@ -412,6 +412,7 @@ def reset_hospital_maze_training(
     reset_robot_pose: bool = True,
     force_path_id: int | None = None,
     curriculum_iteration_offset: int = 0,
+    corridor_width_max: float | None = None,
     debug_vis: bool = False,
 ) -> None:
     """Reset envs into the 5×5 junction-grid maze with actor-only corridor obstacles."""
@@ -485,9 +486,34 @@ def reset_hospital_maze_training(
         phase_indices = torch.full((n,), phase_id, dtype=torch.long, device=device)
         reversed_flags = torch.zeros(n, dtype=torch.bool, device=device)
     else:
-        layout_indices = env._go2w_hospital_layout_id[env_ids].clone()
         phase_indices = env._go2w_hospital_phase_id[env_ids].clone()
-        reversed_flags = ~env._go2w_hospital_path_reversed[env_ids]
+        reversed_flags = torch.zeros(n, dtype=torch.bool, device=device)
+        old_layout = env._go2w_hospital_layout_id[env_ids]
+        old_reversed = env._go2w_hospital_path_reversed[env_ids]
+        layout_indices = torch.zeros(n, dtype=torch.long, device=device)
+        for _li in range(n):
+            old_id = int(old_layout[_li].item())
+            was_rev = bool(old_reversed[_li].item())
+            s_j = old_id // _NUM_J
+            e_j = old_id % _NUM_J
+            # robot is at the junction it just reached
+            cur_j = s_j if was_rev else e_j
+            max_path_steps = (
+                HOSPITAL_TRAIN_LONG_PATH_MAX_STEPS
+                if torch.rand((), device=device).item() < HOSPITAL_TRAIN_LONG_PATH_PROBABILITY
+                else HOSPITAL_TRAIN_MAX_PATH_STEPS
+            )
+            chosen = False
+            for _ in range(80):
+                new_j = int(torch.randint(0, _NUM_J, (1,)).item())
+                if new_j != cur_j:
+                    _steps = (abs(_j_xs[cur_j] - _j_xs[new_j]) + abs(_j_ys[cur_j] - _j_ys[new_j])) / 10.0
+                    if _MIN_PATH_STEPS <= _steps <= max_path_steps:
+                        layout_indices[_li] = cur_j * _NUM_J + new_j
+                        chosen = True
+                        break
+            if not chosen:
+                layout_indices[_li] = cur_j * _NUM_J + ((cur_j + 1) % _NUM_J)
 
     active_mask = torch.zeros(n, k, dtype=torch.bool, device=device)
     obstacle_yaws = torch.zeros(n, k, device=device)
@@ -533,7 +559,12 @@ def reset_hospital_maze_training(
             env_actor_count_cap = actor_count_cap
         else:
             env_target_spacing, env_actor_count_cap = _phase_settings_by_id(local_phase)
-        env_width = HOSPITAL_TRAIN_CORRIDOR_WIDTH
+        if corridor_width_max is not None:
+            env_width = float(
+                torch.empty(1, device=device).uniform_(HOSPITAL_TRAIN_CORRIDOR_WIDTH, corridor_width_max).item()
+            )
+        else:
+            env_width = HOSPITAL_TRAIN_CORRIDOR_WIDTH
 
         layout_id = int(layout_indices[_li].item())
         start_idx = layout_id // _NUM_J
@@ -739,6 +770,7 @@ def reset_hospital_maze_training(
         park_distance=park_distance,
         reset_robot_pose=False,
         force_path_id=force_path_id,
+        corridor_width_max=corridor_width_max,
         debug_vis=debug_vis,
     )
     update_navigation_path_waypoint(
