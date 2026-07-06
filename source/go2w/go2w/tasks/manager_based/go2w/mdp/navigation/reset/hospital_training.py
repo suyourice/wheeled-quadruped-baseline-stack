@@ -498,6 +498,8 @@ def reset_hospital_maze_training(
             e_j = old_id % _NUM_J
             # robot is at the junction it just reached
             cur_j = s_j if was_rev else e_j
+            # junction the robot came FROM — exclude it to prevent exact reverse path
+            prev_j = e_j if was_rev else s_j
             max_path_steps = (
                 HOSPITAL_TRAIN_LONG_PATH_MAX_STEPS
                 if torch.rand((), device=device).item() < HOSPITAL_TRAIN_LONG_PATH_PROBABILITY
@@ -506,14 +508,15 @@ def reset_hospital_maze_training(
             chosen = False
             for _ in range(80):
                 new_j = int(torch.randint(0, _NUM_J, (1,)).item())
-                if new_j != cur_j:
+                if new_j != cur_j and new_j != prev_j:
                     _steps = (abs(_j_xs[cur_j] - _j_xs[new_j]) + abs(_j_ys[cur_j] - _j_ys[new_j])) / 10.0
                     if _MIN_PATH_STEPS <= _steps <= max_path_steps:
                         layout_indices[_li] = cur_j * _NUM_J + new_j
                         chosen = True
                         break
             if not chosen:
-                layout_indices[_li] = cur_j * _NUM_J + ((cur_j + 1) % _NUM_J)
+                new_j = (prev_j + 2) % _NUM_J if (prev_j + 2) % _NUM_J != cur_j else (prev_j + 3) % _NUM_J
+                layout_indices[_li] = cur_j * _NUM_J + new_j
 
     active_mask = torch.zeros(n, k, dtype=torch.bool, device=device)
     obstacle_yaws = torch.zeros(n, k, device=device)

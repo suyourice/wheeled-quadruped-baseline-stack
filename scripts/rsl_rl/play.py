@@ -1471,7 +1471,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-        runner.load(resume_path)
+        if agent_cfg.class_name == "DistillationRunner":
+            # Inference only uses the student policy.  Some play/eval envs expose a
+            # teacher obs shape that differs from the distillation checkpoint.
+            runner.load(
+                resume_path,
+                load_cfg={"student": True, "teacher": False, "optimizer": False, "iteration": True},
+            )
+        else:
+            runner.load(resume_path)
 
         # obtain the trained policy for inference
         policy = runner.get_inference_policy(device=env.unwrapped.device)
