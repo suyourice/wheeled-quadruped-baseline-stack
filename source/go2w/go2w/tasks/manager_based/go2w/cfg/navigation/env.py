@@ -46,9 +46,12 @@ from ...mdp.navigation.hospital.terrain import HospitalMazeSubTerrainCfg
 from ..locomotion.env import EventCfg, Go2wEnvCfg, Go2wSceneCfg
 from .rewards import NavHospitalTeacherRewardsCfg, NavTeacherRewardsCfg
 from .observations import (
-    NavDepthRLDistillObsCfg,
+    NavDepthHospitalRLDistillLongHistObsCfg,
+    NavDepthHospitalRLDistillMultiCamObsCfg,
+    NavDepthHospitalRLDistillObsCfg,
     NavDepthRLDistillLongHistObsCfg,
     NavDepthRLDistillMultiCamObsCfg,
+    NavDepthRLDistillObsCfg,
     NavHospitalTeacherObsCfg,
     NavRLDistillObsCfg,
     NavTeacherObsCfg,
@@ -195,7 +198,7 @@ class HospitalTeacherSceneCfg(Go2wSceneCfg):
 
     Each tile (48x48m) contains a dense corridor network with 25 junctions.
     difficulty_range=(0,1) causes each tile to get a random corridor width
-    between 2.8m and 3.4m, baked into the static mesh at scene creation.
+    between 2.8m and 3.6m, baked into the static mesh at scene creation.
     """
 
     replicate_physics: bool = False
@@ -303,6 +306,37 @@ def _make_depth_camera_cfg(rot_wxyz=None) -> MultiMeshRayCasterCameraCfg:
         ],
         debug_vis=False,
     )
+
+
+def _make_maze_depth_camera_cfg(rot_wxyz=None) -> MultiMeshRayCasterCameraCfg:
+    """Depth camera targeting hospital maze walls and actors."""
+    cfg = _make_depth_camera_cfg(rot_wxyz)
+    cfg.mesh_prim_paths = [
+        "/World/terrain",
+        MultiMeshRayCasterCfg.RaycastTargetCfg(
+            prim_expr="{ENV_REGEX_NS}/obstacle_.*",
+            track_mesh_transforms=True,
+            is_shared=True,
+        ),
+    ]
+    return cfg
+
+
+@configclass
+class HospitalTeacherDepthSceneCfg(HospitalTeacherSceneCfg):
+    """Hospital maze scene with a single depth camera for distillation."""
+
+    depth_camera = _make_maze_depth_camera_cfg()
+
+
+@configclass
+class HospitalTeacherMultiCamDepthSceneCfg(HospitalTeacherSceneCfg):
+    """Hospital maze scene with 4-camera rig for abl-A distillation."""
+
+    depth_camera       = _make_maze_depth_camera_cfg()
+    depth_camera_left  = _make_maze_depth_camera_cfg(D456_CAMERA_LEFT_QUAT_WXYZ)
+    depth_camera_right = _make_maze_depth_camera_cfg(D456_CAMERA_RIGHT_QUAT_WXYZ)
+    depth_camera_rear  = _make_maze_depth_camera_cfg(D456_CAMERA_REAR_QUAT_WXYZ)
 
 
 @configclass
@@ -481,7 +515,8 @@ def _configure_play_common(cfg) -> None:
 
 def _configure_play_obstacle_obs(obs_group) -> None:
     """Redirect privileged obstacle obs to the smaller PLAY obstacle set."""
-    obs_group.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
+    if "obstacle_names" in obs_group.obstacle_depth.params:
+        obs_group.obstacle_depth.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
     obs_group.obstacle_nav_features.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
     obs_group.obstacle_full_geometry.params["obstacle_names"] = PLAY_OBSTACLE_NAMES
 
@@ -546,7 +581,7 @@ class Go2wNavTeacherEnvCfg(Go2wEnvCfg):
 
 @configclass
 class Go2wHospitalTeacherEnvCfg(Go2wNavTeacherEnvCfg):
-    """Scratch PPO teacher trained in static hospital-style corridor mazes."""
+    """Scratch PPO teacher trained in hospital maze corridors."""
 
     scene: HospitalTeacherSceneCfg = HospitalTeacherSceneCfg(num_envs=8192, env_spacing=48.0)
     observations: NavHospitalTeacherObsCfg = NavHospitalTeacherObsCfg()
@@ -559,7 +594,7 @@ class Go2wHospitalTeacherEnvCfg(Go2wNavTeacherEnvCfg):
         if self.scene.lidar is not None:
             self.scene.lidar.update_period = self.decimation * self.sim.dt
 
-        # Keep the static-corridor MVP homogeneous and compatible with the
+        # Keep the maze teacher homogeneous and compatible with the
         # replicated-physics clone path used for high env counts.
         self.events.physics_material = None
         self.events.add_base_mass = None
@@ -573,6 +608,7 @@ class Go2wHospitalTeacherEnvCfg(Go2wNavTeacherEnvCfg):
             "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
             "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
             "curriculum_iteration_offset": 0,
+            "corridor_width_max": 3.6,
         }
         self.events.navigation_path_update = EventTerm(
             func=mdp.update_navigation_path_waypoint_event,
@@ -834,3 +870,56 @@ class Go2wNavDepthMultiCamRLDistillEnvCfg_PLAY(Go2wNavDepthMultiCamRLDistillEnvC
         self.observations.student_state.enable_corruption = False
         self.observations.student_depth.enable_corruption = False
         _configure_play_obstacle_obs(self.observations.teacher)
+
+
+# =============================================================================
+# Hospital Maze Depth Distillation
+# =============================================================================
+
+
+@configclass
+class Go2wHospitalDepthRLDistillEnvCfg(Go2wHospitalTeacherEnvCfg):
+    """Depth-camera student distillation in the hospital maze env."""
+
+    scene: HospitalTeacherDepthSceneCfg = HospitalTeacherDepthSceneCfg(
+        num_envs=DEPTH_DISTILL_NUM_ENVS, env_spacing=48.0
+    )
+    observations: NavDepthHospitalRLDistillObsCfg = NavDepthHospitalRLDistillObsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.depth_camera.update_period = self.decimation * self.sim.dt
+        self.events.reset_obstacles.params["steps_per_iteration"] = 30
+
+
+@configclass
+class Go2wHospitalDepthLongHistRLDistillEnvCfg(Go2wHospitalDepthRLDistillEnvCfg):
+    """Hospital maze depth distillation with 8-frame dense history (abl-D)."""
+
+    observations: NavDepthHospitalRLDistillLongHistObsCfg = NavDepthHospitalRLDistillLongHistObsCfg()
+
+
+@configclass
+class Go2wHospitalDepthSparseRLDistillEnvCfg(Go2wHospitalDepthRLDistillEnvCfg):
+    """Hospital maze depth distillation with sparse history stride-5 (abl-B)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.depth_camera.update_period = (
+            DEPTH_CAMERA_SPARSE_STRIDE * self.decimation * self.sim.dt
+        )
+
+
+@configclass
+class Go2wHospitalDepthMultiCamRLDistillEnvCfg(Go2wHospitalDepthRLDistillEnvCfg):
+    """Hospital maze depth distillation with 4-camera 360 deg rig (abl-A)."""
+
+    scene: HospitalTeacherMultiCamDepthSceneCfg = HospitalTeacherMultiCamDepthSceneCfg(
+        num_envs=DEPTH_DISTILL_NUM_ENVS, env_spacing=48.0
+    )
+    observations: NavDepthHospitalRLDistillMultiCamObsCfg = NavDepthHospitalRLDistillMultiCamObsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        for cam_attr in ("depth_camera", "depth_camera_left", "depth_camera_right", "depth_camera_rear"):
+            getattr(self.scene, cam_attr).update_period = self.decimation * self.sim.dt

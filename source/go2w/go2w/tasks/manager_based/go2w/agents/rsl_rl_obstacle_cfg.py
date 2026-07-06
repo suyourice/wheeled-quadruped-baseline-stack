@@ -65,10 +65,10 @@ class NavTeacherRunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class NavHospitalTeacherRunnerCfg(NavTeacherRunnerCfg):
-    """Scratch PPO runner for the static hospital-corridor teacher."""
+    """Scratch PPO runner for the hospital maze teacher."""
 
     num_steps_per_env = 96
-    max_iterations = 1500
+    max_iterations = 1300
     save_interval = 100
     experiment_name = "go2w_nav_hospital_teacher_rl"
     logger = "wandb"
@@ -100,7 +100,7 @@ class NavHospitalTeacherRunnerCfg(NavTeacherRunnerCfg):
 
 @configclass
 class SimpleNavDistillAlgorithmCfg(RslRlDistillationAlgorithmCfg):
-    """Pure action-MSE distillation algorithm."""
+    """Action-imitation distillation algorithm."""
 
     class_name: str = (
         "go2w.tasks.manager_based.go2w.distillation_algorithms:SimpleActionDistillation"
@@ -236,3 +236,50 @@ class NavDepthMultiCamRLDistillRunnerCfg(NavDepthRLDistillRunnerCfg):
 
     experiment_name = "go2w_nav_depth_multicam_distill"
     wandb_project = "go2w_nav_depth_multicam_distill"
+
+
+# =============================================================================
+# Hospital Maze Depth Distillation runners
+# =============================================================================
+
+
+@configclass
+class NavDepthHospitalRLDistillRunnerCfg(NavDepthRLDistillRunnerCfg):
+    """Distillation runner: hospital maze teacher to depth-CNN student."""
+
+    max_iterations = 1000
+    experiment_name = "go2w_nav_depth_hospital_distill"
+    wandb_project = "go2w_nav_depth_hospital_distill"
+    algorithm = SimpleNavDistillAlgorithmCfg(
+        num_learning_epochs=4,
+        learning_rate=5.0e-4,
+        gradient_length=8,
+        max_grad_norm=1.0,
+        loss_type="mse",
+        action_loss_weight=1.0,
+        safety_loss_weight=0.0,
+    )
+
+
+@configclass
+class NavDepthHospitalLongHistRLDistillRunnerCfg(NavDepthHospitalRLDistillRunnerCfg):
+    """Hospital maze distillation runner for 8-frame long history (abl-D)."""
+
+    experiment_name = "go2w_nav_depth_hospital_longhist_distill"
+    wandb_project = "go2w_nav_depth_hospital_longhist_distill"
+
+
+@configclass
+class NavDepthHospitalSparseRLDistillRunnerCfg(NavDepthHospitalRLDistillRunnerCfg):
+    """Hospital maze distillation runner for sparse history stride-5 (abl-B)."""
+
+    experiment_name = "go2w_nav_depth_hospital_sparse_distill"
+    wandb_project = "go2w_nav_depth_hospital_sparse_distill"
+
+
+@configclass
+class NavDepthHospitalMultiCamRLDistillRunnerCfg(NavDepthHospitalRLDistillRunnerCfg):
+    """Hospital maze distillation runner for 4-camera 360 deg rig (abl-A)."""
+
+    experiment_name = "go2w_nav_depth_hospital_multicam_distill"
+    wandb_project = "go2w_nav_depth_hospital_multicam_distill"

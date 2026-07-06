@@ -202,8 +202,7 @@ gym.register(
 )
 
 # =============================================================================
-# Hospital Teacher obs (369D) play environments
-# Structured corridor layouts evaluated with the hospital maze teacher checkpoint.
+# Hospital Teacher structured corridor play environments (v0)
 # =============================================================================
 
 gym.register(
@@ -232,6 +231,37 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherFloorPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+# Hospital Teacher structured corridor play (v1 training lidar).
+gym.register(
+    id="Nav-Hospital-Teacher-LCorridor-Go2w-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherLCorridorPlayEnvCfgV1",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Nav-Hospital-Teacher-Ward-Go2w-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherWardPlayEnvCfgV1",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Nav-Hospital-Teacher-Floor-Go2w-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherFloorPlayEnvCfgV1",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
     },
 )
@@ -331,5 +361,49 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorMultiCamDepthPlayEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthMultiCamRLDistillRunnerCfg",
+    },
+)
+
+# =============================================================================
+# Hospital Maze Depth Distillation
+# =============================================================================
+
+gym.register(
+    id="Navigation-Depth-Hospital-Distill-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wHospitalDepthRLDistillEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Distill-LongHist-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wHospitalDepthLongHistRLDistillEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalLongHistRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Distill-Sparse-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wHospitalDepthSparseRLDistillEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalSparseRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Distill-4Cam-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wHospitalDepthMultiCamRLDistillEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalMultiCamRLDistillRunnerCfg",
     },
 )

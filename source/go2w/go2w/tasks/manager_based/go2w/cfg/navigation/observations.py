@@ -378,3 +378,40 @@ class NavDepthRLDistillMultiCamObsCfg(NavDepthRLDistillObsCfg):
             self.concatenate_terms = True
 
     student_depth: StudentDepthMultiCamCfg = StudentDepthMultiCamCfg()
+
+
+@configclass
+class NavDepthHospitalRLDistillObsCfg(NavDepthRLDistillObsCfg):
+    """Depth distillation obs for the hospital maze teacher (393D teacher).
+
+    student_state(15D) + student_depth(T*H*W) + teacher(393D hospital lidar+features).
+    Teacher obs matches NavHospitalTeacherObsCfg.PolicyCfg exactly.
+    """
+
+    @configclass
+    class HospitalTeacherCfg(NavHospitalTeacherObsCfg.PolicyCfg):
+        pass
+
+    teacher: HospitalTeacherCfg = HospitalTeacherCfg()
+
+
+@configclass
+class NavDepthHospitalRLDistillLongHistObsCfg(NavDepthHospitalRLDistillObsCfg):
+    """Hospital maze distillation obs with 8-frame dense depth history (abl-D)."""
+
+    @configclass
+    class StudentDepthLongHistCfg(NavDepthRLDistillLongHistObsCfg.StudentDepthLongHistCfg):
+        pass
+
+    student_depth: StudentDepthLongHistCfg = StudentDepthLongHistCfg()
+
+
+@configclass
+class NavDepthHospitalRLDistillMultiCamObsCfg(NavDepthHospitalRLDistillObsCfg):
+    """Hospital maze distillation obs with 4-camera 360 deg depth rig (abl-A)."""
+
+    @configclass
+    class StudentDepthMultiCamCfg(NavDepthRLDistillMultiCamObsCfg.StudentDepthMultiCamCfg):
+        pass
+
+    student_depth: StudentDepthMultiCamCfg = StudentDepthMultiCamCfg()

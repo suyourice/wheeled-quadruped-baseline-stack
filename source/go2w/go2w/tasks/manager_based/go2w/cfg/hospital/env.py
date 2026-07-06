@@ -14,6 +14,7 @@ is available for dynamic actors.
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import MultiMeshRayCasterCfg
+from isaaclab.sensors import patterns as _sensor_patterns
 from isaaclab.utils import configclass
 
 from ... import mdp
@@ -207,9 +208,9 @@ def _structured_path_update_event() -> EventTerm:
         interval_range_s=(0.0, 0.0),
         params={
             "lookahead_distance": 1.25,
-            "waypoint_reach_radius": 0.45,
+            "waypoint_reach_radius": NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
             "adaptive_lookahead": True,
-            "lookahead_min": 0.6,
+            "lookahead_min": 0.55,
             "curvature_scan_horizon": 2.5,
             "curvature_threshold": 0.3,
         },
@@ -411,9 +412,9 @@ def _base_structured_reset_params() -> dict:
         "corner_rounding":             True,
         "corner_radius":               0.80,
         "lookahead_distance":          1.25,
-        "waypoint_reach_radius":       0.45,
+        "waypoint_reach_radius":       NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
         "adaptive_lookahead":          True,
-        "lookahead_min":               0.6,
+        "lookahead_min":               0.55,
         "curvature_scan_horizon":      2.5,
         "curvature_threshold":         0.3,
     }
@@ -673,36 +674,34 @@ class Go2wHospitalTeacherPlayEnvCfg(Go2wHospitalTeacherEnvCfg):
 
 
 # =============================================================================
-# Hospital Teacher obs (369D) variants of the structured corridor play envs
-# These extend the terrain-wall base envs and override observations only.
+# Hospital Teacher structured corridor play envs (v0)
 # =============================================================================
+
+
+def _configure_hospital_teacher_play_obs(obs_group) -> None:
+    """Use hospital teacher actor slots for privileged play observations."""
+    obs_group.obstacle_nav_features.params["obstacle_names"] = HOSPITAL_TRAIN_OBSTACLE_NAMES
+    obs_group.obstacle_full_geometry.params["obstacle_names"] = HOSPITAL_TRAIN_OBSTACLE_NAMES
+    obs_group.enable_corruption = False
 
 
 @configclass
 class Go2wHospitalTeacherLCorridorPlayEnvCfg(Go2wHospitalPlayEnvCfg):
-    """L-corridor hospital play env — Hospital Teacher obs (369D).
+    """L-corridor play env with hospital-teacher privileged observations.
 
-    Same terrain-wall layout and actors as ``Go2wHospitalPlayEnvCfg`` but uses
-    the 369D hospital-teacher obs so the maze teacher checkpoint loads without a
-    size mismatch.  The policy sees the first 12 obstacle slots (matching the
-    training distribution).
+    Same terrain-wall layout and actors as ``Go2wHospitalPlayEnvCfg``.
     """
 
     observations: NavHospitalTeacherObsCfg = NavHospitalTeacherObsCfg()
 
     def __post_init__(self):
         super().__post_init__()
-        # super() calls _configure_play_obstacle_obs → retargets obs to 64 slots.
-        # Restore the 12-slot hospital teacher names so the obs dimension stays 369D.
-        self.observations.policy.obstacle_depth.params["obstacle_names"]         = HOSPITAL_TRAIN_OBSTACLE_NAMES
-        self.observations.policy.obstacle_nav_features.params["obstacle_names"]  = HOSPITAL_TRAIN_OBSTACLE_NAMES
-        self.observations.policy.obstacle_full_geometry.params["obstacle_names"] = HOSPITAL_TRAIN_OBSTACLE_NAMES
-        self.observations.policy.enable_corruption = False
+        _configure_hospital_teacher_play_obs(self.observations.policy)
 
 
 @configclass
 class Go2wHospitalTeacherWardPlayEnvCfg(Go2wHospitalPlayEnvCfg):
-    """Hospital-ward play env — Hospital Teacher obs (369D).
+    """Hospital-ward play env with hospital-teacher privileged observations.
 
     Inherits the nav-teacher L-corridor base and re-applies ward geometry on top.
     """
@@ -728,15 +727,12 @@ class Go2wHospitalTeacherWardPlayEnvCfg(Go2wHospitalPlayEnvCfg):
         self.episode_length_s = HOSPITAL_WARD_EPISODE_LENGTH_S
         self.scene.env_spacing = HOSPITAL_WARD_ENV_SPACING
         _set_structured_goal_termination(self, HOSPITAL_WARD_GOAL_DONE_RADIUS)
-        self.observations.policy.obstacle_depth.params["obstacle_names"]         = HOSPITAL_TRAIN_OBSTACLE_NAMES
-        self.observations.policy.obstacle_nav_features.params["obstacle_names"]  = HOSPITAL_TRAIN_OBSTACLE_NAMES
-        self.observations.policy.obstacle_full_geometry.params["obstacle_names"] = HOSPITAL_TRAIN_OBSTACLE_NAMES
-        self.observations.policy.enable_corruption = False
+        _configure_hospital_teacher_play_obs(self.observations.policy)
 
 
 @configclass
 class Go2wHospitalTeacherFloorPlayEnvCfg(Go2wHospitalPlayEnvCfg):
-    """Full-floor play env — Hospital Teacher obs (369D).
+    """Full-floor play env with hospital-teacher privileged observations.
 
     Inherits the nav-teacher L-corridor base and re-applies full-floor geometry,
     ramps, semantic labels, and actor overrides on top.
@@ -772,10 +768,64 @@ class Go2wHospitalTeacherFloorPlayEnvCfg(Go2wHospitalPlayEnvCfg):
         self.episode_length_s = HOSPITAL_FLOOR_EPISODE_LENGTH_S
         self.scene.env_spacing = HOSPITAL_FLOOR_ENV_SPACING
         _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
-        self.observations.policy.obstacle_depth.params["obstacle_names"]         = HOSPITAL_TRAIN_OBSTACLE_NAMES
-        self.observations.policy.obstacle_nav_features.params["obstacle_names"]  = HOSPITAL_TRAIN_OBSTACLE_NAMES
-        self.observations.policy.obstacle_full_geometry.params["obstacle_names"] = HOSPITAL_TRAIN_OBSTACLE_NAMES
-        self.observations.policy.enable_corruption = False
+        _configure_hospital_teacher_play_obs(self.observations.policy)
+
+
+# =============================================================================
+# Hospital Teacher structured corridor play envs (v1 training lidar)
+# =============================================================================
+
+
+def _make_hospital_teacher_lidar_cfg() -> MultiMeshRayCasterCfg:
+    """Training lidar for hospital maze teacher play."""
+    return MultiMeshRayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base",
+        offset=MultiMeshRayCasterCfg.OffsetCfg(pos=HOSPITAL_RAYCAST_SENSOR_OFFSET),
+        ray_alignment="yaw",
+        pattern_cfg=_sensor_patterns.LidarPatternCfg(
+            channels=HOSPITAL_RAYCAST_CHANNELS,
+            vertical_fov_range=HOSPITAL_RAYCAST_VERTICAL_FOV,
+            horizontal_fov_range=HOSPITAL_RAYCAST_HORIZONTAL_FOV,
+            horizontal_res=HOSPITAL_RAYCAST_HORIZONTAL_RES,
+        ),
+        max_distance=HOSPITAL_RAYCAST_MAX_DISTANCE,
+        mesh_prim_paths=[
+            "/World/terrain",
+            MultiMeshRayCasterCfg.RaycastTargetCfg(
+                prim_expr="{ENV_REGEX_NS}/obstacle_.*",
+                track_mesh_transforms=True,
+                is_shared=True,
+            ),
+        ],
+        debug_vis=False,
+    )
+
+
+@configclass
+class Go2wHospitalTeacherLCorridorPlayEnvCfgV1(Go2wHospitalTeacherLCorridorPlayEnvCfg):
+    """L-corridor play env with hospital teacher training lidar."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.lidar = _make_hospital_teacher_lidar_cfg()
+
+
+@configclass
+class Go2wHospitalTeacherWardPlayEnvCfgV1(Go2wHospitalTeacherWardPlayEnvCfg):
+    """Ward play env with hospital teacher training lidar."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.lidar = _make_hospital_teacher_lidar_cfg()
+
+
+@configclass
+class Go2wHospitalTeacherFloorPlayEnvCfgV1(Go2wHospitalTeacherFloorPlayEnvCfg):
+    """Full-floor play env with hospital teacher training lidar."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.lidar = _make_hospital_teacher_lidar_cfg()
 
 
 # =============================================================================

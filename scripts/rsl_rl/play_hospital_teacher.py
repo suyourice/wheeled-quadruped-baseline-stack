@@ -120,6 +120,7 @@ from play_nav_debug import (  # isort: skip
     NAV_LIVE_LABEL_MAX,
     _LiveObstacleLabelDrawer,
     _get_hospital_live_annotations,
+    _print_nav_obstacle_label_log,
 )
 
 installed_version = metadata.version("rsl-rl-lib")
@@ -303,7 +304,13 @@ def _update_markers(base_env, markers: dict[str, VisualizationMarkers]) -> None:
         final_goal[2] += 0.95
         final_goals.append(final_goal)
 
-        path = base_env._go2w_navigation_path_w[env_index, :path_count, :3]
+        path_full = base_env._go2w_navigation_path_w[env_index, :path_count, :3]
+        _PATH_MARKER_MAX = 32
+        if path_count > _PATH_MARKER_MAX:
+            idx = torch.linspace(0, path_count - 1, _PATH_MARKER_MAX, device=device).long()
+            path = path_full[idx]
+        else:
+            path = path_full
         path_markers = _line_marker_transforms(path, z_offset=0.18)
         if path_markers is not None:
             positions, orientations, scales = path_markers
@@ -484,24 +491,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             f"(scale={NAV_LIVE_LABEL_SCALE:.3f}, max={label_drawer.max_labels})"
         )
 
+    def _save_plot_and_log():
+        sys.stdout = sys.__stdout__
+        if _out_log_file is not None:
+            _out_log_file.flush()
+        if _out_dir is not None:
+            _nav_log = os.path.join(_out_dir, "nav_debug.log")
+            _plot_cmd = [sys.executable, "scripts/plot_nav_debug.py", _nav_log, "--output_dir", _out_dir]
+            sys.__stdout__.write("[INFO] Generating nav debug plot ...\n")
+            sys.__stdout__.flush()
+            result = subprocess.run(_plot_cmd, capture_output=True, text=True)
+            if result.stdout:
+                sys.__stdout__.write(result.stdout.strip() + "\n")
+            if result.returncode != 0 and result.stderr:
+                sys.__stdout__.write(f"[WARN] plot_nav_debug: {result.stderr.strip()}\n")
+        if _out_log_file is not None:
+            _out_log_file.close()
+
     def _finalize():
         label_drawer.clear()
         env.close()
-        if _out_dir is not None:
-            if _out_log_file is not None:
-                _out_log_file.flush()
-            _nav_log = os.path.join(_out_dir, "nav_debug.log")
-            _plot_cmd = [sys.executable, "scripts/plot_nav_debug.py", _nav_log, "--output_dir", _out_dir]
-            print("[INFO] Generating nav debug plot ...")
-            sys.stdout.flush()
-            result = subprocess.run(_plot_cmd, capture_output=True, text=True)
-            if result.stdout:
-                print(result.stdout.strip())
-            if result.returncode != 0 and result.stderr:
-                print(f"[WARN] plot_nav_debug: {result.stderr.strip()}")
-            if _out_log_file is not None:
-                sys.stdout = sys.__stdout__
-                _out_log_file.close()
 
     if args_cli.zero_policy:
         print("[INFO] Playing hospital teacher with zero policy for visual reset smoke.")
@@ -525,6 +534,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             if args_cli.follow_camera:
                 _set_camera(base_env)
             _print_state(base_env, step_count)
+            if args_cli.print_interval > 0 and step_count % args_cli.print_interval == 0:
+                _print_nav_obstacle_label_log(base_env, step_count, args_cli.env_index)
             if step_count % NAV_LIVE_LABEL_INTERVAL == 0:
                 label_drawer.update_many(base_env, _marker_env_indices(base_env))
             step_count += 1
@@ -535,6 +546,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     except KeyboardInterrupt:
         print("[INFO] KeyboardInterrupt — saving logs before exit.")
     finally:
+        _save_plot_and_log()
         _finalize()
 
 
