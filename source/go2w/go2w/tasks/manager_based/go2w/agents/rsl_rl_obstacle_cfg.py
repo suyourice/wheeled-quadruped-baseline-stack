@@ -247,7 +247,7 @@ class NavDepthMultiCamRLDistillRunnerCfg(NavDepthRLDistillRunnerCfg):
 class NavDepthHospitalRLDistillRunnerCfg(NavDepthRLDistillRunnerCfg):
     """Distillation runner: hospital maze teacher to depth-CNN student."""
 
-    max_iterations = 1000
+    max_iterations = 600
     experiment_name = "go2w_nav_depth_hospital_distill"
     wandb_project = "go2w_nav_depth_hospital_distill"
     algorithm = SimpleNavDistillAlgorithmCfg(

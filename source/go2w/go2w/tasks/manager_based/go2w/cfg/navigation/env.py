@@ -890,6 +890,7 @@ class Go2wHospitalDepthRLDistillEnvCfg(Go2wHospitalTeacherEnvCfg):
         super().__post_init__()
         self.scene.depth_camera.update_period = self.decimation * self.sim.dt
         self.events.reset_obstacles.params["steps_per_iteration"] = 30
+        self.events.reset_obstacles.params["curriculum_iteration_offset"] = 280
 
 
 @configclass
