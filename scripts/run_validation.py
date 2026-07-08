@@ -8,6 +8,7 @@ Usage:
 
 Key options:
     --out_name NAME       Sub-directory under logs/nav_play/ (default: validation_<timestamp>)
+    --ablation NAME       Run only one ablation (baseline/longhist/sparse/4cam); default: all
     --maze_episodes N     Episodes per ablation for maze (default: 200)
     --floor_episodes N    Episodes per ablation for floor (default: 50)
     --seed N              Base seed; each episode gets seed+k via --seed_per_episode (default: 42)
@@ -112,6 +113,8 @@ def main():
     parser.add_argument("--depth_video_steps", type=int, default=2000,
                         help="Max steps to record for depth video per run. 0=entire run. "
                         "Default 2000 ≈ first 2 episodes (~40s at 50Hz)")
+    parser.add_argument("--ablation", type=str, default=None,
+                        help="Run only this ablation (baseline/longhist/sparse/4cam). Default: all.")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--skip_plot", action="store_true",
                         help="Skip plot_validation.py after runs")
@@ -121,7 +124,16 @@ def main():
     out_name = args.out_name or f"validation_{ts}"
     out_base = os.path.join("logs", "nav_play", out_name)
 
+    ablations = ABLATIONS
+    if args.ablation:
+        ablations = [a for a in ABLATIONS if a["name"] == args.ablation]
+        if not ablations:
+            print(f"[run_validation] ERROR: unknown ablation '{args.ablation}'. "
+                  f"Valid: {[a['name'] for a in ABLATIONS]}", file=sys.stderr)
+            sys.exit(1)
+
     print(f"[run_validation] Output base: {out_base}")
+    print(f"[run_validation] Ablations: {[a['name'] for a in ablations]}")
     print(f"[run_validation] Maze episodes: {args.maze_episodes}  Floor episodes: {args.floor_episodes}")
     print(f"[run_validation] Seed: {args.seed} (per-episode increment enabled)")
     print(f"[run_validation] Stuck timeout: {args.stuck_timeout} steps")
@@ -129,7 +141,7 @@ def main():
 
     failures = []
 
-    for abl in ABLATIONS:
+    for abl in ablations:
         name = abl["name"]
         ckpt = abl["checkpoint"]
 
