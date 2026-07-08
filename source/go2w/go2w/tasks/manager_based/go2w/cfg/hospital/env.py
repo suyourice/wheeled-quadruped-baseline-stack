@@ -331,13 +331,17 @@ def _apply_mesh_wall_overrides(
         visual_material=_sim_utils.PreviewSurfaceCfg(diffuse_color=(0.58, 0.60, 0.64)),
     )
 
-    # 2. Add /World/terrain to all depth camera ray-cast targets if present
+    # 2. Add /World/terrain to all depth camera ray-cast targets if present.
+    # Also strip /World/ground — the wall terrain mesh has no floor geometry, so
+    # keeping ground here would add baselevel depth hits absent from maze training.
     for _cam_attr in ("depth_camera", "depth_camera_left", "depth_camera_right", "depth_camera_rear"):
         _cam = getattr(cfg.scene, _cam_attr, None)
         if _cam is not None:
-            _existing = list(_cam.mesh_prim_paths)
+            _existing = [p for p in _cam.mesh_prim_paths if not (isinstance(p, str) and p == "/World/ground")]
             if "/World/terrain" not in _existing:
                 _cam.mesh_prim_paths = ["/World/terrain"] + _existing
+            else:
+                _cam.mesh_prim_paths = _existing
 
     # 3. Re-assign obstacle asset shapes/colors (all actors now)
     _apply_hospital_obstacle_asset_overrides(cfg.scene, slot_tables)
@@ -648,7 +652,6 @@ class Go2wHospitalFloorDepthPlayEnvCfg(Go2wNavDepthRLDistillEnvCfg_PLAY):
         )
         self.events.navigation_path_update = _structured_path_update_event()
         _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
-        _include_hospital_ramp_in_depth_camera(self.scene)
 
 
 # =============================================================================
@@ -880,7 +883,6 @@ class Go2wHospitalFloorLongHistDepthPlayEnvCfg(Go2wNavDepthLongHistRLDistillEnvC
         )
         self.events.navigation_path_update = _structured_path_update_event()
         _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
-        _include_hospital_ramp_in_depth_camera(self.scene)
 
 
 @configclass
@@ -928,7 +930,6 @@ class Go2wHospitalFloorSparseDepthPlayEnvCfg(Go2wNavDepthSparseRLDistillEnvCfg_P
         )
         self.events.navigation_path_update = _structured_path_update_event()
         _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
-        _include_hospital_ramp_in_depth_camera(self.scene)
 
 
 @configclass
@@ -977,4 +978,3 @@ class Go2wHospitalFloorMultiCamDepthPlayEnvCfg(Go2wNavDepthMultiCamRLDistillEnvC
         )
         self.events.navigation_path_update = _structured_path_update_event()
         _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
-        _include_hospital_ramp_in_depth_camera(self.scene)
