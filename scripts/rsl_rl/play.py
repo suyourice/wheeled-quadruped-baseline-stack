@@ -487,6 +487,31 @@ parser.add_argument(
     help="Navigation play tasks only: aggregate this many completed episodes, then exit. Use 0 for endless play.",
 )
 parser.add_argument(
+    "--stuck_timeout_steps",
+    "--stuck-timeout-steps",
+    dest="stuck_timeout_steps",
+    type=int,
+    default=0,
+    help="Force-reset envs that haven't moved --stuck_threshold m in this many steps. 0=disabled.",
+)
+parser.add_argument(
+    "--stuck_threshold",
+    "--stuck-threshold",
+    dest="stuck_threshold",
+    type=float,
+    default=0.3,
+    help="Displacement threshold (m) for stuck detection. Default: 0.3.",
+)
+parser.add_argument(
+    "--seed_per_episode",
+    "--seed-per-episode",
+    dest="seed_per_episode",
+    action="store_true",
+    default=False,
+    help="Increment fixed_layout_seed by 1 per completed episode (requires --seed). "
+    "Ensures all ablation runs see the same sequence of layouts for fair comparison.",
+)
+parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument(
@@ -507,6 +532,15 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Save the student depth camera view as an MP4 video alongside the log.",
+)
+parser.add_argument(
+    "--depth_video_steps",
+    "--depth-video-steps",
+    dest="depth_video_steps",
+    type=int,
+    default=0,
+    help="Max steps to record for depth video. 0 = record entire run (default). "
+    "Use e.g. 2000 to capture only the first ~2 episodes.",
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument(
@@ -1527,6 +1561,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         termination_names.index("obstacle_contact") if "obstacle_contact" in termination_names else None
     )
     multi_term_episodes = 0
+    _stuck_termination_count = 0
 
     # Navigation visualization markers — only created for nav tasks.
     _base_env = env.unwrapped
@@ -1536,7 +1571,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _init_spl_tracking(_base_env, termination_names)
     )
     _nav_prev_robot_pos: torch.Tensor | None = None
+    _stuck_last_pos: torch.Tensor | None = None
+    _stuck_counter = torch.zeros(env.unwrapped.num_envs, dtype=torch.long)
     _nav_spl_history: list[float] = []
+    _goals_per_episode_history: list[float] = []
+    _path_progress_history: list[float] = []
     (
         _nav_goal_marker, _nav_final_goal_marker, _nav_start_marker, _nav_path_marker,
         _nav_has_goal_markers,
@@ -1631,6 +1670,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 obs = env.get_observations()
             # agent stepping
             actions = teacher(obs) if teacher is not None else policy(obs)
+            # Capture path progress before env.step() resets it for done envs.
+            _pre_step_path_progress = (
+                _base_env._go2w_navigation_path_progress_s.clone()
+                if hasattr(_base_env, "_go2w_navigation_path_progress_s") else None
+            )
             # env stepping
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
@@ -1642,7 +1686,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 policy_nn.reset(dones)
 
         # Collect depth camera frame for video recording.
-        if args_cli.depth_video:
+        _depth_video_limit = args_cli.depth_video_steps
+        if args_cli.depth_video and (_depth_video_limit == 0 or len(_depth_video_frames) < _depth_video_limit):
             _depth_sensor = _base_env.scene.sensors["depth_camera"]
             _depth_raw = _depth_sensor.data.output["distance_to_image_plane"]
             if _depth_raw.ndim == 4:
@@ -1664,6 +1709,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 done_cpu = dones.cpu().bool()
                 _nav_actual_len += torch.where(done_cpu, torch.zeros_like(step_disp), step_disp)
             _nav_prev_robot_pos = cur_robot_pos
+
+        # Stuck detection: force-reset envs that haven't moved enough in N steps.
+        if args_cli.stuck_timeout_steps > 0:
+            _cur_stuck_pos = _base_env.scene["robot"].data.root_pos_w[:, :2].cpu()
+            if _stuck_last_pos is None:
+                _stuck_last_pos = _cur_stuck_pos.clone()
+            else:
+                _disp = (_cur_stuck_pos - _stuck_last_pos).norm(dim=-1)
+                _moved = _disp >= args_cli.stuck_threshold
+                _stuck_last_pos[_moved] = _cur_stuck_pos[_moved]
+                _stuck_counter[_moved] = 0
+                _stuck_counter[~_moved & ~dones.cpu().bool()] += 1
+                _stuck_mask = _stuck_counter >= args_cli.stuck_timeout_steps
+                if _stuck_mask.any():
+                    _stuck_ids = _stuck_mask.nonzero(as_tuple=False).squeeze(-1).to(_base_env.device)
+                    _base_env.episode_length_buf[_stuck_ids] = _base_env.max_episode_length - 1
+                    _stuck_termination_count += int(_stuck_mask.sum().item())
+                    _stuck_counter[_stuck_mask] = 0
+                    _stuck_last_pos[_stuck_mask] = _cur_stuck_pos[_stuck_mask]
 
         # Track last HLC command (policy output = 3D velocity) for logging.
         last_hlc_cmd = actions.detach()
@@ -1699,6 +1763,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
         num_done = int(done_ids.numel())
         if num_done > 0:
+            if args_cli.stuck_timeout_steps > 0 and _stuck_last_pos is not None:
+                _done_cpu = done_ids.cpu()
+                _stuck_counter[_done_cpu] = 0
+                _stuck_last_pos[_done_cpu] = _base_env.scene["robot"].data.root_pos_w[:, :2].cpu()[_done_cpu]
             total_episode_length += float(episode_lengths[done_ids].sum().item())
             done_terms = (
                 termination_manager._last_episode_dones[done_ids] if termination_manager is not None else None
@@ -1720,8 +1788,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Reset collision count for episodes that just ended.
             for env_id in done_ids.tolist():
                 episode_collision_counts[env_id] = 0
+            # Record goals reached per episode before reset clears the counter.
+            if hasattr(_base_env, "_go2w_goals_reached_episode"):
+                for env_id in done_ids:
+                    _goals_per_episode_history.append(
+                        float(_base_env._go2w_goals_reached_episode[env_id].item())
+                    )
+            # Record path progress at episode end (captured pre-step, before reset zeroes it).
+            if _pre_step_path_progress is not None:
+                for env_id in done_ids:
+                    _path_progress_history.append(
+                        float(_pre_step_path_progress[env_id].item())
+                    )
             episode_lengths[done_ids] = 0
             completed_episodes += num_done
+
+            # Advance layout seed so each episode sees a unique layout (fair cross-ablation comparison).
+            # Only update if the key already exists — some reset functions (e.g. reset_hospital_maze_training,
+            # reset_structured_astar_corridor) don't accept fixed_layout_seed and would crash on **params.
+            if args_cli.seed_per_episode and args_cli.seed is not None:
+                try:
+                    _obs_term_cfg = _base_env.event_manager.get_term_cfg("reset_obstacles")
+                    if "fixed_layout_seed" in (_obs_term_cfg.params or {}):
+                        _obs_term_cfg.params["fixed_layout_seed"] = args_cli.seed + completed_episodes
+                except (ValueError, KeyError, AttributeError):
+                    pass
 
             # SPL: record contribution for each completed episode then reset trackers.
             if _spl_enabled and done_terms is not None and _goal_reached_term_idx is not None:
@@ -1794,13 +1885,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Write session manifest when --play_name is set.
     if _out_dir is not None:
         import json as _json
+        _tc = dict(termination_counts) if termination_counts else {}
+        if _stuck_termination_count > 0:
+            _tc["stuck_timeout"] = _stuck_termination_count
+        _spl_mean = float(sum(_nav_spl_history) / len(_nav_spl_history)) if _nav_spl_history else None
+        _avg_ep_len = total_episode_length / max(completed_episodes, 1)
+        _success_rate = (
+            _tc.get("goal_reached", 0) + _tc.get("structured_goal_reached", 0)
+        ) / max(completed_episodes, 1)
+        _goals_per_ep_mean = (
+            float(sum(_goals_per_episode_history) / len(_goals_per_episode_history))
+            if _goals_per_episode_history else None
+        )
+        _path_progress_mean = (
+            float(sum(_path_progress_history) / len(_path_progress_history))
+            if _path_progress_history else None
+        )
         _manifest = {
             "task": args_cli.task,
             "checkpoint": getattr(args_cli, "checkpoint", None),
             "num_envs": args_cli.num_envs,
+            "completed_episodes": completed_episodes,
             "steps": step_count,
-            "total_episodes": sum(termination_counts.values()) if termination_counts else None,
-            "termination_counts": dict(termination_counts) if termination_counts else {},
+            "total_episodes": sum(_tc.values()) if _tc else None,
+            "termination_counts": _tc,
+            "success_rate": _success_rate,
+            "spl": _spl_mean,
+            "avg_episode_length": _avg_ep_len,
+            "goals_per_episode": _goals_per_ep_mean,
+            "path_progress_mean": _path_progress_mean,
         }
         _manifest_path = os.path.join(_out_dir, "session_manifest.json")
         with open(_manifest_path, "w") as _mf:
@@ -1819,7 +1932,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _plot_cmd.extend(_nav_debug_corridor_plot_args(_base_env, args_cli))
         print(f"[INFO] Generating nav debug plot ...")
         sys.stdout.flush()
-        result = subprocess.run(_plot_cmd, capture_output=True, text=True)
+        result = subprocess.run(_plot_cmd, capture_output=True, text=True, start_new_session=True)
         if result.stdout:
             print(result.stdout.strip())
         if result.returncode != 0 and result.stderr:
