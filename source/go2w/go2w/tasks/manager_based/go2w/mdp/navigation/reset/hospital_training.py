@@ -414,11 +414,28 @@ def reset_hospital_maze_training(
     curriculum_iteration_offset: int = 0,
     corridor_width_max: float | None = None,
     debug_vis: bool = False,
+    obstacle_widths: tuple | None = None,
+    obstacle_depths: tuple | None = None,
+    obstacle_center_zs: tuple | None = None,
+    obstacle_heights: tuple | None = None,
+    obstacle_shape_ids: tuple | None = None,
+    obstacle_class_ids: tuple | None = None,
+    obstacle_priorities: tuple | None = None,
+    actor_count_override: int | None = None,
+    target_spacing_override: float | None = None,
 ) -> None:
     """Reset envs into the 5×5 junction-grid maze with actor-only corridor obstacles."""
     if len(env_ids) == 0 or len(obstacle_names) == 0:
         return
-    if len(obstacle_names) != len(HOSPITAL_TRAIN_OBSTACLE_SHAPE_IDS):
+    # Resolve actor spec overrides (None = use 16-slot training defaults).
+    _widths    = obstacle_widths    if obstacle_widths    is not None else HOSPITAL_TRAIN_OBSTACLE_WIDTHS
+    _depths    = obstacle_depths    if obstacle_depths    is not None else HOSPITAL_TRAIN_OBSTACLE_DEPTHS
+    _center_zs = obstacle_center_zs if obstacle_center_zs is not None else HOSPITAL_TRAIN_OBSTACLE_CENTER_ZS
+    _heights   = obstacle_heights   if obstacle_heights   is not None else HOSPITAL_TRAIN_OBSTACLE_HEIGHTS
+    _shape_ids = obstacle_shape_ids if obstacle_shape_ids is not None else HOSPITAL_TRAIN_OBSTACLE_SHAPE_IDS
+    _class_ids = obstacle_class_ids if obstacle_class_ids is not None else HOSPITAL_TRAIN_OBSTACLE_CLASS_IDS
+    _priorities = obstacle_priorities if obstacle_priorities is not None else HOSPITAL_TRAIN_OBSTACLE_PRIORITIES
+    if obstacle_widths is None and len(obstacle_names) != HOSPITAL_TRAIN_ACTOR_SLOTS:
         raise ValueError("Hospital teacher reset requires the actor-only hospital obstacle table.")
 
     ensure_navigation_goal_buffers(env)
@@ -453,6 +470,10 @@ def reset_hospital_maze_training(
         1, steps_per_iteration
     )
     target_spacing, actor_count_cap, phase_id = _phase_settings(curriculum_step, steps_per_iteration)
+    if actor_count_override is not None:
+        actor_count_cap = min(int(actor_count_override), k)
+    if target_spacing_override is not None:
+        target_spacing = float(target_spacing_override)
 
     _NUM_J = len(MAZE_JUNCTION_NAMES)
     _MIN_PATH_STEPS = HOSPITAL_TRAIN_MIN_PATH_STEPS
@@ -536,14 +557,14 @@ def reset_hospital_maze_training(
 
     dtype = current_root_pos.dtype
     actor_cross_half_widths_t = torch.tensor(
-        [HOSPITAL_TRAIN_OBSTACLE_DEPTHS[i] * 0.5 for i in range(HOSPITAL_TRAIN_ACTOR_SLOTS)],
+        [_depths[i] * 0.5 for i in range(k)],
         dtype=dtype, device=device,
     )
     actor_forward_half_lengths_t = torch.tensor(
-        [HOSPITAL_TRAIN_OBSTACLE_WIDTHS[i] * 0.5 for i in range(HOSPITAL_TRAIN_ACTOR_SLOTS)],
+        [_widths[i] * 0.5 for i in range(k)],
         dtype=dtype, device=device,
     )
-    center_zs_t = torch.tensor(HOSPITAL_TRAIN_OBSTACLE_CENTER_ZS, dtype=dtype, device=device)
+    center_zs_t = torch.tensor(_center_zs, dtype=dtype, device=device)
 
     # -----------------------------------------------------------------------
     # Phase 1: Python loop — collect per-env path specs (no GPU actor placement)
@@ -562,6 +583,10 @@ def reset_hospital_maze_training(
             env_actor_count_cap = actor_count_cap
         else:
             env_target_spacing, env_actor_count_cap = _phase_settings_by_id(local_phase)
+            if actor_count_override is not None:
+                env_actor_count_cap = min(int(actor_count_override), k)
+            if target_spacing_override is not None:
+                env_target_spacing = float(target_spacing_override)
         if corridor_width_max is not None:
             env_width = float(
                 torch.empty(1, device=device).uniform_(HOSPITAL_TRAIN_CORRIDOR_WIDTH, corridor_width_max).item()
@@ -742,13 +767,13 @@ def reset_hospital_maze_training(
         obstacle_names,
         active_mask,
         obstacle_radius_margin=obstacle_radius_margin,
-        fixed_obstacle_shape_ids=HOSPITAL_TRAIN_OBSTACLE_SHAPE_IDS,
-        fixed_obstacle_widths=HOSPITAL_TRAIN_OBSTACLE_WIDTHS,
-        fixed_obstacle_depths=HOSPITAL_TRAIN_OBSTACLE_DEPTHS,
-        fixed_obstacle_heights=HOSPITAL_TRAIN_OBSTACLE_HEIGHTS,
-        fixed_obstacle_center_zs=HOSPITAL_TRAIN_OBSTACLE_CENTER_ZS,
-        fixed_obstacle_class_ids=HOSPITAL_TRAIN_OBSTACLE_CLASS_IDS,
-        fixed_obstacle_priorities=HOSPITAL_TRAIN_OBSTACLE_PRIORITIES,
+        fixed_obstacle_shape_ids=_shape_ids,
+        fixed_obstacle_widths=_widths,
+        fixed_obstacle_depths=_depths,
+        fixed_obstacle_heights=_heights,
+        fixed_obstacle_center_zs=_center_zs,
+        fixed_obstacle_class_ids=_class_ids,
+        fixed_obstacle_priorities=_priorities,
         dynamic_mask=(False,) * k,
         obstacle_yaws=obstacle_yaws,
         low_obstacle_height_threshold=HOSPITAL_LOW_OBSTACLE_FLAG_HEIGHT,
@@ -775,6 +800,15 @@ def reset_hospital_maze_training(
         force_path_id=force_path_id,
         corridor_width_max=corridor_width_max,
         debug_vis=debug_vis,
+        obstacle_widths=obstacle_widths,
+        obstacle_depths=obstacle_depths,
+        obstacle_center_zs=obstacle_center_zs,
+        obstacle_heights=obstacle_heights,
+        obstacle_shape_ids=obstacle_shape_ids,
+        obstacle_class_ids=obstacle_class_ids,
+        obstacle_priorities=obstacle_priorities,
+        actor_count_override=actor_count_override,
+        target_spacing_override=target_spacing_override,
     )
     update_navigation_path_waypoint(
         env,

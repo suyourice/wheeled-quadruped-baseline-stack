@@ -339,6 +339,86 @@ class HospitalTeacherMultiCamDepthSceneCfg(HospitalTeacherSceneCfg):
     depth_camera_rear  = _make_maze_depth_camera_cfg(D456_CAMERA_REAR_QUAT_WXYZ)
 
 
+# Eval-only sensor configs: added to eval scene subclasses so training scenes are untouched.
+_EVAL_OBSTACLE_CONTACTS = ContactSensorCfg(
+    prim_path="{ENV_REGEX_NS}/obstacle_.*",
+    history_length=2,
+    track_air_time=False,
+)
+# All robot bodies for wall collision detection (wheels excluded in play.py by name filter).
+_EVAL_ROBOT_BODY_CONTACTS = ContactSensorCfg(
+    prim_path="{ENV_REGEX_NS}/Robot/.*",
+    history_length=2,
+    track_air_time=False,
+)
+
+
+@configclass
+class HospitalTeacherEvalSceneCfg(HospitalTeacherSceneCfg):
+    """Training scene + eval sensors for maze_train eval (teacher)."""
+
+    obstacle_contacts: ContactSensorCfg = _EVAL_OBSTACLE_CONTACTS
+    robot_body_contacts: ContactSensorCfg = _EVAL_ROBOT_BODY_CONTACTS
+
+
+@configclass
+class HospitalTeacherDepthEvalSceneCfg(HospitalTeacherDepthSceneCfg):
+    """Training depth scene + eval sensors for maze_train eval (students)."""
+
+    obstacle_contacts: ContactSensorCfg = _EVAL_OBSTACLE_CONTACTS
+    robot_body_contacts: ContactSensorCfg = _EVAL_ROBOT_BODY_CONTACTS
+
+
+@configclass
+class HospitalTeacherMultiCamDepthEvalSceneCfg(HospitalTeacherMultiCamDepthSceneCfg):
+    """Training 4-cam scene + eval sensors for maze_train eval (4cam)."""
+
+    obstacle_contacts: ContactSensorCfg = _EVAL_OBSTACLE_CONTACTS
+    robot_body_contacts: ContactSensorCfg = _EVAL_ROBOT_BODY_CONTACTS
+
+
+@configclass
+class HospitalMazeEvalSceneCfg(HospitalTeacherSceneCfg):
+    """Hospital maze scene with 20 obstacle slots for eval-only comparison.
+
+    Extends the 16-slot training scene with 4 extra small-obstacle actors
+    (fallen_object ×2, iv_pole ×1, trash_bin ×1).  Training uses only the
+    original 16 slots — this scene must never be used for training.
+    """
+
+    for _eval_i, (_eval_shape, _eval_fp) in enumerate(HOSPITAL_MAZE_EVAL_OBSTACLE_SPECS[HOSPITAL_TRAIN_ACTOR_SLOTS:]):
+        _eval_slot = HOSPITAL_TRAIN_ACTOR_SLOTS + _eval_i
+        _eval_label = HOSPITAL_MAZE_EVAL_OBSTACLE_LABELS[_eval_slot]
+        vars()[f"obstacle_{_eval_slot}"] = _make_obstacle_cfg(
+            f"obstacle_{_eval_slot}",
+            _eval_slot,
+            _eval_shape,
+            _eval_fp,
+            HOSPITAL_MAZE_EVAL_OBSTACLE_HEIGHTS[_eval_slot],
+            HOSPITAL_LABEL_COLORS.get(_eval_label, HOSPITAL_DEFAULT_COLOR),
+        )
+    del _eval_i, _eval_slot, _eval_shape, _eval_fp, _eval_label
+
+    obstacle_contacts: ContactSensorCfg = _EVAL_OBSTACLE_CONTACTS
+
+
+@configclass
+class HospitalMazeEvalDepthSceneCfg(HospitalMazeEvalSceneCfg):
+    """Eval maze scene (20 obstacles) with a single front depth camera."""
+
+    depth_camera = _make_maze_depth_camera_cfg()
+
+
+@configclass
+class HospitalMazeEvalMultiCamDepthSceneCfg(HospitalMazeEvalSceneCfg):
+    """Eval maze scene (20 obstacles) with 4-camera 360° depth rig."""
+
+    depth_camera       = _make_maze_depth_camera_cfg()
+    depth_camera_left  = _make_maze_depth_camera_cfg(D456_CAMERA_LEFT_QUAT_WXYZ)
+    depth_camera_right = _make_maze_depth_camera_cfg(D456_CAMERA_RIGHT_QUAT_WXYZ)
+    depth_camera_rear  = _make_maze_depth_camera_cfg(D456_CAMERA_REAR_QUAT_WXYZ)
+
+
 @configclass
 class DepthObstacleSceneCfg(ObstacleSceneCfg):
     """Training scene with LiDAR compatibility plus a head-mounted depth camera."""

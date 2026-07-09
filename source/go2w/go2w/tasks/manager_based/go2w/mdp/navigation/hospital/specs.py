@@ -351,6 +351,44 @@ HOSPITAL_TRAIN_OBSTACLE_PRIORITIES = tuple(
     HOSPITAL_LABEL_AVOIDANCE_PRIORITY[label] for label in HOSPITAL_TRAIN_OBSTACLE_LABELS
 )
 
+# ---------------------------------------------------------------------------
+# Maze eval: 16 training slots + 4 additional small-obstacle slots for eval.
+# These constants are EVAL-ONLY — training code uses HOSPITAL_TRAIN_* above.
+# ---------------------------------------------------------------------------
+_HOSPITAL_MAZE_EVAL_EXTRA_SPECS = (
+    ("cuboid", (0.25, 0.35), 0.20, "fallen_object"),   # slot 16
+    ("cuboid", (0.25, 0.35), 0.20, "fallen_object"),   # slot 17
+    ("cylinder", (0.22, 0.22), 1.45, "iv_pole"),        # slot 18
+    ("cylinder", (0.32, 0.32), 0.75, "trash_bin"),      # slot 19
+)
+_HOSPITAL_MAZE_EVAL_ACTOR_SPECS = _HOSPITAL_TRAIN_ACTOR_SPECS + _HOSPITAL_MAZE_EVAL_EXTRA_SPECS
+HOSPITAL_MAZE_EVAL_ACTOR_SLOTS = len(_HOSPITAL_MAZE_EVAL_ACTOR_SPECS)
+HOSPITAL_MAZE_EVAL_OBSTACLE_NAMES = [f"obstacle_{i}" for i in range(HOSPITAL_MAZE_EVAL_ACTOR_SLOTS)]
+HOSPITAL_MAZE_EVAL_OBSTACLE_SPECS = tuple(
+    (shape_kind, footprint_size)
+    for shape_kind, footprint_size, _, _ in _HOSPITAL_MAZE_EVAL_ACTOR_SPECS
+)
+HOSPITAL_MAZE_EVAL_OBSTACLE_SHAPE_IDS = tuple(
+    _SHAPE_ID_BY_KIND[kind] for kind, _ in HOSPITAL_MAZE_EVAL_OBSTACLE_SPECS
+)
+HOSPITAL_MAZE_EVAL_OBSTACLE_WIDTHS = tuple(size[0] for _, size in HOSPITAL_MAZE_EVAL_OBSTACLE_SPECS)
+HOSPITAL_MAZE_EVAL_OBSTACLE_DEPTHS = tuple(size[1] for _, size in HOSPITAL_MAZE_EVAL_OBSTACLE_SPECS)
+HOSPITAL_MAZE_EVAL_OBSTACLE_HEIGHTS = tuple(
+    height for _, _, height, _ in _HOSPITAL_MAZE_EVAL_ACTOR_SPECS
+)
+HOSPITAL_MAZE_EVAL_OBSTACLE_CENTER_ZS = tuple(
+    height * 0.5 + OBSTACLE_GROUND_CLEARANCE for height in HOSPITAL_MAZE_EVAL_OBSTACLE_HEIGHTS
+)
+HOSPITAL_MAZE_EVAL_OBSTACLE_LABELS = tuple(
+    label for _, _, _, label in _HOSPITAL_MAZE_EVAL_ACTOR_SPECS
+)
+HOSPITAL_MAZE_EVAL_OBSTACLE_CLASS_IDS = tuple(
+    HOSPITAL_LABEL_CLASS_ID[label] for label in HOSPITAL_MAZE_EVAL_OBSTACLE_LABELS
+)
+HOSPITAL_MAZE_EVAL_OBSTACLE_PRIORITIES = tuple(
+    HOSPITAL_LABEL_AVOIDANCE_PRIORITY[label] for label in HOSPITAL_MAZE_EVAL_OBSTACLE_LABELS
+)
+
 
 def hospital_class_id(label: str) -> int:
     """Return the coarse teacher-only semantic class id for a hospital label."""

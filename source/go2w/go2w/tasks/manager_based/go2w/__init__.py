@@ -407,3 +407,159 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalMultiCamRLDistillRunnerCfg",
     },
 )
+
+# =============================================================================
+# Hospital Maze Eval (20 obstacles, 220 s, static + dynamic, 5 policies)
+# =============================================================================
+
+gym.register(
+    id="Nav-Hospital-Maze-Eval-Teacher-Static-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeStaticEvalTeacherEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Nav-Hospital-Maze-Eval-Teacher-Dynamic-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeDynamicEvalTeacherEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-Static-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeStaticEvalBaselineEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-Dynamic-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeDynamicEvalBaselineEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-LongHist-Static-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeStaticEvalLongHistEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalLongHistRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-LongHist-Dynamic-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeDynamicEvalLongHistEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalLongHistRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-Sparse-Static-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeStaticEvalSparseEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalSparseRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-Sparse-Dynamic-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeDynamicEvalSparseEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalSparseRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-4Cam-Static-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeStaticEvalMultiCamEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalMultiCamRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-4Cam-Dynamic-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeDynamicEvalMultiCamEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalMultiCamRLDistillRunnerCfg",
+    },
+)
+
+# Training-distribution maze eval (16-slot scene, last curriculum phase, max 12 obstacles)
+
+gym.register(
+    id="Nav-Hospital-Maze-Eval-Teacher-TrainDist-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeTrainDistEvalTeacherEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-TrainDist-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeTrainDistEvalBaselineEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-LongHist-TrainDist-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeTrainDistEvalLongHistEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalLongHistRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-Sparse-TrainDist-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeTrainDistEvalSparseEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalSparseRLDistillRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Navigation-Depth-Hospital-Maze-Eval-4Cam-TrainDist-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalMazeTrainDistEvalMultiCamEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthHospitalMultiCamRLDistillRunnerCfg",
+    },
+)

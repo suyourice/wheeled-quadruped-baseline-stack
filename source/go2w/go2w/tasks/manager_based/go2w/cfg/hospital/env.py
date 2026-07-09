@@ -20,11 +20,24 @@ from isaaclab.utils import configclass
 from ... import mdp
 from ..navigation.env import (
     Go2wHospitalTeacherEnvCfg,
+    Go2wHospitalDepthRLDistillEnvCfg,
+    Go2wHospitalDepthLongHistRLDistillEnvCfg,
+    Go2wHospitalDepthSparseRLDistillEnvCfg,
+    Go2wHospitalDepthMultiCamRLDistillEnvCfg,
     Go2wNavDepthRLDistillEnvCfg_PLAY,
     Go2wNavDepthLongHistRLDistillEnvCfg_PLAY,
     Go2wNavDepthSparseRLDistillEnvCfg_PLAY,
     Go2wNavDepthMultiCamRLDistillEnvCfg_PLAY,
     Go2wNavTeacherEnvCfg_PLAY,
+    HospitalTeacherSceneCfg,
+    HospitalTeacherDepthSceneCfg,
+    HospitalTeacherMultiCamDepthSceneCfg,
+    HospitalTeacherEvalSceneCfg,
+    HospitalTeacherDepthEvalSceneCfg,
+    HospitalTeacherMultiCamDepthEvalSceneCfg,
+    HospitalMazeEvalSceneCfg,
+    HospitalMazeEvalDepthSceneCfg,
+    HospitalMazeEvalMultiCamDepthSceneCfg,
     ObstaclePlayTerrainWallSceneCfg,
     DepthObstaclePlayTerrainWallSceneCfg,
     DepthObstacleMultiCamPlayTerrainWallSceneCfg,
@@ -978,3 +991,307 @@ class Go2wHospitalFloorMultiCamDepthPlayEnvCfg(Go2wNavDepthMultiCamRLDistillEnvC
         )
         self.events.navigation_path_update = _structured_path_update_event()
         _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
+
+
+# =============================================================================
+# Hospital maze eval environments (training-isolated, episode_length_s=220s)
+#
+# Uses the same 5x5 maze terrain as training but adds 4 extra small-obstacle
+# slots (fallen_object x2, iv_pole x1, trash_bin x1) for richer eval coverage.
+# HOSPITAL_TRAIN_* constants and training env classes are untouched.
+#
+# Task IDs:
+#   Nav-Hospital-Maze-Eval-Teacher-Static-Go2w-v0
+#   Nav-Hospital-Maze-Eval-Teacher-Dynamic-Go2w-v0
+#   Navigation-Depth-Hospital-Maze-Eval-Static-Go2w-v0
+#   Navigation-Depth-Hospital-Maze-Eval-Dynamic-Go2w-v0
+#   Navigation-Depth-Hospital-Maze-Eval-LongHist-Static-Go2w-v0
+#   Navigation-Depth-Hospital-Maze-Eval-LongHist-Dynamic-Go2w-v0
+#   Navigation-Depth-Hospital-Maze-Eval-Sparse-Static-Go2w-v0
+#   Navigation-Depth-Hospital-Maze-Eval-Sparse-Dynamic-Go2w-v0
+#   Navigation-Depth-Hospital-Maze-Eval-4Cam-Static-Go2w-v0
+#   Navigation-Depth-Hospital-Maze-Eval-4Cam-Dynamic-Go2w-v0
+# =============================================================================
+
+HOSPITAL_MAZE_EVAL_EPISODE_LENGTH_S = 220.0
+HOSPITAL_MAZE_EVAL_NUM_ENVS = 8
+# Full-density phase offset: matches hospital teacher play (iteration 900+ = phase 4).
+_HOSPITAL_MAZE_EVAL_CURRICULUM_OFFSET = 1100
+
+
+def _configure_maze_eval_env(cfg) -> None:
+    """Apply eval overrides: 20 obstacle slots, 220 s episodes.
+
+    Teacher policy obs: noise OFF (deterministic eval reference).
+    Student student_state: noise ON (matches training conditions; proprio IMU noise
+        was enabled during distillation and should remain on for realistic eval).
+    Student student_depth: noise OFF (per-pixel depth noise is not a valid model
+        of real depth camera noise; distillation handles sim-to-real gap).
+    """
+    cfg.scene.num_envs = HOSPITAL_MAZE_EVAL_NUM_ENVS
+    cfg.episode_length_s = HOSPITAL_MAZE_EVAL_EPISODE_LENGTH_S
+    cfg.events.reset_obstacles.params.update({
+        "obstacle_names": HOSPITAL_MAZE_EVAL_OBSTACLE_NAMES,
+        "curriculum_iteration_offset": _HOSPITAL_MAZE_EVAL_CURRICULUM_OFFSET,
+        "obstacle_widths": HOSPITAL_MAZE_EVAL_OBSTACLE_WIDTHS,
+        "obstacle_depths": HOSPITAL_MAZE_EVAL_OBSTACLE_DEPTHS,
+        "obstacle_center_zs": HOSPITAL_MAZE_EVAL_OBSTACLE_CENTER_ZS,
+        "obstacle_heights": HOSPITAL_MAZE_EVAL_OBSTACLE_HEIGHTS,
+        "obstacle_shape_ids": HOSPITAL_MAZE_EVAL_OBSTACLE_SHAPE_IDS,
+        "obstacle_class_ids": HOSPITAL_MAZE_EVAL_OBSTACLE_CLASS_IDS,
+        "obstacle_priorities": HOSPITAL_MAZE_EVAL_OBSTACLE_PRIORITIES,
+        "actor_count_override": HOSPITAL_MAZE_EVAL_ACTOR_SLOTS,
+    })
+    obs = cfg.observations
+    if hasattr(obs, "policy"):
+        obs.policy.enable_corruption = False
+    if hasattr(obs, "student_depth"):
+        obs.student_depth.enable_corruption = False
+
+    # Retarget obstacle-aware reward terms to the 20-slot eval set so that
+    # priority/active tensors remain consistent with the expanded scene.
+    _eval_obs_names = list(HOSPITAL_MAZE_EVAL_OBSTACLE_NAMES)
+    for _rname in (
+        "nav_lateral_escape",
+        "nav_dense_recovery",
+        "hospital_centerline",
+        "nav_clearance",
+        "obstacle_ttc",
+        "nav_grazing",
+    ):
+        _term = getattr(cfg.rewards, _rname, None)
+        if _term is not None and _term.params and "obstacle_names" in _term.params:
+            _term.params["obstacle_names"] = _eval_obs_names
+
+
+def _add_maze_eval_dynamic_events(cfg) -> None:
+    """Add per-step pose advancement for the dynamic-obstacle eval version.
+
+    kinematic rigid bodies only move when write_root_pose_to_sim is called each step.
+    move_hospital_dynamic_obstacles runs at interval_range_s=(0.0, 0.0) to advance
+    poses every step; it internally resamples velocity directions every 3-6 s.
+    """
+    cfg.events.hospital_dynamic_motion = EventTerm(
+        func=_hospital_events.move_hospital_dynamic_obstacles,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            "obstacle_names": list(HOSPITAL_MAZE_EVAL_OBSTACLE_NAMES),
+            "obstacle_labels": list(HOSPITAL_MAZE_EVAL_OBSTACLE_LABELS),
+            "obstacle_center_zs": tuple(HOSPITAL_MAZE_EVAL_OBSTACLE_CENTER_ZS),
+            "speed_scale": 0.7,
+            "velocity_resample_interval_range": (3.0, 6.0),
+            "active_distance": 100.0,
+        },
+    )
+
+
+# -----------------------------------------------------------------------------
+# Static versions (no moving obstacles - mirrors training distribution)
+# -----------------------------------------------------------------------------
+
+
+@configclass
+class Go2wHospitalMazeStaticEvalTeacherEnvCfg(Go2wHospitalTeacherEnvCfg):
+    """Hospital maze eval env for the teacher policy - 20 obstacles, 220 s."""
+
+    scene: HospitalMazeEvalSceneCfg = HospitalMazeEvalSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_eval_env(self)
+
+
+@configclass
+class Go2wHospitalMazeStaticEvalBaselineEnvCfg(Go2wHospitalDepthRLDistillEnvCfg):
+    """Maze eval env for baseline depth student - 20 obstacles, 220 s."""
+
+    scene: HospitalMazeEvalDepthSceneCfg = HospitalMazeEvalDepthSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_eval_env(self)
+
+
+@configclass
+class Go2wHospitalMazeStaticEvalLongHistEnvCfg(Go2wHospitalDepthLongHistRLDistillEnvCfg):
+    """Maze eval env for long-history depth student - 20 obstacles, 220 s."""
+
+    scene: HospitalMazeEvalDepthSceneCfg = HospitalMazeEvalDepthSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_eval_env(self)
+
+
+@configclass
+class Go2wHospitalMazeStaticEvalSparseEnvCfg(Go2wHospitalDepthSparseRLDistillEnvCfg):
+    """Maze eval env for sparse-history depth student - 20 obstacles, 220 s."""
+
+    scene: HospitalMazeEvalDepthSceneCfg = HospitalMazeEvalDepthSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_eval_env(self)
+
+
+@configclass
+class Go2wHospitalMazeStaticEvalMultiCamEnvCfg(Go2wHospitalDepthMultiCamRLDistillEnvCfg):
+    """Maze eval env for 4-camera depth student - 20 obstacles, 220 s."""
+
+    scene: HospitalMazeEvalMultiCamDepthSceneCfg = HospitalMazeEvalMultiCamDepthSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_eval_env(self)
+
+
+# -----------------------------------------------------------------------------
+# Dynamic versions (label-driven velocity resample every 3-6 s)
+# -----------------------------------------------------------------------------
+
+
+@configclass
+class Go2wHospitalMazeDynamicEvalTeacherEnvCfg(Go2wHospitalMazeStaticEvalTeacherEnvCfg):
+    """Maze eval env (teacher) with label-driven obstacle velocity resample."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _add_maze_eval_dynamic_events(self)
+
+
+@configclass
+class Go2wHospitalMazeDynamicEvalBaselineEnvCfg(Go2wHospitalMazeStaticEvalBaselineEnvCfg):
+    """Maze eval env (baseline depth) with label-driven obstacle velocity resample."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _add_maze_eval_dynamic_events(self)
+
+
+@configclass
+class Go2wHospitalMazeDynamicEvalLongHistEnvCfg(Go2wHospitalMazeStaticEvalLongHistEnvCfg):
+    """Maze eval env (long-hist depth) with label-driven obstacle velocity resample."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _add_maze_eval_dynamic_events(self)
+
+
+@configclass
+class Go2wHospitalMazeDynamicEvalSparseEnvCfg(Go2wHospitalMazeStaticEvalSparseEnvCfg):
+    """Maze eval env (sparse depth) with label-driven obstacle velocity resample."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _add_maze_eval_dynamic_events(self)
+
+
+@configclass
+class Go2wHospitalMazeDynamicEvalMultiCamEnvCfg(Go2wHospitalMazeStaticEvalMultiCamEnvCfg):
+    """Maze eval env (4-cam depth) with label-driven obstacle velocity resample."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _add_maze_eval_dynamic_events(self)
+
+
+# -----------------------------------------------------------------------------
+# Training-distribution eval (16-slot training scene, last curriculum phase,
+# no actor_count_override → training schedule caps at 12 obstacles)
+# -----------------------------------------------------------------------------
+
+
+def _configure_maze_train_dist_eval_env(cfg) -> None:
+    """Apply eval overrides for training-distribution conditions.
+
+    Uses the 16-slot training scene without actor_count_override so obstacle
+    placement follows the last training phase (max 12 at 2.0 m spacing).
+    Noise policy: same as _configure_maze_eval_env (teacher OFF, student_state ON,
+    student_depth OFF).
+    """
+    cfg.scene.num_envs = HOSPITAL_MAZE_EVAL_NUM_ENVS
+    cfg.episode_length_s = HOSPITAL_MAZE_EVAL_EPISODE_LENGTH_S
+    cfg.events.reset_obstacles.params.update({
+        "curriculum_iteration_offset": _HOSPITAL_MAZE_EVAL_CURRICULUM_OFFSET,
+    })
+    obs = cfg.observations
+    if hasattr(obs, "policy"):
+        obs.policy.enable_corruption = False
+    if hasattr(obs, "student_depth"):
+        obs.student_depth.enable_corruption = False
+
+
+@configclass
+class Go2wHospitalMazeTrainDistEvalTeacherEnvCfg(Go2wHospitalTeacherEnvCfg):
+    """Hospital maze eval for teacher: 16-slot training scene, last curriculum phase."""
+
+    scene: HospitalTeacherEvalSceneCfg = HospitalTeacherEvalSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_train_dist_eval_env(self)
+
+
+@configclass
+class Go2wHospitalMazeTrainDistEvalBaselineEnvCfg(Go2wHospitalDepthRLDistillEnvCfg):
+    """Hospital maze eval for baseline depth student: 16-slot training scene."""
+
+    scene: HospitalTeacherDepthEvalSceneCfg = HospitalTeacherDepthEvalSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_train_dist_eval_env(self)
+
+
+@configclass
+class Go2wHospitalMazeTrainDistEvalLongHistEnvCfg(Go2wHospitalDepthLongHistRLDistillEnvCfg):
+    """Hospital maze eval for long-history depth student: 16-slot training scene."""
+
+    scene: HospitalTeacherDepthEvalSceneCfg = HospitalTeacherDepthEvalSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_train_dist_eval_env(self)
+
+
+@configclass
+class Go2wHospitalMazeTrainDistEvalSparseEnvCfg(Go2wHospitalDepthSparseRLDistillEnvCfg):
+    """Hospital maze eval for sparse-history depth student: 16-slot training scene."""
+
+    scene: HospitalTeacherDepthEvalSceneCfg = HospitalTeacherDepthEvalSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_train_dist_eval_env(self)
+
+
+@configclass
+class Go2wHospitalMazeTrainDistEvalMultiCamEnvCfg(Go2wHospitalDepthMultiCamRLDistillEnvCfg):
+    """Hospital maze eval for 4-camera depth student: 16-slot training scene."""
+
+    scene: HospitalTeacherMultiCamDepthEvalSceneCfg = HospitalTeacherMultiCamDepthEvalSceneCfg(
+        num_envs=HOSPITAL_MAZE_EVAL_NUM_ENVS, env_spacing=48.0
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _configure_maze_train_dist_eval_env(self)
