@@ -131,6 +131,8 @@ def main():
                         "Teacher has no depth camera so no video is saved regardless.")
     parser.add_argument("--ablation", type=str, default=None,
                         help="Run only this policy (teacher/baseline/longhist/sparse/4cam). Default: all.")
+    parser.add_argument("--scenario", type=str, default=None,
+                        help="Run only this scenario (maze_train/maze_static/maze_dynamic). Default: all.")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--skip_plot", action="store_true",
                         help="Skip plot_validation.py after runs")
@@ -148,12 +150,30 @@ def main():
                   f"Valid: {[p['name'] for p in POLICIES]}", file=sys.stderr)
             sys.exit(1)
 
+    _ALL_SCENARIOS = ["maze_train", "maze_static", "maze_dynamic"]
+    run_scenarios: list[str]
+    if args.scenario:
+        if args.scenario not in _ALL_SCENARIOS:
+            print(f"[run_validation] ERROR: unknown scenario '{args.scenario}'. "
+                  f"Valid: {_ALL_SCENARIOS}", file=sys.stderr)
+            sys.exit(1)
+        run_scenarios = [args.scenario]
+    else:
+        run_scenarios = _ALL_SCENARIOS
+
     print(f"[run_validation] Output base: {out_base}")
     print(f"[run_validation] Policies: {[p['name'] for p in policies]}")
+    print(f"[run_validation] Scenarios: {run_scenarios}")
     print(f"[run_validation] Episodes per scenario: {args.maze_episodes}")
     print(f"[run_validation] Seed: {args.seed} (per-episode increment enabled)")
     print(f"[run_validation] Stuck timeout: {args.stuck_timeout} steps")
     print(f"[run_validation] Num envs: {args.num_envs}")
+
+    _SCENARIO_TASK_KEY = {
+        "maze_train":   "maze_train_task",
+        "maze_static":  "maze_static_task",
+        "maze_dynamic": "maze_dynamic_task",
+    }
 
     failures = []
 
@@ -161,59 +181,23 @@ def main():
         name = policy["name"]
         ckpt = policy["checkpoint"]
 
-        # Training-distribution maze eval
-        play_name = f"{out_name}/maze_train_{name}"
-        cmd = build_cmd(
-            task=policy["maze_train_task"],
-            checkpoint=ckpt,
-            play_name=play_name,
-            episodes=args.maze_episodes,
-            seed=args.seed,
-            stuck_timeout=args.stuck_timeout,
-            num_envs=args.num_envs,
-            locomotion_checkpoint=args.locomotion_checkpoint,
-            depth_video_steps=args.depth_video_steps,
-        )
-        rc = run_cmd(cmd, dry_run=args.dry_run)
-        if rc != 0:
-            print(f"[run_validation] WARNING: maze_train_{name} exited with code {rc}")
-            failures.append(f"maze_train_{name}")
-
-        # Extended-obstacle static eval
-        play_name = f"{out_name}/maze_static_{name}"
-        cmd = build_cmd(
-            task=policy["maze_static_task"],
-            checkpoint=ckpt,
-            play_name=play_name,
-            episodes=args.maze_episodes,
-            seed=args.seed,
-            stuck_timeout=args.stuck_timeout,
-            num_envs=args.num_envs,
-            locomotion_checkpoint=args.locomotion_checkpoint,
-            depth_video_steps=args.depth_video_steps,
-        )
-        rc = run_cmd(cmd, dry_run=args.dry_run)
-        if rc != 0:
-            print(f"[run_validation] WARNING: maze_static_{name} exited with code {rc}")
-            failures.append(f"maze_static_{name}")
-
-        # Extended-obstacle dynamic eval
-        play_name = f"{out_name}/maze_dynamic_{name}"
-        cmd = build_cmd(
-            task=policy["maze_dynamic_task"],
-            checkpoint=ckpt,
-            play_name=play_name,
-            episodes=args.maze_episodes,
-            seed=args.seed,
-            stuck_timeout=args.stuck_timeout,
-            num_envs=args.num_envs,
-            locomotion_checkpoint=args.locomotion_checkpoint,
-            depth_video_steps=args.depth_video_steps,
-        )
-        rc = run_cmd(cmd, dry_run=args.dry_run)
-        if rc != 0:
-            print(f"[run_validation] WARNING: maze_dynamic_{name} exited with code {rc}")
-            failures.append(f"maze_dynamic_{name}")
+        for scenario in run_scenarios:
+            play_name = f"{out_name}/{scenario}_{name}"
+            cmd = build_cmd(
+                task=policy[_SCENARIO_TASK_KEY[scenario]],
+                checkpoint=ckpt,
+                play_name=play_name,
+                episodes=args.maze_episodes,
+                seed=args.seed,
+                stuck_timeout=args.stuck_timeout,
+                num_envs=args.num_envs,
+                locomotion_checkpoint=args.locomotion_checkpoint,
+                depth_video_steps=args.depth_video_steps,
+            )
+            rc = run_cmd(cmd, dry_run=args.dry_run)
+            if rc != 0:
+                print(f"[run_validation] WARNING: {scenario}_{name} exited with code {rc}")
+                failures.append(f"{scenario}_{name}")
 
     # Plot
     if not args.skip_plot:
