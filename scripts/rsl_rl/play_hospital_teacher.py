@@ -246,6 +246,69 @@ def _make_line_marker(prim_path: str, radius: float, color: tuple[float, float, 
     )
 
 
+def _place_ward_junction_markers(base_env) -> list[VisualizationMarkers]:
+    """Colored sphere markers at T-junction inner corners for geometry debugging.
+
+    Works for both the isolated ward corridor and the full hospital floor tasks.
+    RED   = suspect inner corner (wall box overlap, potential phantom contact)
+    YELLOW = reference outer corner
+
+    Prints a legend to the console so the user can identify which sphere is which.
+    """
+    if not args_cli.show_markers:
+        return []
+    task = args_cli.task or ""
+
+    if "Floor" in task or "floor" in task:
+        from go2w.tasks.manager_based.go2w.mdp.navigation.hospital.floor import (
+            HOSPITAL_FLOOR_CORRIDOR_WIDTH,
+            HOSPITAL_FLOOR_LEG_LENGTH,
+            HOSPITAL_FLOOR_WALL_THICKNESS,
+        )
+        hw = HOSPITAL_FLOOR_CORRIDOR_WIDTH * 0.5
+        L = HOSPITAL_FLOOR_LEG_LENGTH
+        wt = HOSPITAL_FLOOR_WALL_THICKNESS
+        # (local_x, local_y, label, color)
+        named_pts = [
+            (2.0 * L - hw, hw, "floor-LEFT-inner (suspect, x={:.1f} y={:.1f})".format(2.0 * L - hw, hw), (1.0, 0.05, 0.0)),
+            (2.0 * L + hw, hw, "floor-RIGHT-outer (ref,     x={:.1f} y={:.1f})".format(2.0 * L + hw, hw), (1.0, 0.90, 0.0)),
+        ]
+    elif "Ward" in task or "ward" in task:
+        from go2w.tasks.manager_based.go2w.cfg.hospital.env import (
+            HOSPITAL_WARD_CORRIDOR_WIDTH,
+            HOSPITAL_WARD_LEG_LENGTH,
+            HOSPITAL_WARD_WALL_THICKNESS,
+        )
+        hw = HOSPITAL_WARD_CORRIDOR_WIDTH * 0.5
+        L = HOSPITAL_WARD_LEG_LENGTH
+        wt = HOSPITAL_WARD_WALL_THICKNESS
+        B1, B2 = L, 2.0 * L
+        named_pts = [
+            (B1 - hw, hw, "B1-LEFT  (suspect, x={:.1f} y={:.1f})".format(B1 - hw, hw), (1.0, 0.05, 0.0)),
+            (B1 + hw, hw, "B1-RIGHT (ref,     x={:.1f} y={:.1f})".format(B1 + hw, hw), (1.0, 0.90, 0.0)),
+            (B2 - hw, hw, "B2-LEFT  (suspect, x={:.1f} y={:.1f})".format(B2 - hw, hw), (1.0, 0.05, 0.0)),
+            (B2 + hw, hw, "B2-RIGHT (ref,     x={:.1f} y={:.1f})".format(B2 + hw, hw), (1.0, 0.90, 0.0)),
+        ]
+    else:
+        return []
+
+    origin = base_env.scene.env_origins[_selected_env(base_env), :3].clone()
+    origin[2] = 0.0
+    radius = 0.20 + wt * 0.5
+
+    print("[DEBUG] Junction markers (all coords are local to env origin):")
+    placed: list[VisualizationMarkers] = []
+    for i, (lx, ly, label, color) in enumerate(named_pts):
+        world_pt = torch.tensor([[lx, ly, 0.6]], dtype=torch.float32, device=base_env.device) + origin.unsqueeze(0)
+        m = _make_sphere_marker(f"/Visuals/JunctionMarker_{i}", radius, color)
+        m.visualize(translations=world_pt)
+        placed.append(m)
+        color_name = "RED   " if color[1] < 0.5 else "YELLOW"
+        print(f"  [{color_name}] {label}")
+
+    return placed
+
+
 def _init_markers() -> dict[str, VisualizationMarkers]:
     if not args_cli.show_markers:
         return {}
@@ -478,6 +541,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     _print_robot_runtime_state(base_env)
     markers = _init_markers()
     _update_markers(base_env, markers)
+    _place_ward_junction_markers(base_env)
     _set_camera(base_env)
 
     marker_env_indices = _marker_env_indices(base_env)

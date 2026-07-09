@@ -1576,6 +1576,54 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _nav_spl_history: list[float] = []
     _goals_per_episode_history: list[float] = []
     _path_progress_history: list[float] = []
+    _collision_episode_history: list[float] = []
+    _low_collision_episode_history: list[float] = []
+
+    # --- Onset-based collision tracking (eval only, requires ContactSensor in scene) ---
+    # obstacle_contacts sensor: robot↔obstacle contacts (obstacles float 5cm above ground,
+    # so net_forces only reflects robot hits). Low-obstacle slots identified by center_z < 0.25m.
+    # contact_forces sensor on Robot/base: catches wall hits (base never touches ground normally).
+    _OBSTACLE_CONTACT_THRESHOLD = 1.0   # N — same as training reward threshold
+    _WALL_CONTACT_THRESHOLD     = 0.5   # N — lower than termination (1.0 N) to catch soft grazes
+    _obs_sensor     = _base_env.scene.sensors.get("obstacle_contacts")
+    # Prefer full robot-body sensor (eval scenes); fall back to base-only contact_forces.
+    _base_sensor    = (
+        _base_env.scene.sensors.get("robot_body_contacts")
+        or _base_env.scene.sensors.get("contact_forces")
+    )
+    _num_envs_val   = _base_env.num_envs
+    _dev             = _base_env.device
+
+    # Precompute low-obstacle mask from scene center_z values.
+    _low_obs_mask: torch.Tensor | None = None
+    if _obs_sensor is not None:
+        _num_obs_slots = _obs_sensor.data.net_forces_w_history.shape[2]
+        _center_zs = getattr(_base_env, "_go2w_obstacle_center_z", None)
+        if _center_zs is not None and _center_zs.shape[-1] >= _num_obs_slots:
+            _low_obs_mask = (_center_zs[0, :_num_obs_slots] < 0.25).to(_dev)
+        else:
+            _low_obs_mask = torch.zeros(_num_obs_slots, dtype=torch.bool, device=_dev)
+
+    # Mask for wall sensor: exclude wheel bodies (*_foot) to avoid ground contact false positives.
+    _wall_body_non_wheel_mask: torch.Tensor | None = None
+    if _base_sensor is not None:
+        _wall_body_non_wheel_mask = torch.tensor(
+            [not n.endswith("_foot") for n in _base_sensor.body_names],
+            dtype=torch.bool,
+            device=_dev,
+        )
+
+    _obs_contact_prev  = torch.zeros(_num_envs_val, _obs_sensor.data.net_forces_w_history.shape[2] if _obs_sensor is not None else 1, dtype=torch.bool, device=_dev) if _obs_sensor is not None else None
+    _base_contact_prev = torch.zeros(_num_envs_val, dtype=torch.bool, device=_dev)
+    _obs_coll_ep       = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+    _low_obs_coll_ep   = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+    _wall_coll_ep      = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+    _obs_coll_history:      list[float] = []
+    _low_obs_coll_history:  list[float] = []
+    _wall_coll_history:     list[float] = []
+    # Cumulative navigation distance per env: sum of completed path lengths within the episode.
+    _cumul_path_progress = torch.zeros(_num_envs_val, device=_dev)
+
     (
         _nav_goal_marker, _nav_final_goal_marker, _nav_start_marker, _nav_path_marker,
         _nav_has_goal_markers,
@@ -1670,13 +1718,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 obs = env.get_observations()
             # agent stepping
             actions = teacher(obs) if teacher is not None else policy(obs)
-            # Capture path progress before env.step() resets it for done envs.
+            # Capture state before env.step() so episode-end and goal-reached events can be detected.
             _pre_step_path_progress = (
                 _base_env._go2w_navigation_path_progress_s.clone()
                 if hasattr(_base_env, "_go2w_navigation_path_progress_s") else None
             )
+            _pre_step_goals_reached = (
+                _base_env._go2w_goals_reached_episode.clone()
+                if hasattr(_base_env, "_go2w_goals_reached_episode") else None
+            )
             # env stepping
             obs, _, dones, _ = env.step(actions)
+            # Accumulate completed path length when a goal is reached mid-episode (non-done envs only).
+            if _pre_step_goals_reached is not None and _pre_step_path_progress is not None:
+                _post_goals = _base_env._go2w_goals_reached_episode
+                _goal_hit = (_post_goals > _pre_step_goals_reached) & ~dones.to(_dev).bool()
+                _cumul_path_progress[_goal_hit] += _pre_step_path_progress[_goal_hit]
             # reset recurrent states for episodes that have terminated
             if teacher is not None:
                 teacher.reset(dones.bool())
@@ -1794,12 +1851,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     _goals_per_episode_history.append(
                         float(_base_env._go2w_goals_reached_episode[env_id].item())
                     )
-            # Record path progress at episode end (captured pre-step, before reset zeroes it).
+            # Record any-collision and low-obstacle-collision flags per episode.
+            if hasattr(_base_env, "_go2w_had_collision_episode"):
+                for env_id in done_ids:
+                    _collision_episode_history.append(
+                        float(_base_env._go2w_had_collision_episode[env_id].item())
+                    )
+            if hasattr(_base_env, "_go2w_had_low_obstacle_collision_episode"):
+                for env_id in done_ids:
+                    _low_collision_episode_history.append(
+                        float(_base_env._go2w_had_low_obstacle_collision_episode[env_id].item())
+                    )
+            # Record onset-based collision counts (obstacle / low-obstacle / wall) per episode.
+            if _obs_sensor is not None:
+                for env_id in done_ids:
+                    _obs_coll_history.append(float(_obs_coll_ep[env_id].item()))
+                    _low_obs_coll_history.append(float(_low_obs_coll_ep[env_id].item()))
+                    _wall_coll_history.append(float(_wall_coll_ep[env_id].item()))
+                _obs_coll_ep[done_ids]     = 0
+                _low_obs_coll_ep[done_ids] = 0
+                _wall_coll_ep[done_ids]    = 0
+                _obs_contact_prev[done_ids]  = False
+                _base_contact_prev[done_ids] = False
+            # Record cumulative navigation distance: sum of all completed paths + final partial path.
             if _pre_step_path_progress is not None:
                 for env_id in done_ids:
                     _path_progress_history.append(
-                        float(_pre_step_path_progress[env_id].item())
+                        float((_cumul_path_progress[env_id] + _pre_step_path_progress[env_id]).item())
                     )
+                _cumul_path_progress[done_ids] = 0.0
+            # Refresh low-obstacle mask with center_z values updated by the episode reset.
+            if _obs_sensor is not None:
+                _czs = getattr(_base_env, "_go2w_obstacle_center_z", None)
+                if _czs is not None and _czs.shape[-1] >= _num_obs_slots:
+                    _low_obs_mask = (_czs[0, :_num_obs_slots] < 0.25).to(_dev)
             episode_lengths[done_ids] = 0
             completed_episodes += num_done
 
@@ -1842,6 +1927,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
             if _obstacle_label_logging:
                 _print_nav_obstacle_label_log(_base_env, step_count, args_cli.nav_log_env)
+        # Onset-based collision detection: rising-edge (no-contact→contact) per env per slot.
+        if _obs_sensor is not None:
+            _obs_forces = _obs_sensor.data.net_forces_w_history[:, 0]  # [E, N_obs, 3]
+            _obs_force_mag = _obs_forces.norm(dim=-1)                   # [E, N_obs]
+            _obs_contact_now = _obs_force_mag > _OBSTACLE_CONTACT_THRESHOLD
+            _obs_onset = _obs_contact_now & ~_obs_contact_prev           # rising edge
+            _obs_coll_ep     += _obs_onset.any(dim=-1).long()
+            if _low_obs_mask is not None:
+                _low_obs_coll_ep += (_obs_onset & _low_obs_mask).any(dim=-1).long()
+            _obs_contact_prev = _obs_contact_now
+
+            # Wall: non-wheel robot body force with no simultaneous obstacle contact.
+            if _base_sensor is not None:
+                _base_forces = _base_sensor.data.net_forces_w_history[:, 0]  # [E, bodies, 3]
+                if _wall_body_non_wheel_mask is not None:
+                    _base_forces = _base_forces[:, _wall_body_non_wheel_mask, :]
+                _base_force_mag = _base_forces.norm(dim=-1).max(dim=-1).values  # [E]
+                _base_contact_now = _base_force_mag > _WALL_CONTACT_THRESHOLD
+                _wall_onset = (_base_contact_now & ~_base_contact_prev) & ~_obs_contact_now.any(dim=-1)
+                _wall_coll_ep += _wall_onset.long()
+                _base_contact_prev = _base_contact_now
+
         if args_cli.nav_contact_debug:
             _print_nav_contact_debug(_base_env, step_count, args_cli.nav_log_env, last_hlc_cmd)
             if step_count + 1 >= args_cli.nav_contact_debug_steps:
@@ -1901,6 +2008,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             float(sum(_path_progress_history) / len(_path_progress_history))
             if _path_progress_history else None
         )
+        _collision_rate = (
+            float(sum(_collision_episode_history) / len(_collision_episode_history))
+            if _collision_episode_history else None
+        )
+        _low_collision_rate = (
+            float(sum(_low_collision_episode_history) / len(_low_collision_episode_history))
+            if _low_collision_episode_history else None
+        )
+        _avg_obs_collisions = (
+            float(sum(_obs_coll_history) / len(_obs_coll_history))
+            if _obs_coll_history else None
+        )
+        _avg_low_obs_collisions = (
+            float(sum(_low_obs_coll_history) / len(_low_obs_coll_history))
+            if _low_obs_coll_history else None
+        )
+        _avg_wall_collisions = (
+            float(sum(_wall_coll_history) / len(_wall_coll_history))
+            if _wall_coll_history else None
+        )
         _manifest = {
             "task": args_cli.task,
             "checkpoint": getattr(args_cli, "checkpoint", None),
@@ -1914,6 +2041,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "avg_episode_length": _avg_ep_len,
             "goals_per_episode": _goals_per_ep_mean,
             "path_progress_mean": _path_progress_mean,
+            "collision_rate": _collision_rate,
+            "low_obstacle_collision_rate": _low_collision_rate,
+            "avg_obstacle_collisions_per_ep": _avg_obs_collisions,
+            "avg_low_obstacle_collisions_per_ep": _avg_low_obs_collisions,
+            "avg_wall_collisions_per_ep": _avg_wall_collisions,
         }
         _manifest_path = os.path.join(_out_dir, "session_manifest.json")
         with open(_manifest_path, "w") as _mf:
