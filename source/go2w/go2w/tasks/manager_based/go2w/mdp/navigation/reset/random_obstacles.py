@@ -76,37 +76,6 @@ def update_locomotion_curriculum(
                                   lerp(ang_vel_z_initial[1], ang_vel_z_final[1]))
 
 
-def _separated_parked_positions(parked_world: torch.Tensor, num_slots: int) -> torch.Tensor:
-    from ..slotting import _separated_parked_positions as _impl
-
-    return _impl(parked_world, num_slots)
-
-
-def _physical_slot_randomization_mask(
-    env: ManagerBasedRLEnv,
-    n: int,
-    randomize_slots: bool,
-    start_iteration: int,
-    warmup_iterations: int,
-    steps_per_iteration: int,
-    device: torch.device,
-) -> bool | torch.Tensor:
-    from ..slotting import _physical_slot_randomization_mask as _impl
-
-    return _impl(env, n, randomize_slots, start_iteration, warmup_iterations, steps_per_iteration, device)
-
-
-def _assign_logical_positions_to_physical_slots(
-    logical_positions: torch.Tensor,
-    logical_active: torch.Tensor,
-    parked_positions: torch.Tensor,
-    randomize_slots: bool | torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from ..slotting import _assign_logical_positions_to_physical_slots as _impl
-
-    return _impl(logical_positions, logical_active, parked_positions, randomize_slots)
-
-
 def reset_obstacles_curriculum(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,

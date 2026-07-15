@@ -16,11 +16,16 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
-from checkpoint_utils import configure_frozen_llc_action, load_teacher_locomotion_checkpoint  # isort: skip
+from checkpoint_utils import configure_frozen_llc_action  # isort: skip
+from play_common import (  # isort: skip
+    TeeStream,
+    build_teacher_policy,
+    format_eval_metrics,
+    override_play_obstacle_count,
+    override_play_command_path_spawn,
+    resolve_play_seed,
+)
 
-DEFAULT_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
-DEFAULT_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
-DEFAULT_COMMAND_PATH_MIN_SPEED = 0.2
 DEFAULT_DYNAMIC_OBSTACLE_SPEED_RANGE = (0.25, 0.70)
 DEFAULT_DYNAMIC_OBSTACLE_LATERAL_SPEED = 0.12
 DEFAULT_DYNAMIC_OBSTACLE_LONGITUDINAL_EXTENT = 2.0
@@ -487,6 +492,31 @@ parser.add_argument(
     help="Navigation play tasks only: aggregate this many completed episodes, then exit. Use 0 for endless play.",
 )
 parser.add_argument(
+    "--stuck_timeout_steps",
+    "--stuck-timeout-steps",
+    dest="stuck_timeout_steps",
+    type=int,
+    default=0,
+    help="Force-reset envs that haven't moved --stuck_threshold m in this many steps. 0=disabled.",
+)
+parser.add_argument(
+    "--stuck_threshold",
+    "--stuck-threshold",
+    dest="stuck_threshold",
+    type=float,
+    default=0.3,
+    help="Displacement threshold (m) for stuck detection. Default: 0.3.",
+)
+parser.add_argument(
+    "--seed_per_episode",
+    "--seed-per-episode",
+    dest="seed_per_episode",
+    action="store_true",
+    default=False,
+    help="Increment fixed_layout_seed by 1 per completed episode (requires --seed). "
+    "Ensures all ablation runs see the same sequence of layouts for fair comparison.",
+)
+parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument(
@@ -507,6 +537,15 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Save the student depth camera view as an MP4 video alongside the log.",
+)
+parser.add_argument(
+    "--depth_video_steps",
+    "--depth-video-steps",
+    dest="depth_video_steps",
+    type=int,
+    default=0,
+    help="Max steps to record for depth video. 0 = record entire run (default). "
+    "Use e.g. 2000 to capture only the first ~2 episodes.",
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument(
@@ -565,27 +604,9 @@ installed_version = metadata.version("rsl-rl-lib")
 """Rest everything follows."""
 
 from collections import defaultdict
-import copy
 import os
 import subprocess
 import time
-
-
-class _TeeStream:
-    """Mirrors writes to multiple streams (stdout + file)."""
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, data):
-        for s in self._streams:
-            s.write(data)
-
-    def flush(self):
-        for s in self._streams:
-            s.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._streams[0], name)
 
 import gymnasium as gym
 import numpy as np
@@ -607,7 +628,6 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.math import quat_from_angle_axis
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
-from rsl_rl.utils import resolve_callable
 
 from isaaclab_rl.rsl_rl import (
     RslRlBaseRunnerCfg,
@@ -640,7 +660,6 @@ from go2w.tasks.manager_based.go2w.cfg.observation_layout import POLICY_OBS
 
 from play_nav_debug import (  # isort: skip
     NAV_LIVE_LABEL_INTERVAL, NAV_LIVE_LABEL_SCALE, NAV_LIVE_LABEL_MAX,
-    _format_eval_metrics,
     _LiveObstacleLabelDrawer,
     _nav_debug_corridor_plot_args,
     _ablation_apply_direct_goal,
@@ -652,56 +671,6 @@ from play_nav_debug import (  # isort: skip
 )
 
 
-def _build_teacher_policy(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
-    """Instantiate the rule-based navigation teacher for direct play/evaluation."""
-    teacher_cfg = getattr(agent_cfg, "teacher", None)
-    if teacher_cfg is None:
-        raise ValueError("--teacher_steering requires a distillation runner config with a teacher model.")
-    if "teacher" not in obs:
-        raise ValueError("--teacher_steering requires an env exposing the 'teacher' observation group.")
-    if args_cli.locomotion_checkpoint is None:
-        raise ValueError("--teacher_steering requires --locomotion_checkpoint for the frozen LLC.")
-
-    teacher_cfg_dict = copy.deepcopy(teacher_cfg.to_dict())
-    teacher_class = resolve_callable(teacher_cfg_dict.pop("class_name"))
-    teacher = teacher_class(obs, {"teacher": ["teacher"]}, "teacher", env.num_actions, **teacher_cfg_dict)
-    teacher = teacher.to(device)
-    teacher.eval()
-    load_teacher_locomotion_checkpoint(teacher, args_cli.locomotion_checkpoint, device)
-    return teacher
-
-
-def _override_play_obstacle_count(
-    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
-    num_obstacles: int | None,
-):
-    """Override active obstacle count for obstacle play configs."""
-    if num_obstacles is None:
-        return
-    if num_obstacles < 0:
-        raise ValueError("--num_obstacles must be >= 0.")
-
-    events_cfg = getattr(env_cfg, "events", None)
-    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
-    if reset_obstacles is None:
-        raise ValueError("--num_obstacles requires an obstacle play task with a reset_obstacles event.")
-
-    params = reset_obstacles.params
-    obstacle_names = params.get("obstacle_names", [])
-    max_available = len(obstacle_names)
-    if num_obstacles > max_available:
-        raise ValueError(
-            f"--num_obstacles={num_obstacles} exceeds the play scene capacity ({max_available}). "
-            "Increase PLAY_MAX_OBSTACLES in cfg/navigation/env.py if you need more."
-        )
-
-    if "start_iteration" in params:
-        params["start_iteration"] = 0
-    if "warmup_iterations" in params:
-        params["warmup_iterations"] = 0
-    params["min_obstacles"] = num_obstacles
-    params["max_obstacles"] = num_obstacles
-    print(f"[INFO] Active play obstacles: {num_obstacles}/{max_available}")
 
 
 def _override_dynamic_navigation_play(
@@ -1099,62 +1068,6 @@ def _override_play_episode_length(
     print(f"[INFO] Play episode length: {env_cfg.episode_length_s:.1f} s")
 
 
-def _override_play_command_path_spawn(
-    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
-    command_path_obstacles: int | None,
-    command_path_forward_range: tuple[float, float] | list[float] | None,
-    command_path_lateral_range: tuple[float, float] | list[float] | None,
-    command_path_min_speed: float | None,
-):
-    """Override command-direction obstacle spawn for obstacle play configs."""
-    if (
-        command_path_obstacles is None
-        and command_path_forward_range is None
-        and command_path_lateral_range is None
-        and command_path_min_speed is None
-    ):
-        return
-
-    events_cfg = getattr(env_cfg, "events", None)
-    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
-    if reset_obstacles is None:
-        raise ValueError("--command_path_obstacles requires an obstacle play task with a reset_obstacles event.")
-
-    params = reset_obstacles.params
-    obstacle_names = params.get("obstacle_names", [])
-    max_available = len(obstacle_names)
-    active_obstacles = int(params.get("max_obstacles", max_available))
-
-    count = params.get("command_path_obstacles", 0) if command_path_obstacles is None else command_path_obstacles
-    if count < 0:
-        raise ValueError("--command_path_obstacles must be >= 0.")
-    if count > active_obstacles:
-        raise ValueError(
-            f"--command_path_obstacles={count} exceeds active obstacle count ({active_obstacles}). "
-            "Increase --num_obstacles or lower the command-path count."
-        )
-
-    forward_range = tuple(command_path_forward_range) if command_path_forward_range is not None else params.get(
-        "command_path_forward_range", DEFAULT_COMMAND_PATH_FORWARD_RANGE
-    )
-    lateral_range = tuple(command_path_lateral_range) if command_path_lateral_range is not None else params.get(
-        "command_path_lateral_range", DEFAULT_COMMAND_PATH_LATERAL_RANGE
-    )
-    min_speed = command_path_min_speed
-    if min_speed is None:
-        min_speed = params.get("command_path_min_speed", DEFAULT_COMMAND_PATH_MIN_SPEED)
-
-    params["command_path_obstacles"] = count
-    params["command_name"] = "base_velocity"
-    params["command_path_forward_range"] = forward_range
-    params["command_path_lateral_range"] = lateral_range
-    params["command_path_min_speed"] = min_speed
-    print(
-        "[INFO] Command-path obstacle spawn: "
-        f"count={count}, forward={forward_range}, lateral={lateral_range}, min_speed={min_speed:.2f}"
-    )
-
-
 def _override_navigation_play_case(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     args_cli: argparse.Namespace,
@@ -1257,13 +1170,6 @@ def _override_navigation_play_case(
     )
 
 
-def _resolve_play_seed(args_cli, default_seed: int | None) -> int:
-    if args_cli.seed is not None:
-        return args_cli.seed
-    base_seed = default_seed if default_seed is not None else 0
-    return (base_seed + random.SystemRandom().randrange(1, 2_147_483_647)) % 2_147_483_647
-
-
 def _init_spl_tracking(
     base_env, termination_names: list[str]
 ) -> tuple[bool, torch.Tensor, torch.Tensor, int | None]:
@@ -1363,10 +1269,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    # Resize terrain generator grid so tiles match num_envs exactly (same logic as train.py).
+    _scene_terrain = getattr(env_cfg.scene, "terrain", None)
+    if _scene_terrain is not None and getattr(_scene_terrain, "use_terrain_origins", False):
+        _tg = getattr(_scene_terrain, "terrain_generator", None)
+        if _tg is not None:
+            import math as _m
+            _n = env_cfg.scene.num_envs
+            _r = _m.isqrt(_n)
+            while _r > 1 and _n % _r != 0:
+                _r -= 1
+            _tg.num_rows = max(1, _r)
+            _tg.num_cols = max(1, _m.ceil(_n / _r))
+            del _m, _n, _r, _tg
+    del _scene_terrain
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
     _override_play_episode_length(env_cfg, args_cli)
-    _override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
-    _override_play_command_path_spawn(
+    override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
+    override_play_command_path_spawn(
         env_cfg,
         args_cli.command_path_obstacles,
         args_cli.command_path_forward_range,
@@ -1377,7 +1297,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Resolve seed early so _override_navigation_play_case can inject fixed_layout_seed.
     # handle_deprecated_rsl_rl_cfg does not affect the seed path, so order is safe.
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-    env_seed = _resolve_play_seed(args_cli, agent_cfg.seed)
+    env_seed = resolve_play_seed(args_cli, agent_cfg.seed)
     agent_cfg.seed = env_seed
     env_cfg.seed = env_seed
     print(f"[INFO] Play seed: {env_seed}")
@@ -1446,7 +1366,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     teacher = None
     policy_nn = None
     if args_cli.teacher_steering:
-        teacher = _build_teacher_policy(env, obs, agent_cfg, env.unwrapped.device)
+        teacher = build_teacher_policy(
+            env, obs, agent_cfg, env.unwrapped.device, args_cli.locomotion_checkpoint
+        )
         print("[INFO] Running direct teacher steering: geometric navigation teacher + frozen LLC")
     else:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
@@ -1457,7 +1379,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-        runner.load(resume_path)
+        if agent_cfg.class_name == "DistillationRunner":
+            # Inference only uses the student policy.  Some play/eval envs expose a
+            # teacher obs shape that differs from the distillation checkpoint.
+            runner.load(
+                resume_path,
+                load_cfg={"student": True, "teacher": False, "optimizer": False, "iteration": True},
+            )
+        else:
+            runner.load(resume_path)
 
         # obtain the trained policy for inference
         policy = runner.get_inference_policy(device=env.unwrapped.device)
@@ -1505,6 +1435,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         termination_names.index("obstacle_contact") if "obstacle_contact" in termination_names else None
     )
     multi_term_episodes = 0
+    _stuck_termination_count = 0
 
     # Navigation visualization markers — only created for nav tasks.
     _base_env = env.unwrapped
@@ -1514,7 +1445,59 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _init_spl_tracking(_base_env, termination_names)
     )
     _nav_prev_robot_pos: torch.Tensor | None = None
+    _stuck_last_pos: torch.Tensor | None = None
+    _stuck_counter = torch.zeros(env.unwrapped.num_envs, dtype=torch.long)
     _nav_spl_history: list[float] = []
+    _goals_per_episode_history: list[float] = []
+    _path_progress_history: list[float] = []
+    _collision_episode_history: list[float] = []
+    _low_collision_episode_history: list[float] = []
+
+    # --- Onset-based collision tracking (eval only, requires ContactSensor in scene) ---
+    # obstacle_contacts sensor: robot↔obstacle contacts (obstacles float 5cm above ground,
+    # so net_forces only reflects robot hits). Low-obstacle slots identified by center_z < 0.25m.
+    # contact_forces sensor on Robot/base: catches wall hits (base never touches ground normally).
+    _OBSTACLE_CONTACT_THRESHOLD = 1.0   # N — same as training reward threshold
+    _WALL_CONTACT_THRESHOLD     = 0.5   # N — lower than termination (1.0 N) to catch soft grazes
+    _obs_sensor     = _base_env.scene.sensors.get("obstacle_contacts")
+    # Prefer full robot-body sensor (eval scenes); fall back to base-only contact_forces.
+    _base_sensor    = (
+        _base_env.scene.sensors.get("robot_body_contacts")
+        or _base_env.scene.sensors.get("contact_forces")
+    )
+    _num_envs_val   = _base_env.num_envs
+    _dev             = _base_env.device
+
+    # Precompute low-obstacle mask from scene center_z values.
+    _low_obs_mask: torch.Tensor | None = None
+    if _obs_sensor is not None:
+        _num_obs_slots = _obs_sensor.data.net_forces_w_history.shape[2]
+        _center_zs = getattr(_base_env, "_go2w_obstacle_center_z", None)
+        if _center_zs is not None and _center_zs.shape[-1] >= _num_obs_slots:
+            _low_obs_mask = (_center_zs[0, :_num_obs_slots] < 0.25).to(_dev)
+        else:
+            _low_obs_mask = torch.zeros(_num_obs_slots, dtype=torch.bool, device=_dev)
+
+    # Mask for wall sensor: exclude wheel bodies (*_foot) to avoid ground contact false positives.
+    _wall_body_non_wheel_mask: torch.Tensor | None = None
+    if _base_sensor is not None:
+        _wall_body_non_wheel_mask = torch.tensor(
+            [not n.endswith("_foot") for n in _base_sensor.body_names],
+            dtype=torch.bool,
+            device=_dev,
+        )
+
+    _obs_contact_prev  = torch.zeros(_num_envs_val, _obs_sensor.data.net_forces_w_history.shape[2] if _obs_sensor is not None else 1, dtype=torch.bool, device=_dev) if _obs_sensor is not None else None
+    _base_contact_prev = torch.zeros(_num_envs_val, dtype=torch.bool, device=_dev)
+    _obs_coll_ep       = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+    _low_obs_coll_ep   = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+    _wall_coll_ep      = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+    _obs_coll_history:      list[float] = []
+    _low_obs_coll_history:  list[float] = []
+    _wall_coll_history:     list[float] = []
+    # Cumulative navigation distance per env: sum of completed path lengths within the episode.
+    _cumul_path_progress = torch.zeros(_num_envs_val, device=_dev)
+
     (
         _nav_goal_marker, _nav_final_goal_marker, _nav_start_marker, _nav_path_marker,
         _nav_has_goal_markers,
@@ -1527,7 +1510,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _out_dir = os.path.abspath(os.path.join("logs", "nav_play", args_cli.play_name))
         os.makedirs(_out_dir, exist_ok=True)
         _out_log_file = open(os.path.join(_out_dir, "nav_debug.log"), "w", buffering=1)
-        sys.stdout = _TeeStream(sys.__stdout__, _out_log_file)
+        sys.stdout = TeeStream(sys.__stdout__, _out_log_file)
         os.environ.setdefault("GO2W_NAV_DEBUG", "1")
         print(f"[INFO] Play output dir: {_out_dir}")
 
@@ -1609,8 +1592,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 obs = env.get_observations()
             # agent stepping
             actions = teacher(obs) if teacher is not None else policy(obs)
+            # Capture state before env.step() so episode-end and goal-reached events can be detected.
+            _pre_step_path_progress = (
+                _base_env._go2w_navigation_path_progress_s.clone()
+                if hasattr(_base_env, "_go2w_navigation_path_progress_s") else None
+            )
+            _pre_step_goals_reached = (
+                _base_env._go2w_goals_reached_episode.clone()
+                if hasattr(_base_env, "_go2w_goals_reached_episode") else None
+            )
             # env stepping
             obs, _, dones, _ = env.step(actions)
+            # Accumulate completed path length when a goal is reached mid-episode (non-done envs only).
+            if _pre_step_goals_reached is not None and _pre_step_path_progress is not None:
+                _post_goals = _base_env._go2w_goals_reached_episode
+                _goal_hit = (_post_goals > _pre_step_goals_reached) & ~dones.to(_dev).bool()
+                _cumul_path_progress[_goal_hit] += _pre_step_path_progress[_goal_hit]
             # reset recurrent states for episodes that have terminated
             if teacher is not None:
                 teacher.reset(dones.bool())
@@ -1620,7 +1617,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 policy_nn.reset(dones)
 
         # Collect depth camera frame for video recording.
-        if args_cli.depth_video:
+        _depth_video_limit = args_cli.depth_video_steps
+        if args_cli.depth_video and (_depth_video_limit == 0 or len(_depth_video_frames) < _depth_video_limit):
             _depth_sensor = _base_env.scene.sensors["depth_camera"]
             _depth_raw = _depth_sensor.data.output["distance_to_image_plane"]
             if _depth_raw.ndim == 4:
@@ -1642,6 +1640,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 done_cpu = dones.cpu().bool()
                 _nav_actual_len += torch.where(done_cpu, torch.zeros_like(step_disp), step_disp)
             _nav_prev_robot_pos = cur_robot_pos
+
+        # Stuck detection: force-reset envs that haven't moved enough in N steps.
+        if args_cli.stuck_timeout_steps > 0:
+            _cur_stuck_pos = _base_env.scene["robot"].data.root_pos_w[:, :2].cpu()
+            if _stuck_last_pos is None:
+                _stuck_last_pos = _cur_stuck_pos.clone()
+            else:
+                _disp = (_cur_stuck_pos - _stuck_last_pos).norm(dim=-1)
+                _moved = _disp >= args_cli.stuck_threshold
+                _stuck_last_pos[_moved] = _cur_stuck_pos[_moved]
+                _stuck_counter[_moved] = 0
+                _stuck_counter[~_moved & ~dones.cpu().bool()] += 1
+                _stuck_mask = _stuck_counter >= args_cli.stuck_timeout_steps
+                if _stuck_mask.any():
+                    _stuck_ids = _stuck_mask.nonzero(as_tuple=False).squeeze(-1).to(_base_env.device)
+                    _base_env.episode_length_buf[_stuck_ids] = _base_env.max_episode_length - 1
+                    _stuck_termination_count += int(_stuck_mask.sum().item())
+                    _stuck_counter[_stuck_mask] = 0
+                    _stuck_last_pos[_stuck_mask] = _cur_stuck_pos[_stuck_mask]
 
         # Track last HLC command (policy output = 3D velocity) for logging.
         last_hlc_cmd = actions.detach()
@@ -1677,6 +1694,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
         num_done = int(done_ids.numel())
         if num_done > 0:
+            if args_cli.stuck_timeout_steps > 0 and _stuck_last_pos is not None:
+                _done_cpu = done_ids.cpu()
+                _stuck_counter[_done_cpu] = 0
+                _stuck_last_pos[_done_cpu] = _base_env.scene["robot"].data.root_pos_w[:, :2].cpu()[_done_cpu]
             total_episode_length += float(episode_lengths[done_ids].sum().item())
             done_terms = (
                 termination_manager._last_episode_dones[done_ids] if termination_manager is not None else None
@@ -1698,8 +1719,59 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Reset collision count for episodes that just ended.
             for env_id in done_ids.tolist():
                 episode_collision_counts[env_id] = 0
+            # Record goals reached per episode before reset clears the counter.
+            if hasattr(_base_env, "_go2w_goals_reached_episode"):
+                for env_id in done_ids:
+                    _goals_per_episode_history.append(
+                        float(_base_env._go2w_goals_reached_episode[env_id].item())
+                    )
+            # Record any-collision and low-obstacle-collision flags per episode.
+            if hasattr(_base_env, "_go2w_had_collision_episode"):
+                for env_id in done_ids:
+                    _collision_episode_history.append(
+                        float(_base_env._go2w_had_collision_episode[env_id].item())
+                    )
+            if hasattr(_base_env, "_go2w_had_low_obstacle_collision_episode"):
+                for env_id in done_ids:
+                    _low_collision_episode_history.append(
+                        float(_base_env._go2w_had_low_obstacle_collision_episode[env_id].item())
+                    )
+            # Record onset-based collision counts (obstacle / low-obstacle / wall) per episode.
+            if _obs_sensor is not None:
+                for env_id in done_ids:
+                    _obs_coll_history.append(float(_obs_coll_ep[env_id].item()))
+                    _low_obs_coll_history.append(float(_low_obs_coll_ep[env_id].item()))
+                    _wall_coll_history.append(float(_wall_coll_ep[env_id].item()))
+                _obs_coll_ep[done_ids]     = 0
+                _low_obs_coll_ep[done_ids] = 0
+                _wall_coll_ep[done_ids]    = 0
+                _obs_contact_prev[done_ids]  = False
+                _base_contact_prev[done_ids] = False
+            # Record cumulative navigation distance: sum of all completed paths + final partial path.
+            if _pre_step_path_progress is not None:
+                for env_id in done_ids:
+                    _path_progress_history.append(
+                        float((_cumul_path_progress[env_id] + _pre_step_path_progress[env_id]).item())
+                    )
+                _cumul_path_progress[done_ids] = 0.0
+            # Refresh low-obstacle mask with center_z values updated by the episode reset.
+            if _obs_sensor is not None:
+                _czs = getattr(_base_env, "_go2w_obstacle_center_z", None)
+                if _czs is not None and _czs.shape[-1] >= _num_obs_slots:
+                    _low_obs_mask = (_czs[0, :_num_obs_slots] < 0.25).to(_dev)
             episode_lengths[done_ids] = 0
             completed_episodes += num_done
+
+            # Advance layout seed so each episode sees a unique layout (fair cross-ablation comparison).
+            # Only update if the key already exists — some reset functions (e.g. reset_hospital_maze_training,
+            # reset_structured_astar_corridor) don't accept fixed_layout_seed and would crash on **params.
+            if args_cli.seed_per_episode and args_cli.seed is not None:
+                try:
+                    _obs_term_cfg = _base_env.event_manager.get_term_cfg("reset_obstacles")
+                    if "fixed_layout_seed" in (_obs_term_cfg.params or {}):
+                        _obs_term_cfg.params["fixed_layout_seed"] = args_cli.seed + completed_episodes
+                except (ValueError, KeyError, AttributeError):
+                    pass
 
             # SPL: record contribution for each completed episode then reset trackers.
             if _spl_enabled and done_terms is not None and _goal_reached_term_idx is not None:
@@ -1729,6 +1801,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
             if _obstacle_label_logging:
                 _print_nav_obstacle_label_log(_base_env, step_count, args_cli.nav_log_env)
+        # Onset-based collision detection: rising-edge (no-contact→contact) per env per slot.
+        if _obs_sensor is not None:
+            _obs_forces = _obs_sensor.data.net_forces_w_history[:, 0]  # [E, N_obs, 3]
+            _obs_force_mag = _obs_forces.norm(dim=-1)                   # [E, N_obs]
+            _obs_contact_now = _obs_force_mag > _OBSTACLE_CONTACT_THRESHOLD
+            _obs_onset = _obs_contact_now & ~_obs_contact_prev           # rising edge
+            _obs_coll_ep     += _obs_onset.any(dim=-1).long()
+            if _low_obs_mask is not None:
+                _low_obs_coll_ep += (_obs_onset & _low_obs_mask).any(dim=-1).long()
+            _obs_contact_prev = _obs_contact_now
+
+            # Wall: non-wheel robot body force with no simultaneous obstacle contact.
+            if _base_sensor is not None:
+                _base_forces = _base_sensor.data.net_forces_w_history[:, 0]  # [E, bodies, 3]
+                if _wall_body_non_wheel_mask is not None:
+                    _base_forces = _base_forces[:, _wall_body_non_wheel_mask, :]
+                _base_force_mag = _base_forces.norm(dim=-1).max(dim=-1).values  # [E]
+                _base_contact_now = _base_force_mag > _WALL_CONTACT_THRESHOLD
+                _wall_onset = (_base_contact_now & ~_base_contact_prev) & ~_obs_contact_now.any(dim=-1)
+                _wall_coll_ep += _wall_onset.long()
+                _base_contact_prev = _base_contact_now
+
         if args_cli.nav_contact_debug:
             _print_nav_contact_debug(_base_env, step_count, args_cli.nav_log_env, last_hlc_cmd)
             if step_count + 1 >= args_cli.nav_contact_debug_steps:
@@ -1745,7 +1839,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if _nav_spl_history:
                 averaged["spl"] = sum(_nav_spl_history) / len(_nav_spl_history)
             avg_episode_length = total_episode_length / max(completed_episodes, 1)
-            print("[PLAY-EVAL] " + _format_eval_metrics(averaged, completed_episodes, avg_episode_length))
+            print("[PLAY-EVAL] " + format_eval_metrics(averaged, completed_episodes, avg_episode_length))
             if completed_episodes >= args_cli.nav_eval_episodes:
                 break
 
@@ -1772,13 +1866,60 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Write session manifest when --play_name is set.
     if _out_dir is not None:
         import json as _json
+        _tc = dict(termination_counts) if termination_counts else {}
+        if _stuck_termination_count > 0:
+            _tc["stuck_timeout"] = _stuck_termination_count
+        _spl_mean = float(sum(_nav_spl_history) / len(_nav_spl_history)) if _nav_spl_history else None
+        _avg_ep_len = total_episode_length / max(completed_episodes, 1)
+        _success_rate = (
+            _tc.get("goal_reached", 0) + _tc.get("structured_goal_reached", 0)
+        ) / max(completed_episodes, 1)
+        _goals_per_ep_mean = (
+            float(sum(_goals_per_episode_history) / len(_goals_per_episode_history))
+            if _goals_per_episode_history else None
+        )
+        _path_progress_mean = (
+            float(sum(_path_progress_history) / len(_path_progress_history))
+            if _path_progress_history else None
+        )
+        _collision_rate = (
+            float(sum(_collision_episode_history) / len(_collision_episode_history))
+            if _collision_episode_history else None
+        )
+        _low_collision_rate = (
+            float(sum(_low_collision_episode_history) / len(_low_collision_episode_history))
+            if _low_collision_episode_history else None
+        )
+        _avg_obs_collisions = (
+            float(sum(_obs_coll_history) / len(_obs_coll_history))
+            if _obs_coll_history else None
+        )
+        _avg_low_obs_collisions = (
+            float(sum(_low_obs_coll_history) / len(_low_obs_coll_history))
+            if _low_obs_coll_history else None
+        )
+        _avg_wall_collisions = (
+            float(sum(_wall_coll_history) / len(_wall_coll_history))
+            if _wall_coll_history else None
+        )
         _manifest = {
             "task": args_cli.task,
             "checkpoint": getattr(args_cli, "checkpoint", None),
             "num_envs": args_cli.num_envs,
+            "completed_episodes": completed_episodes,
             "steps": step_count,
-            "total_episodes": sum(termination_counts.values()) if termination_counts else None,
-            "termination_counts": dict(termination_counts) if termination_counts else {},
+            "total_episodes": sum(_tc.values()) if _tc else None,
+            "termination_counts": _tc,
+            "success_rate": _success_rate,
+            "spl": _spl_mean,
+            "avg_episode_length": _avg_ep_len,
+            "goals_per_episode": _goals_per_ep_mean,
+            "path_progress_mean": _path_progress_mean,
+            "collision_rate": _collision_rate,
+            "low_obstacle_collision_rate": _low_collision_rate,
+            "avg_obstacle_collisions_per_ep": _avg_obs_collisions,
+            "avg_low_obstacle_collisions_per_ep": _avg_low_obs_collisions,
+            "avg_wall_collisions_per_ep": _avg_wall_collisions,
         }
         _manifest_path = os.path.join(_out_dir, "session_manifest.json")
         with open(_manifest_path, "w") as _mf:
@@ -1795,9 +1936,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "--output_dir", _out_dir,
         ]
         _plot_cmd.extend(_nav_debug_corridor_plot_args(_base_env, args_cli))
-        print(f"[INFO] Generating nav debug plot ...")
+        print("[INFO] Generating nav debug plot ...")
         sys.stdout.flush()
-        result = subprocess.run(_plot_cmd, capture_output=True, text=True)
+        result = subprocess.run(_plot_cmd, capture_output=True, text=True, start_new_session=True)
         if result.stdout:
             print(result.stdout.strip())
         if result.returncode != 0 and result.stderr:

@@ -276,6 +276,31 @@ def obstacle_contact_penalty(
     env._go2w_had_collision_episode[reset_mask] = False
     env._go2w_had_collision_episode |= contacts > 0
 
+    # Track low-obstacle contacts separately (for depth-student ablation eval).
+    low_flag_stored = getattr(env, "_go2w_obstacle_low_flag", None)
+    if low_flag_stored is not None and max_forces.shape[1] > 0:
+        if not hasattr(env, "_go2w_contact_body_to_slot"):
+            body_names = contact_sensor.body_names
+            slot_arr = torch.zeros(len(body_names), dtype=torch.long, device=env.device)
+            for bi, bname in enumerate(body_names):
+                try:
+                    slot_arr[bi] = int(bname.rsplit("_", 1)[1])
+                except (ValueError, IndexError):
+                    slot_arr[bi] = -1
+            env._go2w_contact_body_to_slot = slot_arr
+        slot_indices = env._go2w_contact_body_to_slot   # (K_bodies,)
+        K_max = low_flag_stored.shape[1]
+        valid = (slot_indices >= 0) & (slot_indices < K_max)
+        safe_slots = slot_indices.clamp(0, K_max - 1)
+        low_flag_by_body = low_flag_stored[:, safe_slots] & valid.unsqueeze(0)  # (N, K_bodies)
+        low_contacts = ((max_forces > threshold) & low_flag_by_body).any(dim=1)  # (N,)
+        if not hasattr(env, "_go2w_had_low_obstacle_collision_episode"):
+            env._go2w_had_low_obstacle_collision_episode = torch.zeros(
+                env.num_envs, device=env.device, dtype=torch.bool
+            )
+        env._go2w_had_low_obstacle_collision_episode[reset_mask] = False
+        env._go2w_had_low_obstacle_collision_episode |= low_contacts
+
     if "log" not in env.extras:
         env.extras["log"] = {}
     env.extras["log"]["obstacle_contact_activation_rate"] = (contacts > 0).float().mean()

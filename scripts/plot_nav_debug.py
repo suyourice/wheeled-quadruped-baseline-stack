@@ -557,7 +557,7 @@ def main() -> None:
 
     out_path = out_dir / f"{log_path.stem}_env{args.env}.png"
     plot_combined(records, args.env, occ, extent, astar_raw, astar_sparse, obstacle_snapshots, out_path, args.show)
-    print(f"\nDone.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":

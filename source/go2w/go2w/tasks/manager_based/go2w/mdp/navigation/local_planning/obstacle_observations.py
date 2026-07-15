@@ -16,6 +16,16 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi, yaw_quat
 
 from ...common.orientation import quat_yaw_wxyz
+from ..hospital.specs import (
+    HOSPITAL_CLASS_COUNT,
+    HOSPITAL_CORRIDOR_FEATURE_DIM,
+    HOSPITAL_MAZE_JUNCTION_COUNT,
+    HOSPITAL_PATH_FEATURE_DIM,
+    HOSPITAL_SEMANTIC_FEATURE_DIM,
+    HOSPITAL_TRAIN_ACTOR_SLOTS,
+    HOSPITAL_TRAIN_MAX_ROUTE_LENGTH,
+    HOSPITAL_TRAIN_OBSTACLE_DENSITY_SCHEDULE,
+)
 from ..goals import ensure_navigation_goal_buffers
 from .obstacle_geometry import (
     DEFAULT_OBSTACLE_DEPTH,
@@ -24,9 +34,11 @@ from .obstacle_geometry import (
     OBSTACLE_SHAPE_CONE,
     OBSTACLE_SHAPE_CUBOID,
     OBSTACLE_SHAPE_CYLINDER,
+    _meta_slice,
     obstacle_active_mask,
     obstacle_risk_radius,
 )
+from .hospital_metrics import hospital_centerline_metrics
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -34,6 +46,16 @@ if TYPE_CHECKING:
 # =============================================================================
 # Privileged navigation geometry features (teacher-only)
 # =============================================================================
+
+
+def _obstacle_obs_step_cache(env: ManagerBasedRLEnv) -> dict:
+    """Per-step observation cache for shared obstacle geometry tensors."""
+    step = int(getattr(env, "common_step_counter", 0))
+    if getattr(env, "_go2w_obstacle_obs_cache_step", None) != step:
+        env._go2w_obstacle_obs_cache = {}
+        env._go2w_obstacle_obs_cache_step = step
+    return env._go2w_obstacle_obs_cache
+
 
 def _get_obstacle_relative_xy(
     env: ManagerBasedRLEnv,
@@ -52,6 +74,12 @@ def _get_obstacle_relative_xy(
         z = torch.zeros(N, 0, device=env.device)
         return z.unsqueeze(-1).expand(-1, -1, 2), z, z
 
+    cache = _obstacle_obs_step_cache(env)
+    cache_key = ("relative_xy", tuple(obstacle_names), robot_cfg.name)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     robot = env.scene[robot_cfg.name]
     robot_pos_w = robot.data.root_pos_w[:, :3]
     robot_yaw_quat = yaw_quat(robot.data.root_quat_w)
@@ -67,7 +95,9 @@ def _get_obstacle_relative_xy(
     rel_xy = rel_b.reshape(N, K, 3)[:, :, :2]            # (N, K, 2)
     dists = torch.norm(rel_xy, dim=-1)                    # (N, K)
     angles = torch.atan2(rel_xy[..., 1], rel_xy[..., 0])  # (N, K) ∈ (−π, π]
-    return rel_xy, dists, angles
+    result = (rel_xy, dists, angles)
+    cache[cache_key] = result
+    return result
 
 
 def obstacle_full_geometry_features(
@@ -117,25 +147,32 @@ def obstacle_full_geometry_features(
     active = gather_slots(active).float()
 
     meta_shape = (env.num_envs, len(obstacle_names))
-    if hasattr(env, "_go2w_obstacle_shape_id") and env._go2w_obstacle_shape_id.shape == meta_shape:
-        shape_ids = gather_slots(env._go2w_obstacle_shape_id)
-    else:
-        shape_ids = torch.full((N, selected_slots), OBSTACLE_SHAPE_CUBOID, dtype=torch.long, device=device)
-    if hasattr(env, "_go2w_obstacle_width") and env._go2w_obstacle_width.shape == meta_shape:
-        widths = gather_slots(env._go2w_obstacle_width)
-    else:
-        widths = torch.full((N, selected_slots), DEFAULT_OBSTACLE_WIDTH, device=device)
-    if hasattr(env, "_go2w_obstacle_depth") and env._go2w_obstacle_depth.shape == meta_shape:
-        depths = gather_slots(env._go2w_obstacle_depth)
-    else:
-        depths = torch.full((N, selected_slots), DEFAULT_OBSTACLE_DEPTH, device=device)
-    if hasattr(env, "_go2w_obstacle_effective_radius") and env._go2w_obstacle_effective_radius.shape == meta_shape:
-        effective_radius = gather_slots(env._go2w_obstacle_effective_radius)
-    else:
-        effective_radius = torch.full((N, selected_slots), DEFAULT_OBSTACLE_EFFECTIVE_RADIUS, device=device)
 
-    if hasattr(env, "_go2w_obstacle_yaw") and env._go2w_obstacle_yaw.shape == meta_shape:
-        obstacle_yaw_w = gather_slots(env._go2w_obstacle_yaw)
+    def gather_meta(attr_name: str, fallback: torch.Tensor) -> torch.Tensor:
+        stored = getattr(env, attr_name, None)
+        sliced = _meta_slice(stored, meta_shape) if stored is not None else None
+        return gather_slots(sliced) if sliced is not None else fallback
+
+    shape_ids = gather_meta(
+        "_go2w_obstacle_shape_id",
+        torch.full((N, selected_slots), OBSTACLE_SHAPE_CUBOID, dtype=torch.long, device=device),
+    )
+    widths = gather_meta(
+        "_go2w_obstacle_width",
+        torch.full((N, selected_slots), DEFAULT_OBSTACLE_WIDTH, device=device),
+    )
+    depths = gather_meta(
+        "_go2w_obstacle_depth",
+        torch.full((N, selected_slots), DEFAULT_OBSTACLE_DEPTH, device=device),
+    )
+    effective_radius = gather_meta(
+        "_go2w_obstacle_effective_radius",
+        torch.full((N, selected_slots), DEFAULT_OBSTACLE_EFFECTIVE_RADIUS, device=device),
+    )
+    yaw_stored = getattr(env, "_go2w_obstacle_yaw", None)
+    yaw_sliced = _meta_slice(yaw_stored, meta_shape) if yaw_stored is not None else None
+    if yaw_sliced is not None:
+        obstacle_yaw_w = gather_slots(yaw_sliced)
     else:
         obs_quat_all = torch.stack([env.scene[n].data.root_quat_w for n in obstacle_names], dim=1)
         obstacle_yaw_w = gather_slots(quat_yaw_wxyz(obs_quat_all.reshape(N * K, 4)).reshape(N, K))
@@ -383,6 +420,170 @@ def obstacle_navigation_features(
         obstacle_count_norm,   # [14]
         rear_clearance,        # [15]
     ], dim=-1)  # (N, 16)
+
+
+def hospital_path_features(
+    env: ManagerBasedRLEnv,
+    max_path_length: float = HOSPITAL_TRAIN_MAX_ROUTE_LENGTH,
+) -> torch.Tensor:
+    """Return compact A*/waypoint progress features for the hospital teacher."""
+    if not hasattr(env, "_go2w_navigation_path_w"):
+        return torch.zeros(env.num_envs, HOSPITAL_PATH_FEATURE_DIM, device=env.device)
+
+    N = env.num_envs
+    ids = torch.arange(N, device=env.device)
+    count = env._go2w_navigation_path_count.clamp(min=2)
+    final_idx = (count - 1).clamp(max=env._go2w_navigation_path_s.shape[1] - 1)
+    final_s = env._go2w_navigation_path_s[ids, final_idx].clamp(min=1.0e-6)
+    progress_s = env._go2w_navigation_path_progress_s.clamp(min=0.0)
+    target_s = env._go2w_navigation_path_target_s.clamp(min=0.0)
+    final_dist = env._go2w_navigation_path_final_distance.clamp(min=0.0, max=max_path_length)
+    target_idx = env._go2w_navigation_path_target_index.float()
+
+    layout_count = max(HOSPITAL_MAZE_JUNCTION_COUNT * HOSPITAL_MAZE_JUNCTION_COUNT - 1, 1)
+    layout_norm = getattr(
+        env, "_go2w_hospital_layout_id", torch.zeros(N, dtype=torch.long, device=env.device)
+    ).float() / layout_count
+    phase_norm = getattr(
+        env, "_go2w_hospital_phase_id", torch.zeros(N, dtype=torch.long, device=env.device)
+    ).float() / max(len(HOSPITAL_TRAIN_OBSTACLE_DENSITY_SCHEDULE) - 1, 1)
+    actor_norm = getattr(env, "_go2w_hospital_actor_count", torch.zeros(N, device=env.device)).float()
+    actor_norm = actor_norm / max(HOSPITAL_TRAIN_ACTOR_SLOTS, 1)
+
+    return torch.stack(
+        [
+            (progress_s / final_s).clamp(0.0, 1.0),
+            (target_s / final_s).clamp(0.0, 1.0),
+            final_dist / max_path_length,
+            final_s.clamp(max=max_path_length) / max_path_length,
+            ((target_s - progress_s).clamp(min=0.0, max=4.0) / 4.0),
+            (target_idx / (count.float() - 1.0).clamp(min=1.0)).clamp(0.0, 1.0),
+            (count.float() / max(env._go2w_navigation_path_s.shape[1], 1)).clamp(0.0, 1.0),
+            layout_norm.clamp(0.0, 1.0),
+            phase_norm.clamp(0.0, 1.0),
+            actor_norm.clamp(0.0, 1.0),
+        ],
+        dim=-1,
+    )
+
+
+def hospital_corridor_features(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    max_lateral_error: float = 2.0,
+    max_front_distance: float = 8.0,
+) -> torch.Tensor:
+    """Return corridor-following features for the hospital teacher."""
+    if not hasattr(env, "_go2w_structured_corridor_width"):
+        return torch.zeros(env.num_envs, HOSPITAL_CORRIDOR_FEATURE_DIM, device=env.device)
+
+    lateral_error, heading_error, curvature, left_clearance, right_clearance = hospital_centerline_metrics(
+        env, robot_cfg
+    )
+    corridor_width = env._go2w_structured_corridor_width.clamp(min=0.1)  # (N,)
+    final_dist = torch.zeros(env.num_envs, device=env.device)
+    if hasattr(env, "_go2w_navigation_path_final_distance"):
+        final_dist = env._go2w_navigation_path_final_distance.clamp(min=0.0, max=max_front_distance)
+
+    return torch.stack(
+        [
+            (lateral_error / max_lateral_error).clamp(-1.0, 1.0),
+            (lateral_error.abs() / max_lateral_error).clamp(0.0, 1.0),
+            heading_error.sin(),
+            heading_error.cos(),
+            (curvature / math.pi).clamp(0.0, 1.0),
+            (left_clearance / corridor_width).clamp(0.0, 1.0),
+            (right_clearance / corridor_width).clamp(0.0, 1.0),
+            final_dist / max_front_distance,
+        ],
+        dim=-1,
+    )
+
+
+def hospital_semantic_obstacle_features(
+    env: ManagerBasedRLEnv,
+    obstacle_names: list[str],
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    num_slots: int = 15,
+    max_distance: float = 8.0,
+    max_height: float = 2.5,
+    max_relative_speed: float = 2.5,
+) -> torch.Tensor:
+    """Return nearest hospital obstacle semantics, priority, and height metadata."""
+    if num_slots <= 0 or len(obstacle_names) == 0:
+        return torch.zeros(env.num_envs, max(num_slots, 0) * HOSPITAL_SEMANTIC_FEATURE_DIM, device=env.device)
+
+    robot = env.scene[robot_cfg.name]
+    _, center_dists, _ = _get_obstacle_relative_xy(env, obstacle_names, robot_cfg)
+    N, K = center_dists.shape
+    device = env.device
+    active = obstacle_active_mask(env, obstacle_names, center_dists, max_distance)
+    sort_dists = torch.where(active, center_dists, torch.full_like(center_dists, max_distance * 10.0))
+    selected_slots = min(K, num_slots)
+    nearest_idx = torch.topk(sort_dists, k=selected_slots, dim=1, largest=False, sorted=True).indices
+
+    def gather_slots(values: torch.Tensor) -> torch.Tensor:
+        if values.ndim == 2:
+            return torch.gather(values, dim=1, index=nearest_idx)
+        index = nearest_idx.unsqueeze(-1).expand(-1, -1, values.shape[-1])
+        return torch.gather(values, dim=1, index=index)
+
+    meta_shape = (env.num_envs, len(obstacle_names))
+    active_s = gather_slots(active).float()
+
+    def gather_meta(attr_name: str, fallback: torch.Tensor) -> torch.Tensor:
+        stored = getattr(env, attr_name, None)
+        sliced = _meta_slice(stored, meta_shape) if stored is not None else None
+        return gather_slots(sliced) if sliced is not None else fallback
+
+    class_ids = gather_meta(
+        "_go2w_obstacle_class_id",
+        torch.zeros((N, selected_slots), dtype=torch.long, device=device),
+    ).clamp(min=0, max=HOSPITAL_CLASS_COUNT - 1)
+    priority = gather_meta(
+        "_go2w_obstacle_priority",
+        torch.full((N, selected_slots), 0.5, device=device),
+    )
+    height = gather_meta("_go2w_obstacle_height", torch.zeros((N, selected_slots), device=device))
+    top_z = gather_meta("_go2w_obstacle_top_z", height)
+    low_flag = gather_meta("_go2w_obstacle_low_flag", torch.zeros_like(height)).float()
+    dynamic_flag = gather_meta("_go2w_obstacle_dynamic_mask", torch.zeros_like(height)).float()
+
+    obs_vel_w = torch.stack(
+        [env.scene[n].data.root_lin_vel_w[:, :3] for n in obstacle_names], dim=1
+    )
+    rel_vel_w = obs_vel_w - robot.data.root_lin_vel_w[:, :3].unsqueeze(1)
+    robot_yaw_quat = yaw_quat(robot.data.root_quat_w)
+    quat_exp = robot_yaw_quat.unsqueeze(1).expand(-1, K, -1).reshape(N * K, 4)
+    rel_vel_b = quat_apply_inverse(quat_exp, rel_vel_w.reshape(N * K, 3)).reshape(N, K, 3)[:, :, :2]
+    rel_vel_b = gather_slots(rel_vel_b) * dynamic_flag.unsqueeze(-1)
+
+    class_one_hot = torch.nn.functional.one_hot(class_ids, num_classes=HOSPITAL_CLASS_COUNT).float()
+    actor_flag = (class_ids != 0).float()
+    rel_vx = (rel_vel_b[..., 0] / max(max_relative_speed, 1.0e-6)).clamp(-1.0, 1.0)
+    rel_vy = (rel_vel_b[..., 1] / max(max_relative_speed, 1.0e-6)).clamp(-1.0, 1.0)
+    features = torch.cat(
+        (
+            active_s.unsqueeze(-1),
+            class_one_hot,
+            priority.clamp(0.0, 1.0).unsqueeze(-1),
+            (height.clamp(0.0, max_height) / max_height).unsqueeze(-1),
+            (top_z.clamp(0.0, max_height) / max_height).unsqueeze(-1),
+            low_flag.unsqueeze(-1),
+            dynamic_flag.unsqueeze(-1),
+            rel_vx.unsqueeze(-1),
+            rel_vy.unsqueeze(-1),
+            actor_flag.unsqueeze(-1),
+        ),
+        dim=-1,
+    )
+    features = features * active_s.unsqueeze(-1)
+
+    if selected_slots < num_slots:
+        pad_shape = (N, num_slots - selected_slots, HOSPITAL_SEMANTIC_FEATURE_DIM)
+        features = torch.cat([features, torch.zeros(pad_shape, device=device)], dim=1)
+
+    return features.flatten(start_dim=1)
 
 
 def prev_hlc_actions(

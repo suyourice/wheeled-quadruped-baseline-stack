@@ -30,22 +30,6 @@ def _format_vector(values: torch.Tensor, precision: int = 3) -> str:
     return ", ".join(f"{value.item():+.{precision}f}" for value in values)
 
 
-def _format_eval_metrics(metrics: dict[str, float], completed_episodes: int, avg_episode_length: float) -> str:
-    preferred_keys = [
-        "goal_reached_rate",
-        "spl",
-        "time_out_rate",
-        "base_contact_rate",
-        "root_height_below_minimum_rate",
-        "multi_term_fraction",
-    ]
-    parts = [f"episodes={completed_episodes}", f"avg_episode_len={avg_episode_length:.2f}"]
-    for key in preferred_keys:
-        if key in metrics:
-            parts.append(f"{key}={metrics[key]:.4f}")
-    return " ".join(parts)
-
-
 _NAV_OBSTACLE_LABEL_SHORT_NAMES: dict[str, str] = {
     "patient_ambulatory": "PT",
     "patient_with_iv": "PT_IV",
@@ -149,9 +133,17 @@ class _LiveObstacleLabelDrawer:
             pass
 
     def update(self, base_env, env_index: int) -> None:
+        self.update_many(base_env, [env_index])
+
+    def update_many(self, base_env, env_indices) -> None:
         if not self.enabled or self._draw is None or self.max_labels <= 0:
             return
-        records = _get_nav_obstacle_records(base_env, env_index, include_walls=False)[: self.max_labels]
+        records = []
+        annotations = []
+        for env_index in env_indices:
+            records.extend(_get_nav_obstacle_records(base_env, int(env_index), include_walls=False))
+            annotations.extend(_get_hospital_live_annotations(base_env, int(env_index)))
+        records = records[: self.max_labels]
         shadow_points: list[tuple[float, float, float]] = []
         obstacle_points: list[tuple[float, float, float]] = []
         zone_points: list[tuple[float, float, float]] = []
@@ -183,7 +175,7 @@ class _LiveObstacleLabelDrawer:
 
         for rec in records:
             add_label(rec["short_label"], rec["x"], rec["y"], rec["z"], self.scale, obstacle_points)
-        for ann in _get_hospital_live_annotations(base_env, env_index):
+        for ann in annotations:
             target = zone_points if ann["kind"] == "zone" else situation_points
             add_label(
                 ann["label"],

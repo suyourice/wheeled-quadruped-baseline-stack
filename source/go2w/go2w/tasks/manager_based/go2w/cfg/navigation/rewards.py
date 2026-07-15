@@ -224,3 +224,139 @@ class NavTeacherRewardsCfg:
         weight=-200.0,
         params={"term_keys": ["base_contact", "root_height_below_minimum"]},
     )
+
+
+@configclass
+class NavHospitalTeacherRewardsCfg(NavTeacherRewardsCfg):
+    """Hospital corridor teacher rewards.
+
+    The generic open-field obstacle shaping is disabled here because wall blocks
+    are part of the task geometry. Hospital-specific terms shape path following,
+    centerline confidence, wall safety, and priority/height-aware actor safety.
+    """
+
+    # ContactSensor removed from HospitalTeacherSceneCfg; wall/actor avoidance is
+    # handled purely via distance-based penalties below.
+    obstacle_collision = None
+
+    # Keep direct goal attraction weak: the rolling goal lives on the corridor
+    # centerline, while the main hospital objective is tangent path progress.
+    goal_progress = RewTerm(
+        func=mdp.goal_progress_dense,
+        weight=1.0,
+        params={"clip": 0.5},
+    )
+    goal_heading = RewTerm(
+        func=mdp.goal_heading_tanh_reward,
+        weight=0.15,
+        params={"std": NAV_GOAL_HEADING_STD},
+    )
+
+    nav_lateral_escape = RewTerm(
+        func=mdp.nav_frontal_blocked_lateral_escape_reward,
+        weight=2.0,
+        params={
+            "obstacle_names": HOSPITAL_TRAIN_OBSTACLE_NAMES,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "frontal_half_angle_deg": 70.0,
+            "min_blockage_for_reward": 0.08,
+            "goal_path_min_blockage": 0.03,
+            "goal_path_corridor_half_width": 0.7,
+        },
+    )
+    nav_open_path_straightness = None
+    nav_open_path_goal_heading = None
+    nav_impossible_gap = None
+    nav_passable_gap = None
+    nav_dense_recovery = RewTerm(
+        func=mdp.nav_dense_recovery_reward,
+        weight=NAV_DENSE_RECOVERY_WEIGHT,
+        params={
+            "obstacle_names": HOSPITAL_TRAIN_OBSTACLE_NAMES,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "frontal_half_angle_deg": 70.0,
+            "frontal_block_threshold": 0.08,
+            "goal_path_block_threshold": 0.08,
+            "generic_block_threshold": 0.15,
+        },
+    )
+
+    hospital_path_progress = RewTerm(
+        func=mdp.hospital_path_progress_reward,
+        weight=5.0,
+        params={"clip": 0.6},
+    )
+    hospital_centerline = RewTerm(
+        func=mdp.hospital_centerline_deviation_penalty,
+        weight=-0.6,
+        params={
+            "robot_cfg": SceneEntityCfg("robot"),
+            "obstacle_names": HOSPITAL_TRAIN_OBSTACLE_NAMES,
+            "tolerance": 0.15,
+            "scale": 1.0,
+            "actor_relax_clearance": 0.5,
+        },
+    )
+    hospital_wall_clearance = RewTerm(
+        func=mdp.hospital_wall_clearance_penalty,
+        weight=-6.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot"),
+            "min_wall_clearance": 0.50,
+        },
+    )
+    hospital_path_heading = RewTerm(
+        func=mdp.hospital_path_heading_alignment_reward,
+        weight=0.9,
+        params={"robot_cfg": SceneEntityCfg("robot")},
+    )
+    hospital_backtrack = RewTerm(
+        func=mdp.hospital_backtrack_penalty,
+        weight=-2.0,
+        params={"clip": 0.4},
+    )
+    hospital_stuck = RewTerm(
+        func=mdp.hospital_stuck_penalty,
+        weight=-2.5,
+        params={
+            "min_progress": 0.01,
+            "min_final_distance": 0.8,
+            "patience_steps": 60,
+        },
+    )
+
+    nav_clearance = RewTerm(
+        func=mdp.hospital_priority_clearance_penalty,
+        weight=-2.5,
+        params={
+            "obstacle_names": HOSPITAL_TRAIN_OBSTACLE_NAMES,
+            "min_safe_dist": 0.22,
+            "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    obstacle_ttc = RewTerm(
+        func=mdp.hospital_priority_ttc_penalty,
+        weight=-4.0,
+        params={
+            "obstacle_names": HOSPITAL_TRAIN_OBSTACLE_NAMES,
+            "safe_ttc": 1.0,
+            "command_name": "base_velocity",
+            "robot_half_width": NAV_TTC_ROBOT_HALF_WIDTH,
+            "safety_margin": NAV_TTC_SAFETY_MARGIN,
+            "robot_front_margin": NAV_TTC_FRONT_MARGIN,
+            "lookahead_distance": NAV_TTC_LOOKAHEAD_DISTANCE,
+            "sum_clip": NAV_TTC_SUM_CLIP,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    nav_grazing = RewTerm(
+        func=mdp.hospital_low_obstacle_grazing_penalty,
+        weight=-2.0,
+        params={
+            "obstacle_names": HOSPITAL_TRAIN_OBSTACLE_NAMES,
+            "graze_distance": 0.08,
+            "robot_safety_radius": NAV_TTC_ROBOT_HALF_WIDTH,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )

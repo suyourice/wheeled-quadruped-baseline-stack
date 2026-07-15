@@ -46,10 +46,3 @@ HLC_TEACHER_OBS = {
     "full_geometry":     ObsSlice(205, 445),  # mdp.obstacle_full_geometry_features (15 slots x 16D)
     "prev_actions":      ObsSlice(445, 451),  # mdp.prev_hlc_actions (2 frames x 3D)
 }
-
-# HLC student obs - 189D.
-# Defined in NavRLDistillObsCfg.StudentCfg (cfg/navigation/env.py).
-HLC_STUDENT_OBS = {
-    "proprio":      ObsSlice(0,   9),    # base_lin_vel(3) + projected_gravity(3) + goal_command(3)
-    "lidar_scan":   ObsSlice(9,   189),  # mdp.lidar_distances (180 bins)
-}
