@@ -30,22 +30,6 @@ def _format_vector(values: torch.Tensor, precision: int = 3) -> str:
     return ", ".join(f"{value.item():+.{precision}f}" for value in values)
 
 
-def _format_eval_metrics(metrics: dict[str, float], completed_episodes: int, avg_episode_length: float) -> str:
-    preferred_keys = [
-        "goal_reached_rate",
-        "spl",
-        "time_out_rate",
-        "base_contact_rate",
-        "root_height_below_minimum_rate",
-        "multi_term_fraction",
-    ]
-    parts = [f"episodes={completed_episodes}", f"avg_episode_len={avg_episode_length:.2f}"]
-    for key in preferred_keys:
-        if key in metrics:
-            parts.append(f"{key}={metrics[key]:.4f}")
-    return " ".join(parts)
-
-
 _NAV_OBSTACLE_LABEL_SHORT_NAMES: dict[str, str] = {
     "patient_ambulatory": "PT",
     "patient_with_iv": "PT_IV",

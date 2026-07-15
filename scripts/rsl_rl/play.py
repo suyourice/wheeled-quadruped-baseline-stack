@@ -16,11 +16,16 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
-from checkpoint_utils import configure_frozen_llc_action, load_teacher_locomotion_checkpoint  # isort: skip
+from checkpoint_utils import configure_frozen_llc_action  # isort: skip
+from play_common import (  # isort: skip
+    TeeStream,
+    build_teacher_policy,
+    format_eval_metrics,
+    override_play_obstacle_count,
+    override_play_command_path_spawn,
+    resolve_play_seed,
+)
 
-DEFAULT_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
-DEFAULT_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
-DEFAULT_COMMAND_PATH_MIN_SPEED = 0.2
 DEFAULT_DYNAMIC_OBSTACLE_SPEED_RANGE = (0.25, 0.70)
 DEFAULT_DYNAMIC_OBSTACLE_LATERAL_SPEED = 0.12
 DEFAULT_DYNAMIC_OBSTACLE_LONGITUDINAL_EXTENT = 2.0
@@ -599,27 +604,9 @@ installed_version = metadata.version("rsl-rl-lib")
 """Rest everything follows."""
 
 from collections import defaultdict
-import copy
 import os
 import subprocess
 import time
-
-
-class _TeeStream:
-    """Mirrors writes to multiple streams (stdout + file)."""
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, data):
-        for s in self._streams:
-            s.write(data)
-
-    def flush(self):
-        for s in self._streams:
-            s.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._streams[0], name)
 
 import gymnasium as gym
 import numpy as np
@@ -641,7 +628,6 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.math import quat_from_angle_axis
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
-from rsl_rl.utils import resolve_callable
 
 from isaaclab_rl.rsl_rl import (
     RslRlBaseRunnerCfg,
@@ -674,7 +660,6 @@ from go2w.tasks.manager_based.go2w.cfg.observation_layout import POLICY_OBS
 
 from play_nav_debug import (  # isort: skip
     NAV_LIVE_LABEL_INTERVAL, NAV_LIVE_LABEL_SCALE, NAV_LIVE_LABEL_MAX,
-    _format_eval_metrics,
     _LiveObstacleLabelDrawer,
     _nav_debug_corridor_plot_args,
     _ablation_apply_direct_goal,
@@ -686,56 +671,6 @@ from play_nav_debug import (  # isort: skip
 )
 
 
-def _build_teacher_policy(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
-    """Instantiate the rule-based navigation teacher for direct play/evaluation."""
-    teacher_cfg = getattr(agent_cfg, "teacher", None)
-    if teacher_cfg is None:
-        raise ValueError("--teacher_steering requires a distillation runner config with a teacher model.")
-    if "teacher" not in obs:
-        raise ValueError("--teacher_steering requires an env exposing the 'teacher' observation group.")
-    if args_cli.locomotion_checkpoint is None:
-        raise ValueError("--teacher_steering requires --locomotion_checkpoint for the frozen LLC.")
-
-    teacher_cfg_dict = copy.deepcopy(teacher_cfg.to_dict())
-    teacher_class = resolve_callable(teacher_cfg_dict.pop("class_name"))
-    teacher = teacher_class(obs, {"teacher": ["teacher"]}, "teacher", env.num_actions, **teacher_cfg_dict)
-    teacher = teacher.to(device)
-    teacher.eval()
-    load_teacher_locomotion_checkpoint(teacher, args_cli.locomotion_checkpoint, device)
-    return teacher
-
-
-def _override_play_obstacle_count(
-    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
-    num_obstacles: int | None,
-):
-    """Override active obstacle count for obstacle play configs."""
-    if num_obstacles is None:
-        return
-    if num_obstacles < 0:
-        raise ValueError("--num_obstacles must be >= 0.")
-
-    events_cfg = getattr(env_cfg, "events", None)
-    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
-    if reset_obstacles is None:
-        raise ValueError("--num_obstacles requires an obstacle play task with a reset_obstacles event.")
-
-    params = reset_obstacles.params
-    obstacle_names = params.get("obstacle_names", [])
-    max_available = len(obstacle_names)
-    if num_obstacles > max_available:
-        raise ValueError(
-            f"--num_obstacles={num_obstacles} exceeds the play scene capacity ({max_available}). "
-            "Increase PLAY_MAX_OBSTACLES in cfg/navigation/env.py if you need more."
-        )
-
-    if "start_iteration" in params:
-        params["start_iteration"] = 0
-    if "warmup_iterations" in params:
-        params["warmup_iterations"] = 0
-    params["min_obstacles"] = num_obstacles
-    params["max_obstacles"] = num_obstacles
-    print(f"[INFO] Active play obstacles: {num_obstacles}/{max_available}")
 
 
 def _override_dynamic_navigation_play(
@@ -1133,62 +1068,6 @@ def _override_play_episode_length(
     print(f"[INFO] Play episode length: {env_cfg.episode_length_s:.1f} s")
 
 
-def _override_play_command_path_spawn(
-    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
-    command_path_obstacles: int | None,
-    command_path_forward_range: tuple[float, float] | list[float] | None,
-    command_path_lateral_range: tuple[float, float] | list[float] | None,
-    command_path_min_speed: float | None,
-):
-    """Override command-direction obstacle spawn for obstacle play configs."""
-    if (
-        command_path_obstacles is None
-        and command_path_forward_range is None
-        and command_path_lateral_range is None
-        and command_path_min_speed is None
-    ):
-        return
-
-    events_cfg = getattr(env_cfg, "events", None)
-    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
-    if reset_obstacles is None:
-        raise ValueError("--command_path_obstacles requires an obstacle play task with a reset_obstacles event.")
-
-    params = reset_obstacles.params
-    obstacle_names = params.get("obstacle_names", [])
-    max_available = len(obstacle_names)
-    active_obstacles = int(params.get("max_obstacles", max_available))
-
-    count = params.get("command_path_obstacles", 0) if command_path_obstacles is None else command_path_obstacles
-    if count < 0:
-        raise ValueError("--command_path_obstacles must be >= 0.")
-    if count > active_obstacles:
-        raise ValueError(
-            f"--command_path_obstacles={count} exceeds active obstacle count ({active_obstacles}). "
-            "Increase --num_obstacles or lower the command-path count."
-        )
-
-    forward_range = tuple(command_path_forward_range) if command_path_forward_range is not None else params.get(
-        "command_path_forward_range", DEFAULT_COMMAND_PATH_FORWARD_RANGE
-    )
-    lateral_range = tuple(command_path_lateral_range) if command_path_lateral_range is not None else params.get(
-        "command_path_lateral_range", DEFAULT_COMMAND_PATH_LATERAL_RANGE
-    )
-    min_speed = command_path_min_speed
-    if min_speed is None:
-        min_speed = params.get("command_path_min_speed", DEFAULT_COMMAND_PATH_MIN_SPEED)
-
-    params["command_path_obstacles"] = count
-    params["command_name"] = "base_velocity"
-    params["command_path_forward_range"] = forward_range
-    params["command_path_lateral_range"] = lateral_range
-    params["command_path_min_speed"] = min_speed
-    print(
-        "[INFO] Command-path obstacle spawn: "
-        f"count={count}, forward={forward_range}, lateral={lateral_range}, min_speed={min_speed:.2f}"
-    )
-
-
 def _override_navigation_play_case(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     args_cli: argparse.Namespace,
@@ -1289,13 +1168,6 @@ def _override_navigation_play_case(
         f"start_exclusion_radius={reset_params.get('start_exclusion_radius')}, "
         f"goal_exclusion_radius={reset_params.get('goal_exclusion_radius')}"
     )
-
-
-def _resolve_play_seed(args_cli, default_seed: int | None) -> int:
-    if args_cli.seed is not None:
-        return args_cli.seed
-    base_seed = default_seed if default_seed is not None else 0
-    return (base_seed + random.SystemRandom().randrange(1, 2_147_483_647)) % 2_147_483_647
 
 
 def _init_spl_tracking(
@@ -1413,8 +1285,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     del _scene_terrain
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
     _override_play_episode_length(env_cfg, args_cli)
-    _override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
-    _override_play_command_path_spawn(
+    override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
+    override_play_command_path_spawn(
         env_cfg,
         args_cli.command_path_obstacles,
         args_cli.command_path_forward_range,
@@ -1425,7 +1297,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Resolve seed early so _override_navigation_play_case can inject fixed_layout_seed.
     # handle_deprecated_rsl_rl_cfg does not affect the seed path, so order is safe.
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-    env_seed = _resolve_play_seed(args_cli, agent_cfg.seed)
+    env_seed = resolve_play_seed(args_cli, agent_cfg.seed)
     agent_cfg.seed = env_seed
     env_cfg.seed = env_seed
     print(f"[INFO] Play seed: {env_seed}")
@@ -1494,7 +1366,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     teacher = None
     policy_nn = None
     if args_cli.teacher_steering:
-        teacher = _build_teacher_policy(env, obs, agent_cfg, env.unwrapped.device)
+        teacher = build_teacher_policy(
+            env, obs, agent_cfg, env.unwrapped.device, args_cli.locomotion_checkpoint
+        )
         print("[INFO] Running direct teacher steering: geometric navigation teacher + frozen LLC")
     else:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
@@ -1636,7 +1510,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _out_dir = os.path.abspath(os.path.join("logs", "nav_play", args_cli.play_name))
         os.makedirs(_out_dir, exist_ok=True)
         _out_log_file = open(os.path.join(_out_dir, "nav_debug.log"), "w", buffering=1)
-        sys.stdout = _TeeStream(sys.__stdout__, _out_log_file)
+        sys.stdout = TeeStream(sys.__stdout__, _out_log_file)
         os.environ.setdefault("GO2W_NAV_DEBUG", "1")
         print(f"[INFO] Play output dir: {_out_dir}")
 
@@ -1965,7 +1839,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if _nav_spl_history:
                 averaged["spl"] = sum(_nav_spl_history) / len(_nav_spl_history)
             avg_episode_length = total_episode_length / max(completed_episodes, 1)
-            print("[PLAY-EVAL] " + _format_eval_metrics(averaged, completed_episodes, avg_episode_length))
+            print("[PLAY-EVAL] " + format_eval_metrics(averaged, completed_episodes, avg_episode_length))
             if completed_episodes >= args_cli.nav_eval_episodes:
                 break
 

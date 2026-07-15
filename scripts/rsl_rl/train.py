@@ -17,11 +17,13 @@ from isaaclab.app import AppLauncher
 # local imports
 import cli_args  # isort: skip
 from checkpoint_utils import (  # isort: skip
+    apply_hospital_curriculum_offset,
     configure_frozen_llc_action,
     find_state_dict,
     load_padded_state_dict,
     load_teacher_locomotion_checkpoint,
 )
+from play_common import format_eval_metrics  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -252,25 +254,6 @@ def _load_locomotion_checkpoint(runner: OnPolicyRunner, ckpt_path: str, device: 
     print(f"[INFO] Loaded locomotion checkpoint from: {ckpt_path}")
 
 
-def _apply_hospital_curriculum_offset(env_cfg, iteration_offset: int) -> None:
-    """Inject a hospital teacher curriculum offset without changing the schedule itself."""
-    if iteration_offset < 0:
-        raise ValueError("--hospital_curriculum_iteration_offset must be non-negative.")
-    if iteration_offset == 0:
-        return
-
-    reset_obstacles = getattr(getattr(env_cfg, "events", None), "reset_obstacles", None)
-    params = getattr(reset_obstacles, "params", None)
-    if not isinstance(params, dict) or "curriculum_iteration_offset" not in params:
-        raise ValueError(
-            "--hospital_curriculum_iteration_offset is only supported for hospital teacher tasks "
-            "whose reset_obstacles params include 'curriculum_iteration_offset'."
-        )
-    params["curriculum_iteration_offset"] = int(iteration_offset)
-    print(f"[INFO] Hospital curriculum iteration offset: {iteration_offset}")
-
-
-
 def _build_teacher_for_eval(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str):
     """Instantiate the active distillation teacher for direct evaluation."""
     teacher_cfg = getattr(agent_cfg, "teacher", None)
@@ -283,22 +266,6 @@ def _build_teacher_for_eval(env, obs, agent_cfg: RslRlBaseRunnerCfg, device: str
     teacher = teacher.to(device)
     teacher.eval()
     return teacher
-
-
-def _format_eval_metrics(metrics: dict[str, float], completed_episodes: int, avg_episode_length: float) -> str:
-    """Format the most useful teacher-eval summary metrics for quick reading."""
-    preferred_keys = [
-        "goal_reached_rate",
-        "time_out_rate",
-        "base_contact_rate",
-        "root_height_below_minimum_rate",
-        "multi_term_fraction",
-    ]
-    parts = [f"episodes={completed_episodes}", f"avg_episode_len={avg_episode_length:.2f}"]
-    for key in preferred_keys:
-        if key in metrics:
-            parts.append(f"{key}={metrics[key]:.4f}")
-    return " ".join(parts)
 
 
 def _run_teacher_only_eval(env, agent_cfg: RslRlBaseRunnerCfg) -> None:
@@ -362,7 +329,7 @@ def _run_teacher_only_eval(env, agent_cfg: RslRlBaseRunnerCfg) -> None:
             }
             averaged["multi_term_fraction"] = multi_term_episodes / max(completed_episodes, 1)
             avg_episode_length = total_episode_length / max(completed_episodes, 1)
-            print("[TEACHER-EVAL] " + _format_eval_metrics(averaged, completed_episodes, avg_episode_length))
+            print("[TEACHER-EVAL] " + format_eval_metrics(averaged, completed_episodes, avg_episode_length))
 
     averaged = {
         f"{term_name}_rate": termination_counts[term_name] / max(completed_episodes, 1)
@@ -371,7 +338,7 @@ def _run_teacher_only_eval(env, agent_cfg: RslRlBaseRunnerCfg) -> None:
     averaged["multi_term_fraction"] = multi_term_episodes / max(completed_episodes, 1)
     avg_episode_length = total_episode_length / max(completed_episodes, 1)
     print("[INFO] Teacher-only evaluation complete.")
-    print("[TEACHER-EVAL][FINAL] " + _format_eval_metrics(averaged, completed_episodes, avg_episode_length))
+    print("[TEACHER-EVAL][FINAL] " + format_eval_metrics(averaged, completed_episodes, avg_episode_length))
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -446,7 +413,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
-    _apply_hospital_curriculum_offset(env_cfg, args_cli.hospital_curriculum_iteration_offset)
+    if args_cli.hospital_curriculum_iteration_offset != 0:
+        apply_hospital_curriculum_offset(env_cfg, args_cli.hospital_curriculum_iteration_offset)
     uses_frozen_llc_action = configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint, args_cli.task)
 
     # create isaac environment

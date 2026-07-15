@@ -53,13 +53,12 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import torch
 
-import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.utils.math import quat_from_angle_axis
+from isaaclab.markers import VisualizationMarkers
 from isaaclab_tasks.utils import parse_env_cfg
 
 from checkpoint_utils import configure_frozen_llc_action
+from hospital_markers import line_marker_transforms, make_line_marker, make_sphere_marker
 
 import go2w.tasks  # noqa: F401
 from go2w.tasks.manager_based.go2w.mdp.navigation.hospital.specs import (
@@ -76,74 +75,6 @@ def _phase_schedule(phase: int) -> tuple[int, float, int]:
             f"--phase must be in [0, {len(HOSPITAL_TRAIN_WIDTH_SCHEDULE) - 1}], got {phase}."
         )
     return HOSPITAL_TRAIN_WIDTH_SCHEDULE[phase]
-
-
-def _line_marker_transforms(points: torch.Tensor, z_offset: float = 0.10):
-    """Return cylinder marker transforms for a connected 3D polyline."""
-    if points.shape[0] < 2:
-        return None
-    points = points.clone()
-    points[:, 2] += z_offset
-    start = points[:-1]
-    end = points[1:]
-    direction = end - start
-    lengths = direction.norm(dim=-1)
-    valid = lengths > 0.03
-    if not bool(valid.any()):
-        return None
-
-    start = start[valid]
-    end = end[valid]
-    direction = direction[valid]
-    lengths = lengths[valid]
-    positions = (start + end) * 0.5
-
-    direction_norm = direction / lengths.unsqueeze(-1).clamp(min=1.0e-6)
-    default_axis = torch.zeros_like(direction_norm)
-    default_axis[:, 2] = 1.0
-    rotation_axis = torch.linalg.cross(default_axis, direction_norm, dim=-1)
-    rotation_axis_norm = rotation_axis.norm(dim=-1)
-    fallback_axis = torch.zeros_like(rotation_axis)
-    fallback_axis[:, 0] = 1.0
-    rotation_axis = torch.where(
-        (rotation_axis_norm > 1.0e-6).unsqueeze(-1),
-        rotation_axis / rotation_axis_norm.unsqueeze(-1).clamp(min=1.0e-6),
-        fallback_axis,
-    )
-    cos_angle = (default_axis * direction_norm).sum(dim=-1).clamp(-1.0, 1.0)
-    orientations = quat_from_angle_axis(torch.acos(cos_angle), rotation_axis)
-    scales = torch.ones(positions.shape[0], 3, device=positions.device, dtype=positions.dtype)
-    scales[:, 2] = lengths
-    return positions, orientations, scales
-
-
-def _make_sphere_marker(prim_path: str, radius: float, color: tuple[float, float, float]) -> VisualizationMarkers:
-    return VisualizationMarkers(
-        VisualizationMarkersCfg(
-            prim_path=prim_path,
-            markers={
-                "sphere": sim_utils.SphereCfg(
-                    radius=radius,
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
-                ),
-            },
-        )
-    )
-
-
-def _make_line_marker(prim_path: str, radius: float, color: tuple[float, float, float]) -> VisualizationMarkers:
-    return VisualizationMarkers(
-        VisualizationMarkersCfg(
-            prim_path=prim_path,
-            markers={
-                "line": sim_utils.CylinderCfg(
-                    radius=radius,
-                    height=1.0,
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color, roughness=1.0),
-                ),
-            },
-        )
-    )
 
 
 def _set_camera(base_env, env_index: int) -> None:
@@ -281,7 +212,7 @@ def _update_markers(base_env, env_index: int, markers: dict[str, VisualizationMa
     markers["final_goal"].visualize(translations=final_goal)
 
     path = base_env._go2w_navigation_path_w[env_index, :path_count, :3]
-    path_markers = _line_marker_transforms(path, z_offset=0.18)
+    path_markers = line_marker_transforms(path, z_offset=0.18)
     if path_markers is not None:
         positions, orientations, scales = path_markers
         markers["path"].visualize(translations=positions, orientations=orientations, scales=scales)
@@ -292,7 +223,7 @@ def _update_markers(base_env, env_index: int, markers: dict[str, VisualizationMa
     centerline = torch.zeros(centerline_count, 3, device=device)
     centerline[:, :2] = centerline_local + origin.unsqueeze(0)
     centerline[:, 2] = base_env.scene["robot"].data.root_pos_w[env_index, 2]
-    centerline_markers = _line_marker_transforms(centerline, z_offset=0.10)
+    centerline_markers = line_marker_transforms(centerline, z_offset=0.10)
     if centerline_markers is not None:
         positions, orientations, scales = centerline_markers
         markers["centerline"].visualize(translations=positions, orientations=orientations, scales=scales)
@@ -335,12 +266,12 @@ def main() -> None:
     env.reset()
 
     markers = {
-        "start": _make_sphere_marker("/Visuals/HospitalStart", 0.22, (0.10, 0.45, 1.0)),
-        "current_goal": _make_sphere_marker("/Visuals/HospitalCurrentGoal", 0.28, (0.0, 0.9, 0.10)),
-        "final_goal": _make_sphere_marker("/Visuals/HospitalFinalGoal", 0.24, (1.0, 0.05, 0.02)),
-        "actors": _make_sphere_marker("/Visuals/HospitalActorCenters", 0.10, (1.0, 1.0, 1.0)),
-        "path": _make_line_marker("/Visuals/HospitalPath", 0.03, (1.0, 0.85, 0.0)),
-        "centerline": _make_line_marker("/Visuals/HospitalCenterline", 0.018, (0.0, 0.85, 1.0)),
+        "start": make_sphere_marker("/Visuals/HospitalStart", 0.22, (0.10, 0.45, 1.0)),
+        "current_goal": make_sphere_marker("/Visuals/HospitalCurrentGoal", 0.28, (0.0, 0.9, 0.10)),
+        "final_goal": make_sphere_marker("/Visuals/HospitalFinalGoal", 0.24, (1.0, 0.05, 0.02)),
+        "actors": make_sphere_marker("/Visuals/HospitalActorCenters", 0.10, (1.0, 1.0, 1.0)),
+        "path": make_line_marker("/Visuals/HospitalPath", 0.03, (1.0, 0.85, 0.0)),
+        "centerline": make_line_marker("/Visuals/HospitalCenterline", 0.018, (0.0, 0.85, 1.0)),
     }
 
     _set_camera(base_env, args_cli.env_index)

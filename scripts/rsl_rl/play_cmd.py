@@ -44,17 +44,18 @@ Usage examples:
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-import random
 import sys
 
 from isaaclab.app import AppLauncher
 
 import cli_args  # isort: skip
-from checkpoint_utils import configure_frozen_llc_action, load_teacher_locomotion_checkpoint  # isort: skip
-
-DEFAULT_COMMAND_PATH_FORWARD_RANGE = (1.6, 2.4)
-DEFAULT_COMMAND_PATH_LATERAL_RANGE = (-0.35, 0.35)
-DEFAULT_COMMAND_PATH_MIN_SPEED = 0.2
+from checkpoint_utils import configure_frozen_llc_action  # isort: skip
+from play_common import (  # isort: skip
+    build_teacher_policy,
+    override_play_obstacle_count,
+    override_play_command_path_spawn,
+    resolve_play_seed,
+)
 
 parser = argparse.ArgumentParser(description="Play a Go2-W policy with fixed velocity commands.")
 parser.add_argument("--num_envs", type=int, default=None)
@@ -136,7 +137,6 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import importlib.metadata as metadata
-import copy
 import os
 import time
 
@@ -144,7 +144,6 @@ import gymnasium as gym
 import torch
 from packaging import version
 from rsl_rl.runners import OnPolicyRunner
-from rsl_rl.utils import resolve_callable
 
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.utils.assets import retrieve_file_path
@@ -162,119 +161,6 @@ import go2w.tasks  # noqa: F401
 installed_version = metadata.version("rsl-rl-lib")
 
 
-def _override_play_obstacle_count(env_cfg, num_obstacles):
-    """Override active obstacle count for obstacle play configs."""
-    if num_obstacles is None:
-        return
-    if num_obstacles < 0:
-        raise ValueError("--num_obstacles must be >= 0.")
-    events_cfg = getattr(env_cfg, "events", None)
-    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
-    if reset_obstacles is None:
-        raise ValueError("--num_obstacles requires an obstacle play task with a reset_obstacles event.")
-    params = reset_obstacles.params
-    max_available = len(params.get("obstacle_names", []))
-    if num_obstacles > max_available:
-        raise ValueError(
-            f"--num_obstacles={num_obstacles} exceeds play scene capacity ({max_available})."
-        )
-    params["start_iteration"] = 0
-    params["warmup_iterations"] = 0
-    params["min_obstacles"] = num_obstacles
-    params["max_obstacles"] = num_obstacles
-    print(f"[INFO] Active play obstacles: {num_obstacles}/{max_available}")
-
-
-def _override_play_command_path_spawn(
-    env_cfg,
-    command_path_obstacles,
-    command_path_forward_range,
-    command_path_lateral_range,
-    command_path_min_speed,
-    command_path_reference_xy=None,
-):
-    """Override command-direction obstacle spawn for obstacle play configs."""
-    if (
-        command_path_obstacles is None
-        and command_path_forward_range is None
-        and command_path_lateral_range is None
-        and command_path_min_speed is None
-    ):
-        return
-
-    events_cfg = getattr(env_cfg, "events", None)
-    reset_obstacles = getattr(events_cfg, "reset_obstacles", None) if events_cfg is not None else None
-    if reset_obstacles is None:
-        raise ValueError("--command_path_obstacles requires an obstacle play task with a reset_obstacles event.")
-
-    params = reset_obstacles.params
-    obstacle_names = params.get("obstacle_names", [])
-    max_available = len(obstacle_names)
-    active_obstacles = int(params.get("max_obstacles", max_available))
-
-    count = params.get("command_path_obstacles", 0) if command_path_obstacles is None else command_path_obstacles
-    if count < 0:
-        raise ValueError("--command_path_obstacles must be >= 0.")
-    if count > active_obstacles:
-        raise ValueError(
-            f"--command_path_obstacles={count} exceeds active obstacle count ({active_obstacles}). "
-            "Increase --num_obstacles or lower the command-path count."
-        )
-
-    forward_range = tuple(command_path_forward_range) if command_path_forward_range is not None else params.get(
-        "command_path_forward_range", DEFAULT_COMMAND_PATH_FORWARD_RANGE
-    )
-    lateral_range = tuple(command_path_lateral_range) if command_path_lateral_range is not None else params.get(
-        "command_path_lateral_range", DEFAULT_COMMAND_PATH_LATERAL_RANGE
-    )
-    min_speed = command_path_min_speed
-    if min_speed is None:
-        min_speed = params.get("command_path_min_speed", DEFAULT_COMMAND_PATH_MIN_SPEED)
-
-    params["command_path_obstacles"] = count
-    params["command_name"] = "base_velocity"
-    params["command_path_reference_xy"] = command_path_reference_xy
-    params["command_path_forward_range"] = forward_range
-    params["command_path_lateral_range"] = lateral_range
-    params["command_path_min_speed"] = min_speed
-    print(
-        "[INFO] Command-path obstacle spawn: "
-        f"count={count}, forward={forward_range}, lateral={lateral_range}, min_speed={min_speed:.2f}, "
-        f"reference={command_path_reference_xy}"
-    )
-
-
-def _build_teacher_policy(env, obs, agent_cfg, device: str):
-    """Instantiate the rule-based steering teacher for direct play/evaluation."""
-    teacher_cfg = getattr(agent_cfg, "teacher", None)
-    if teacher_cfg is None:
-        raise ValueError(
-            "--teacher_steering requires a distillation runner config with a 'teacher' model config."
-        )
-    if "teacher" not in obs.keys():
-        raise ValueError(
-            "--teacher_steering requires an environment exposing a 'teacher' observation group. "
-            "Use a distillation play task such as Navigation-RL-Distill-Go2w-Play-v0."
-        )
-    if args_cli.locomotion_checkpoint is None:
-        raise ValueError("--teacher_steering requires --locomotion_checkpoint for the frozen LLC.")
-
-    teacher_cfg_dict = copy.deepcopy(teacher_cfg.to_dict())
-    teacher_class = resolve_callable(teacher_cfg_dict.pop("class_name"))
-    teacher = teacher_class(obs, {"teacher": ["teacher"]}, "teacher", env.num_actions, **teacher_cfg_dict)
-    teacher = teacher.to(device)
-    teacher.eval()
-    load_teacher_locomotion_checkpoint(teacher, args_cli.locomotion_checkpoint, device)
-    return teacher
-
-
-def _resolve_play_seed(args_cli, default_seed: int | None) -> int:
-    if args_cli.seed is not None:
-        return args_cli.seed
-    base_seed = default_seed if default_seed is not None else 0
-    return (base_seed + random.SystemRandom().randrange(1, 2_147_483_647)) % 2_147_483_647
-
-
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with fixed velocity commands."""
@@ -282,19 +168,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-    env_seed = _resolve_play_seed(args_cli, agent_cfg.seed)
+    env_seed = resolve_play_seed(args_cli, agent_cfg.seed)
     agent_cfg.seed = env_seed
     env_cfg.seed = env_seed
     print(f"[INFO] Play seed: {env_seed}")
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    _override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
-    _override_play_command_path_spawn(
+    override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
+    override_play_command_path_spawn(
         env_cfg,
         args_cli.command_path_obstacles,
         args_cli.command_path_forward_range,
         args_cli.command_path_lateral_range,
         args_cli.command_path_min_speed,
-        None if args_cli.random_commands else (args_cli.cmd_vx, args_cli.cmd_vy),
+        command_path_reference_xy=None if args_cli.random_commands else (args_cli.cmd_vx, args_cli.cmd_vy),
     )
 
     # ------------------------------------------------------------------
@@ -343,7 +229,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     teacher = None
 
     if args_cli.teacher_steering:
-        teacher = _build_teacher_policy(env, obs, agent_cfg, env.unwrapped.device)
+        teacher = build_teacher_policy(
+            env, obs, agent_cfg, env.unwrapped.device, args_cli.locomotion_checkpoint
+        )
         print("[INFO] Running direct teacher evaluation: geometric steering + frozen LLC")
     else:
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)

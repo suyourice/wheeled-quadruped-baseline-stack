@@ -69,6 +69,33 @@ def load_teacher_locomotion_checkpoint(teacher, ckpt_path: str, device: str) -> 
     print(f"[INFO] Loaded teacher frozen LLC from '{actor_key}' in: {ckpt_path}")
 
 
+def apply_hospital_curriculum_offset(env_cfg, iteration_offset: int, *, strict: bool = True) -> None:
+    """Inject a hospital teacher curriculum offset without changing the schedule itself.
+
+    With ``strict=True`` (train), tasks whose reset params lack
+    ``curriculum_iteration_offset`` raise; with ``strict=False`` (play), they
+    are skipped with an informational message.
+    """
+    if iteration_offset < 0:
+        raise ValueError("--hospital_curriculum_iteration_offset must be non-negative.")
+
+    reset_obstacles = getattr(getattr(env_cfg, "events", None), "reset_obstacles", None)
+    params = getattr(reset_obstacles, "params", None)
+    if not isinstance(params, dict) or "curriculum_iteration_offset" not in params:
+        if strict:
+            raise ValueError(
+                "--hospital_curriculum_iteration_offset is only supported for hospital teacher tasks "
+                "whose reset_obstacles params include 'curriculum_iteration_offset'."
+            )
+        print(
+            "[INFO] reset_obstacles has no 'curriculum_iteration_offset' — skipping curriculum offset "
+            "(play env uses a fixed layout, no curriculum needed)."
+        )
+        return
+    params["curriculum_iteration_offset"] = int(iteration_offset)
+    print(f"[INFO] Hospital curriculum iteration offset: {iteration_offset}")
+
+
 def configure_frozen_llc_action(env_cfg, ckpt_path: str | None, task_name: str = "") -> bool:
     """Inject the fast-flat LLC checkpoint into HLC action configs before env creation."""
     import os

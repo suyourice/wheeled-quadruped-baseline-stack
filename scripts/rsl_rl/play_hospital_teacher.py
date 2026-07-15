@@ -16,7 +16,8 @@ import time
 
 from isaaclab.app import AppLauncher
 
-from checkpoint_utils import configure_frozen_llc_action  # isort: skip
+from checkpoint_utils import apply_hospital_curriculum_offset, configure_frozen_llc_action  # isort: skip
+from play_common import TeeStream  # isort: skip
 
 parser = argparse.ArgumentParser(description="Play a hospital teacher checkpoint.")
 parser.add_argument("--task", type=str, default="Nav-Hospital-Teacher-Go2w-v0")
@@ -105,15 +106,18 @@ import gymnasium as gym
 import torch
 from rsl_rl.runners import OnPolicyRunner
 
-import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils.assets import retrieve_file_path
-from isaaclab.utils.math import quat_from_angle_axis
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 from isaaclab_tasks.utils.hydra import hydra_task_config
 import go2w.tasks  # noqa: F401
+from hospital_markers import (  # isort: skip
+    line_marker_transforms,
+    make_line_marker,
+    make_sphere_marker,
+)
 from play_nav_debug import (  # isort: skip
     NAV_LIVE_LABEL_INTERVAL,
     NAV_LIVE_LABEL_SCALE,
@@ -126,24 +130,6 @@ from play_nav_debug import (  # isort: skip
 installed_version = metadata.version("rsl-rl-lib")
 
 
-class _TeeStream:
-    """Mirrors writes to multiple streams (stdout + log file)."""
-
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, data):
-        for s in self._streams:
-            s.write(data)
-
-    def flush(self):
-        for s in self._streams:
-            s.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._streams[0], name)
-
-
 def _infer_iteration_from_checkpoint(path: str) -> int:
     match = re.search(r"model_(\d+)\.pt$", os.path.basename(path))
     if match is None:
@@ -152,22 +138,6 @@ def _infer_iteration_from_checkpoint(path: str) -> int:
             "Pass --hospital_curriculum_iteration_offset explicitly."
         )
     return int(match.group(1))
-
-
-def _apply_hospital_curriculum_offset(env_cfg: ManagerBasedRLEnvCfg, iteration_offset: int) -> None:
-    if iteration_offset < 0:
-        raise ValueError("--hospital_curriculum_iteration_offset must be non-negative.")
-
-    reset_obstacles = getattr(getattr(env_cfg, "events", None), "reset_obstacles", None)
-    params = getattr(reset_obstacles, "params", None)
-    if not isinstance(params, dict) or "curriculum_iteration_offset" not in params:
-        print(
-            "[INFO] reset_obstacles has no 'curriculum_iteration_offset' — skipping curriculum offset "
-            "(play env uses a fixed layout, no curriculum needed)."
-        )
-        return
-    params["curriculum_iteration_offset"] = int(iteration_offset)
-    print(f"[INFO] Hospital curriculum iteration offset: {iteration_offset}")
 
 
 def _selected_env(base_env) -> int:
@@ -180,135 +150,6 @@ def _marker_env_indices(base_env) -> list[int]:
     return list(range(base_env.num_envs))
 
 
-def _line_marker_transforms(points: torch.Tensor, z_offset: float = 0.10):
-    if points.shape[0] < 2:
-        return None
-    points = points.clone()
-    points[:, 2] += z_offset
-    start = points[:-1]
-    end = points[1:]
-    direction = end - start
-    lengths = direction.norm(dim=-1)
-    valid = lengths > 0.03
-    if not bool(valid.any()):
-        return None
-
-    start = start[valid]
-    end = end[valid]
-    direction = direction[valid]
-    lengths = lengths[valid]
-    positions = (start + end) * 0.5
-    direction_norm = direction / lengths.unsqueeze(-1).clamp(min=1.0e-6)
-    default_axis = torch.zeros_like(direction_norm)
-    default_axis[:, 2] = 1.0
-    rotation_axis = torch.linalg.cross(default_axis, direction_norm, dim=-1)
-    rotation_axis_norm = rotation_axis.norm(dim=-1)
-    fallback_axis = torch.zeros_like(rotation_axis)
-    fallback_axis[:, 0] = 1.0
-    rotation_axis = torch.where(
-        (rotation_axis_norm > 1.0e-6).unsqueeze(-1),
-        rotation_axis / rotation_axis_norm.unsqueeze(-1).clamp(min=1.0e-6),
-        fallback_axis,
-    )
-    cos_angle = (default_axis * direction_norm).sum(dim=-1).clamp(-1.0, 1.0)
-    orientations = quat_from_angle_axis(torch.acos(cos_angle), rotation_axis)
-    scales = torch.ones(positions.shape[0], 3, device=positions.device, dtype=positions.dtype)
-    scales[:, 2] = lengths
-    return positions, orientations, scales
-
-
-def _make_sphere_marker(prim_path: str, radius: float, color: tuple[float, float, float]) -> VisualizationMarkers:
-    return VisualizationMarkers(
-        VisualizationMarkersCfg(
-            prim_path=prim_path,
-            markers={
-                "sphere": sim_utils.SphereCfg(
-                    radius=radius,
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
-                ),
-            },
-        )
-    )
-
-
-def _make_line_marker(prim_path: str, radius: float, color: tuple[float, float, float]) -> VisualizationMarkers:
-    return VisualizationMarkers(
-        VisualizationMarkersCfg(
-            prim_path=prim_path,
-            markers={
-                "line": sim_utils.CylinderCfg(
-                    radius=radius,
-                    height=1.0,
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color, roughness=1.0),
-                ),
-            },
-        )
-    )
-
-
-def _place_ward_junction_markers(base_env) -> list[VisualizationMarkers]:
-    """Colored sphere markers at T-junction inner corners for geometry debugging.
-
-    Works for both the isolated ward corridor and the full hospital floor tasks.
-    RED   = suspect inner corner (wall box overlap, potential phantom contact)
-    YELLOW = reference outer corner
-
-    Prints a legend to the console so the user can identify which sphere is which.
-    """
-    if not args_cli.show_markers:
-        return []
-    task = args_cli.task or ""
-
-    if "Floor" in task or "floor" in task:
-        from go2w.tasks.manager_based.go2w.mdp.navigation.hospital.floor import (
-            HOSPITAL_FLOOR_CORRIDOR_WIDTH,
-            HOSPITAL_FLOOR_LEG_LENGTH,
-            HOSPITAL_FLOOR_WALL_THICKNESS,
-        )
-        hw = HOSPITAL_FLOOR_CORRIDOR_WIDTH * 0.5
-        L = HOSPITAL_FLOOR_LEG_LENGTH
-        wt = HOSPITAL_FLOOR_WALL_THICKNESS
-        # (local_x, local_y, label, color)
-        named_pts = [
-            (2.0 * L - hw, hw, "floor-LEFT-inner (suspect, x={:.1f} y={:.1f})".format(2.0 * L - hw, hw), (1.0, 0.05, 0.0)),
-            (2.0 * L + hw, hw, "floor-RIGHT-outer (ref,     x={:.1f} y={:.1f})".format(2.0 * L + hw, hw), (1.0, 0.90, 0.0)),
-        ]
-    elif "Ward" in task or "ward" in task:
-        from go2w.tasks.manager_based.go2w.cfg.hospital.env import (
-            HOSPITAL_WARD_CORRIDOR_WIDTH,
-            HOSPITAL_WARD_LEG_LENGTH,
-            HOSPITAL_WARD_WALL_THICKNESS,
-        )
-        hw = HOSPITAL_WARD_CORRIDOR_WIDTH * 0.5
-        L = HOSPITAL_WARD_LEG_LENGTH
-        wt = HOSPITAL_WARD_WALL_THICKNESS
-        B1, B2 = L, 2.0 * L
-        named_pts = [
-            (B1 - hw, hw, "B1-LEFT  (suspect, x={:.1f} y={:.1f})".format(B1 - hw, hw), (1.0, 0.05, 0.0)),
-            (B1 + hw, hw, "B1-RIGHT (ref,     x={:.1f} y={:.1f})".format(B1 + hw, hw), (1.0, 0.90, 0.0)),
-            (B2 - hw, hw, "B2-LEFT  (suspect, x={:.1f} y={:.1f})".format(B2 - hw, hw), (1.0, 0.05, 0.0)),
-            (B2 + hw, hw, "B2-RIGHT (ref,     x={:.1f} y={:.1f})".format(B2 + hw, hw), (1.0, 0.90, 0.0)),
-        ]
-    else:
-        return []
-
-    origin = base_env.scene.env_origins[_selected_env(base_env), :3].clone()
-    origin[2] = 0.0
-    radius = 0.20 + wt * 0.5
-
-    print("[DEBUG] Junction markers (all coords are local to env origin):")
-    placed: list[VisualizationMarkers] = []
-    for i, (lx, ly, label, color) in enumerate(named_pts):
-        world_pt = torch.tensor([[lx, ly, 0.6]], dtype=torch.float32, device=base_env.device) + origin.unsqueeze(0)
-        m = _make_sphere_marker(f"/Visuals/JunctionMarker_{i}", radius, color)
-        m.visualize(translations=world_pt)
-        placed.append(m)
-        color_name = "RED   " if color[1] < 0.5 else "YELLOW"
-        print(f"  [{color_name}] {label}")
-
-    return placed
-
-
 def _init_markers() -> dict[str, VisualizationMarkers]:
     if not args_cli.show_markers:
         return {}
@@ -316,15 +157,15 @@ def _init_markers() -> dict[str, VisualizationMarkers]:
     final_radius = 0.09 if not args_cli.large_markers else 0.24
     start_radius = 0.08 if not args_cli.large_markers else 0.22
     markers = {
-        "robot": _make_sphere_marker("/Visuals/HospitalTeacherRobot", start_radius, (1.0, 1.0, 1.0)),
-        "start": _make_sphere_marker("/Visuals/HospitalTeacherStart", start_radius, (0.15, 0.90, 1.0)),
-        "current_goal": _make_sphere_marker("/Visuals/HospitalTeacherCurrentGoal", goal_radius, (0.0, 0.9, 0.10)),
-        "final_goal": _make_sphere_marker("/Visuals/HospitalTeacherFinalGoal", final_radius, (1.0, 0.05, 0.02)),
+        "robot": make_sphere_marker("/Visuals/HospitalTeacherRobot", start_radius, (1.0, 1.0, 1.0)),
+        "start": make_sphere_marker("/Visuals/HospitalTeacherStart", start_radius, (0.15, 0.90, 1.0)),
+        "current_goal": make_sphere_marker("/Visuals/HospitalTeacherCurrentGoal", goal_radius, (0.0, 0.9, 0.10)),
+        "final_goal": make_sphere_marker("/Visuals/HospitalTeacherFinalGoal", final_radius, (1.0, 0.05, 0.02)),
         # actor footprint boxes removed — obstacle geometry + text labels are sufficient
-        "path": _make_line_marker("/Visuals/HospitalTeacherPath", 0.03, (1.0, 0.85, 0.0)),
+        "path": make_line_marker("/Visuals/HospitalTeacherPath", 0.03, (1.0, 0.85, 0.0)),
     }
     if args_cli.show_centerline:
-        markers["centerline"] = _make_line_marker("/Visuals/HospitalTeacherCenterline", 0.018, (0.0, 0.85, 1.0))
+        markers["centerline"] = make_line_marker("/Visuals/HospitalTeacherCenterline", 0.018, (0.0, 0.85, 1.0))
     return markers
 
 
@@ -374,7 +215,7 @@ def _update_markers(base_env, markers: dict[str, VisualizationMarkers]) -> None:
             path = path_full[idx]
         else:
             path = path_full
-        path_markers = _line_marker_transforms(path, z_offset=0.18)
+        path_markers = line_marker_transforms(path, z_offset=0.18)
         if path_markers is not None:
             positions, orientations, scales = path_markers
             path_positions.append(positions)
@@ -392,7 +233,7 @@ def _update_markers(base_env, markers: dict[str, VisualizationMarkers]) -> None:
             centerline = torch.zeros(centerline_count, 3, device=device)
             centerline[:, :2] = centerline_local + origin.unsqueeze(0)
             centerline[:, 2] = base_env.scene["robot"].data.root_pos_w[env_index, 2]
-            centerline_markers = _line_marker_transforms(centerline, z_offset=0.10)
+            centerline_markers = line_marker_transforms(centerline, z_offset=0.10)
             if centerline_markers is not None:
                 positions, orientations, scales = centerline_markers
                 center_positions.append(positions)
@@ -497,7 +338,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         _out_dir = os.path.abspath(os.path.join("logs", "nav_play", args_cli.play_name))
         os.makedirs(_out_dir, exist_ok=True)
         _out_log_file = open(os.path.join(_out_dir, "nav_debug.log"), "w", buffering=1)
-        sys.stdout = _TeeStream(sys.__stdout__, _out_log_file)
+        sys.stdout = TeeStream(sys.__stdout__, _out_log_file)
         os.environ["GO2W_NAV_DEBUG"] = "1"
         os.environ["GO2W_NAV_DEBUG_ENV"] = str(args_cli.env_index)
         print(f"[INFO] Play output dir: {_out_dir}")
@@ -512,7 +353,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         else args_cli.hospital_curriculum_iteration_offset
     )
     env_cfg.log_dir = os.path.dirname(checkpoint_path) if checkpoint_path is not None else os.path.abspath("logs/nav_play")
-    _apply_hospital_curriculum_offset(env_cfg, iteration_offset)
+    apply_hospital_curriculum_offset(env_cfg, iteration_offset, strict=False)
     configure_frozen_llc_action(env_cfg, args_cli.locomotion_checkpoint, args_cli.task)
 
     render_mode = "rgb_array" if args_cli.video else None
@@ -541,7 +382,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     _print_robot_runtime_state(base_env)
     markers = _init_markers()
     _update_markers(base_env, markers)
-    _place_ward_junction_markers(base_env)
     _set_camera(base_env)
 
     marker_env_indices = _marker_env_indices(base_env)
