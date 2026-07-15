@@ -23,6 +23,7 @@ Training flow:
 """
 
 import math
+import os
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
@@ -56,6 +57,28 @@ from .observations import (
     NavRLDistillObsCfg,
     NavTeacherObsCfg,
 )
+
+
+def _resolve_terrain_cache_dir() -> str:
+    """Pick an isolated on-disk terrain mesh cache directory for this process.
+
+    Isaac Lab's TerrainGenerator caches sub-terrain meshes as .obj files under a
+    shared directory (default: node-local /tmp/isaaclab/terrains). When several
+    Isaac Sim processes generate the same terrain in parallel on one node (e.g.
+    validate_go2w.sh's 4 backgrounded ablations, or torchrun's DDP ranks), they
+    race on the same cache file: one process's partial write can be read by
+    another as a corrupted multi-object file, which trimesh loads back as a
+    Scene instead of a Trimesh, crashing TerrainGenerator._get_terrain_mesh with
+    "KeyError: 'world'" in Scene.apply_transform. Isolating the cache directory
+    per process avoids the race entirely.
+    """
+    override = os.environ.get("GO2W_TERRAIN_CACHE_DIR")
+    if override:
+        return override
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is not None:
+        return f"/tmp/isaaclab/terrains_rank{local_rank}"
+    return "/tmp/isaaclab/terrains"
 
 
 # =============================================================================
@@ -214,6 +237,7 @@ class HospitalTeacherSceneCfg(Go2wSceneCfg):
             difficulty_range=(0.0, 1.0),
             sub_terrains={"maze": HospitalMazeSubTerrainCfg()},
             use_cache=True,
+            cache_dir=_resolve_terrain_cache_dir(),
         ),
         use_terrain_origins=True,
         physics_material=sim_utils.RigidBodyMaterialCfg(
