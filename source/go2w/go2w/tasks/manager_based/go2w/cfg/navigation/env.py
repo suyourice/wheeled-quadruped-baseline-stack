@@ -525,6 +525,35 @@ _NAV_RESET_PARAMS_BASE = {
 }
 
 
+def _nav_reset_params(
+    *,
+    min_obstacles: int,
+    max_obstacles: int,
+    empty_env_fraction: float,
+    phase_schedule,
+    min_inter_obstacle_dist: float = 0.7,
+    slot_randomization_start_iteration: int = NAV_PHYSICAL_SLOT_RANDOMIZATION_START_ITERATION,
+    slot_randomization_warmup_iterations: int = NAV_PHYSICAL_SLOT_RANDOMIZATION_WARMUP_ITERATIONS,
+) -> dict:
+    """Build ``reset_obstacles.params`` for the flat navigation train envs."""
+    return {
+        **_NAV_RESET_PARAMS_BASE,
+        "obstacle_names": OBSTACLE_NAMES,
+        "min_obstacles": min_obstacles,
+        "max_obstacles": max_obstacles,
+        "empty_env_fraction": empty_env_fraction,
+        "min_inter_obstacle_dist": min_inter_obstacle_dist,
+        "phase_schedule": phase_schedule,
+        "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
+        "fixed_obstacle_shape_ids": TRAIN_OBSTACLE_SHAPE_IDS,
+        "fixed_obstacle_widths": TRAIN_OBSTACLE_WIDTHS,
+        "fixed_obstacle_depths": TRAIN_OBSTACLE_DEPTHS,
+        "randomize_physical_obstacle_slots": True,
+        "physical_slot_randomization_start_iteration": slot_randomization_start_iteration,
+        "physical_slot_randomization_warmup_iterations": slot_randomization_warmup_iterations,
+    }
+
+
 @configclass
 class ObstacleEventCfg(EventCfg):
     """Base obstacle-environment events (legacy obstacle curriculum for compatibility)."""
@@ -550,7 +579,13 @@ class ObstacleEventCfg(EventCfg):
 
 
 def _retarget_nav_rewards_to_play_obstacles(rewards: NavTeacherRewardsCfg) -> None:
-    """Use the full play obstacle slot list for footprint-aware reward terms."""
+    """Use the full play obstacle slot list for footprint-aware reward terms.
+
+    Note: ``_configure_maze_eval_env`` (cfg/hospital/env.py) keeps a separate,
+    intentionally different retarget list for the maze-eval reward set
+    (includes hospital_centerline, excludes the open-path/impossible-gap terms).
+    When adding a new obstacle-aware reward term, update both lists.
+    """
     reward_names = (
         "nav_clearance",
         "nav_lateral_escape",
@@ -633,22 +668,12 @@ class Go2wNavTeacherEnvCfg(Go2wEnvCfg):
 
         # Replace the legacy obstacle curriculum with the navigation reset.
         self.events.reset_obstacles.func = mdp.reset_navigation_goals_and_obstacles
-        self.events.reset_obstacles.params = {
-            **_NAV_RESET_PARAMS_BASE,
-            "obstacle_names": OBSTACLE_NAMES,
-            "min_obstacles": 5,
-            "max_obstacles": 12,
-            "empty_env_fraction": 0.1,
-            "min_inter_obstacle_dist": 0.7,
-            "phase_schedule": NAV_CURRICULUM_PHASE_SCHEDULE,
-            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
-            "fixed_obstacle_shape_ids": TRAIN_OBSTACLE_SHAPE_IDS,
-            "fixed_obstacle_widths": TRAIN_OBSTACLE_WIDTHS,
-            "fixed_obstacle_depths": TRAIN_OBSTACLE_DEPTHS,
-            "randomize_physical_obstacle_slots": True,
-            "physical_slot_randomization_start_iteration": NAV_PHYSICAL_SLOT_RANDOMIZATION_START_ITERATION,
-            "physical_slot_randomization_warmup_iterations": NAV_PHYSICAL_SLOT_RANDOMIZATION_WARMUP_ITERATIONS,
-        }
+        self.events.reset_obstacles.params = _nav_reset_params(
+            min_obstacles=5,
+            max_obstacles=12,
+            empty_env_fraction=0.1,
+            phase_schedule=NAV_CURRICULUM_PHASE_SCHEDULE,
+        )
 
         # Episode never terminates on goal reached — goal_reached_and_resample
         # resamples the target in-place so navigation continues uninterrupted.
@@ -727,22 +752,12 @@ class Go2wNavRLDistillEnvCfg(Go2wNavTeacherEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         # Student acts in the env, so use more obstacles to diversify experience.
-        self.events.reset_obstacles.params = {
-            **_NAV_RESET_PARAMS_BASE,
-            "obstacle_names": OBSTACLE_NAMES,
-            "min_obstacles": 5,
-            "max_obstacles": 5,
-            "empty_env_fraction": 0.05,
-            "min_inter_obstacle_dist": 0.7,
-            "phase_schedule": NAV_CURRICULUM_PHASE_SCHEDULE,
-            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
-            "fixed_obstacle_shape_ids": TRAIN_OBSTACLE_SHAPE_IDS,
-            "fixed_obstacle_widths": TRAIN_OBSTACLE_WIDTHS,
-            "fixed_obstacle_depths": TRAIN_OBSTACLE_DEPTHS,
-            "randomize_physical_obstacle_slots": True,
-            "physical_slot_randomization_start_iteration": NAV_PHYSICAL_SLOT_RANDOMIZATION_START_ITERATION,
-            "physical_slot_randomization_warmup_iterations": NAV_PHYSICAL_SLOT_RANDOMIZATION_WARMUP_ITERATIONS,
-        }
+        self.events.reset_obstacles.params = _nav_reset_params(
+            min_obstacles=5,
+            max_obstacles=5,
+            empty_env_fraction=0.05,
+            phase_schedule=NAV_CURRICULUM_PHASE_SCHEDULE,
+        )
 
 
 @configclass
@@ -768,22 +783,15 @@ class Go2wNavDepthRLDistillEnvCfg(Go2wNavRLDistillEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.depth_camera.update_period = self.decimation * self.sim.dt
-        self.events.reset_obstacles.params = {
-            **_NAV_RESET_PARAMS_BASE,
-            "obstacle_names": OBSTACLE_NAMES,
-            "min_obstacles": DEPTH_DISTILL_MIN_OBSTACLES,
-            "max_obstacles": DEPTH_DISTILL_MAX_OBSTACLES,
-            "empty_env_fraction": DEPTH_DISTILL_EMPTY_ENV_FRACTION,
-            "min_inter_obstacle_dist": DEPTH_DISTILL_MIN_INTER_OBSTACLE_DIST,
-            "phase_schedule": None,
-            "obstacle_radius_margin": NAV_OBSTACLE_RADIUS_MARGIN,
-            "fixed_obstacle_shape_ids": TRAIN_OBSTACLE_SHAPE_IDS,
-            "fixed_obstacle_widths": TRAIN_OBSTACLE_WIDTHS,
-            "fixed_obstacle_depths": TRAIN_OBSTACLE_DEPTHS,
-            "randomize_physical_obstacle_slots": True,
-            "physical_slot_randomization_start_iteration": 0,
-            "physical_slot_randomization_warmup_iterations": 0,
-        }
+        self.events.reset_obstacles.params = _nav_reset_params(
+            min_obstacles=DEPTH_DISTILL_MIN_OBSTACLES,
+            max_obstacles=DEPTH_DISTILL_MAX_OBSTACLES,
+            empty_env_fraction=DEPTH_DISTILL_EMPTY_ENV_FRACTION,
+            min_inter_obstacle_dist=DEPTH_DISTILL_MIN_INTER_OBSTACLE_DIST,
+            phase_schedule=None,
+            slot_randomization_start_iteration=0,
+            slot_randomization_warmup_iterations=0,
+        )
         self.events.depth_distill_dynamic_obstacles = EventTerm(
             func=mdp.move_dynamic_play_obstacles,
             mode="interval",
@@ -858,13 +866,13 @@ class DepthObstacleMultiCamPlayTerrainWallSceneCfg(DepthObstacleMultiCamPlayScen
 
 @configclass
 class Go2wNavDepthLongHistRLDistillEnvCfg(Go2wNavDepthRLDistillEnvCfg):
-    """Depth distillation env with 8-frame dense history (abl-D)."""
+    """Depth distillation env with 8-frame dense history (abl-D).
+
+    Camera update period stays at the parent's per-step rate; only the
+    observation history length changes.
+    """
 
     observations: NavDepthRLDistillLongHistObsCfg = NavDepthRLDistillLongHistObsCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.scene.depth_camera.update_period = self.decimation * self.sim.dt
 
 
 @configclass

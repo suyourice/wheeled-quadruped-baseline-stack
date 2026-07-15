@@ -409,6 +409,83 @@ def _base_structured_reset_params() -> dict:
     }
 
 
+def _lcorridor_wall_kwargs() -> dict:
+    """Wall geometry for the L-corridor play envs."""
+    return dict(
+        corridor_kind=HOSPITAL_PLAY_CORRIDOR_KIND,
+        leg_length=HOSPITAL_PLAY_LEG_LENGTH,
+        corridor_width=HOSPITAL_PLAY_CORRIDOR_WIDTH,
+        wall_thickness=HOSPITAL_PLAY_WALL_THICKNESS,
+        dynamic_obstacle_count=HOSPITAL_PLAY_DYNAMIC_OBSTACLE_COUNT,
+        tile_size=HOSPITAL_PLAY_ENV_SPACING,
+    )
+
+
+def _ward_wall_kwargs() -> dict:
+    """Wall geometry for the hospital-ward play envs."""
+    return dict(
+        corridor_kind=HOSPITAL_WARD_CORRIDOR_KIND,
+        leg_length=HOSPITAL_WARD_LEG_LENGTH,
+        corridor_width=HOSPITAL_WARD_CORRIDOR_WIDTH,
+        wall_thickness=HOSPITAL_WARD_WALL_THICKNESS,
+        dynamic_obstacle_count=HOSPITAL_WARD_DYNAMIC_OBSTACLE_COUNT,
+        speed_scale=0.7,
+        min_inter_obstacle_dist=1.00,
+        tile_size=HOSPITAL_WARD_ENV_SPACING,
+    )
+
+
+def _floor_wall_kwargs(wall_count: int = 0) -> dict:
+    """Wall geometry, semantic actors, and ramps for the full-floor play envs."""
+    return dict(
+        corridor_kind=HOSPITAL_FLOOR_CORRIDOR_KIND,
+        leg_length=HOSPITAL_FLOOR_LEG_LENGTH,
+        corridor_width=HOSPITAL_FLOOR_CORRIDOR_WIDTH,
+        wall_thickness=HOSPITAL_FLOOR_WALL_THICKNESS,
+        dynamic_obstacle_count=HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
+        speed_scale=0.8,
+        semantic_local_poses=_hospital_floor_semantic_local_poses(wall_count, HOSPITAL_FLOOR_LEG_LENGTH),
+        queue_groups=_hospital_floor_queue_groups(wall_count),
+        seated_groups=_hospital_floor_seated_groups(wall_count),
+        ramp_asset_name=HOSPITAL_RAMP_ASSET_NAME,
+        ramp_local_pose=HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
+        ramp_b_asset_name=HOSPITAL_RAMP_B_ASSET_NAME,
+        ramp_b_local_pose=HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
+        robot_start_local_xy=HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
+        min_inter_obstacle_dist=1.05,
+        tile_size=HOSPITAL_FLOOR_ENV_SPACING,
+    )
+
+
+def _apply_structured_play(
+    cfg,
+    *,
+    episode_length_s: float,
+    env_spacing: float,
+    min_inter_obstacle_dist: float,
+    goal_done_radius: float,
+    wall_kwargs: dict,
+) -> None:
+    """Configure a play env for structured A*-corridor navigation.
+
+    Applies the sequence shared by every structured hospital play env:
+    episode length, env spacing, structured reset event, terrain walls,
+    per-step waypoint update, and the final-goal termination.
+    """
+    cfg.episode_length_s = episode_length_s
+    cfg.scene.env_spacing = env_spacing
+    cfg.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
+    cfg.events.reset_obstacles.params = {
+        **_base_structured_reset_params(),
+        "min_inter_obstacle_dist": min_inter_obstacle_dist,
+    }
+    cfg.events.hospital_velocity_resample = None
+    cfg.events.hospital_group_update = None
+    _apply_mesh_wall_overrides(cfg, **wall_kwargs)
+    cfg.events.navigation_path_update = _structured_path_update_event()
+    _set_structured_goal_termination(cfg, goal_done_radius)
+
+
 # =============================================================================
 # L-corridor play environments
 # =============================================================================
@@ -428,29 +505,20 @@ class Go2wHospitalPlayEnvCfg(Go2wNavTeacherEnvCfg_PLAY):
         num_envs=4, env_spacing=HOSPITAL_PLAY_ENV_SPACING
     )
 
+    def _structured_play_spec(self) -> dict:
+        """Structured-play timing and geometry; geometry subclasses override."""
+        return dict(
+            episode_length_s=HOSPITAL_PLAY_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_PLAY_ENV_SPACING,
+            min_inter_obstacle_dist=0.80,
+            goal_done_radius=HOSPITAL_PLAY_GOAL_DONE_RADIUS,
+            wall_kwargs=_lcorridor_wall_kwargs(),
+        )
+
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = HOSPITAL_PLAY_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_PLAY_ENV_SPACING
-        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
-        self.events.reset_obstacles.params = {
-            **_base_structured_reset_params(),
-            "min_inter_obstacle_dist": 0.80,
-        }
-        self.events.hospital_velocity_resample = None
-        self.events.hospital_group_update = None
-        _apply_mesh_wall_overrides(
-            self,
-            corridor_kind=HOSPITAL_PLAY_CORRIDOR_KIND,
-            leg_length=HOSPITAL_PLAY_LEG_LENGTH,
-            corridor_width=HOSPITAL_PLAY_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_PLAY_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_PLAY_DYNAMIC_OBSTACLE_COUNT,
-            tile_size=HOSPITAL_PLAY_ENV_SPACING,
-        )
+        _apply_structured_play(self, **self._structured_play_spec())
         _configure_play_obstacle_obs(self.observations.policy)
-        self.events.navigation_path_update = _structured_path_update_event()
-        _set_structured_goal_termination(self, HOSPITAL_PLAY_GOAL_DONE_RADIUS)
 
 
 @configclass
@@ -468,26 +536,14 @@ class Go2wHospitalDepthPlayEnvCfg(Go2wNavDepthRLDistillEnvCfg_PLAY):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = HOSPITAL_PLAY_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_PLAY_ENV_SPACING
-        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
-        self.events.reset_obstacles.params = {
-            **_base_structured_reset_params(),
-            "min_inter_obstacle_dist": 0.80,
-        }
-        self.events.hospital_velocity_resample = None
-        self.events.hospital_group_update = None
-        _apply_mesh_wall_overrides(
+        _apply_structured_play(
             self,
-            corridor_kind=HOSPITAL_PLAY_CORRIDOR_KIND,
-            leg_length=HOSPITAL_PLAY_LEG_LENGTH,
-            corridor_width=HOSPITAL_PLAY_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_PLAY_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_PLAY_DYNAMIC_OBSTACLE_COUNT,
-            tile_size=HOSPITAL_PLAY_ENV_SPACING,
+            episode_length_s=HOSPITAL_PLAY_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_PLAY_ENV_SPACING,
+            min_inter_obstacle_dist=0.80,
+            goal_done_radius=HOSPITAL_PLAY_GOAL_DONE_RADIUS,
+            wall_kwargs=_lcorridor_wall_kwargs(),
         )
-        self.events.navigation_path_update = _structured_path_update_event()
-        _set_structured_goal_termination(self, HOSPITAL_PLAY_GOAL_DONE_RADIUS)
 
 
 # =============================================================================
@@ -512,28 +568,14 @@ class Go2wHospitalWardDepthPlayEnvCfg(Go2wNavDepthRLDistillEnvCfg_PLAY):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = HOSPITAL_WARD_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_WARD_ENV_SPACING
-        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
-        self.events.reset_obstacles.params = {
-            **_base_structured_reset_params(),
-            "min_inter_obstacle_dist": 1.00,
-        }
-        self.events.hospital_velocity_resample = None
-        self.events.hospital_group_update = None
-        _apply_mesh_wall_overrides(
+        _apply_structured_play(
             self,
-            corridor_kind=HOSPITAL_WARD_CORRIDOR_KIND,
-            leg_length=HOSPITAL_WARD_LEG_LENGTH,
-            corridor_width=HOSPITAL_WARD_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_WARD_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_WARD_DYNAMIC_OBSTACLE_COUNT,
-            speed_scale=0.7,
+            episode_length_s=HOSPITAL_WARD_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_WARD_ENV_SPACING,
             min_inter_obstacle_dist=1.00,
-            tile_size=HOSPITAL_WARD_ENV_SPACING,
+            goal_done_radius=HOSPITAL_WARD_GOAL_DONE_RADIUS,
+            wall_kwargs=_ward_wall_kwargs(),
         )
-        self.events.navigation_path_update = _structured_path_update_event()
-        _set_structured_goal_termination(self, HOSPITAL_WARD_GOAL_DONE_RADIUS)
 
 
 # =============================================================================
@@ -557,38 +599,15 @@ class Go2wHospitalFloorPlayEnvCfg(Go2wNavTeacherEnvCfg_PLAY):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = HOSPITAL_FLOOR_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_FLOOR_ENV_SPACING
-        wall_count = 0  # terrain walls — no obstacle slots used for walls
-        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
-        self.events.reset_obstacles.params = {
-            **_base_structured_reset_params(),
-            "min_inter_obstacle_dist": 1.05,
-        }
-        self.events.hospital_velocity_resample = None
-        self.events.hospital_group_update = None
-        _apply_mesh_wall_overrides(
+        _apply_structured_play(
             self,
-            corridor_kind=HOSPITAL_FLOOR_CORRIDOR_KIND,
-            leg_length=HOSPITAL_FLOOR_LEG_LENGTH,
-            corridor_width=HOSPITAL_FLOOR_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_FLOOR_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
-            speed_scale=0.8,
-            semantic_local_poses=_hospital_floor_semantic_local_poses(wall_count, HOSPITAL_FLOOR_LEG_LENGTH),
-            queue_groups=_hospital_floor_queue_groups(wall_count),
-            seated_groups=_hospital_floor_seated_groups(wall_count),
-            ramp_asset_name=HOSPITAL_RAMP_ASSET_NAME,
-            ramp_local_pose=HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
-            ramp_b_asset_name=HOSPITAL_RAMP_B_ASSET_NAME,
-            ramp_b_local_pose=HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
-            robot_start_local_xy=HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
+            episode_length_s=HOSPITAL_FLOOR_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_FLOOR_ENV_SPACING,
             min_inter_obstacle_dist=1.05,
-            tile_size=HOSPITAL_FLOOR_ENV_SPACING,
+            goal_done_radius=HOSPITAL_FLOOR_GOAL_DONE_RADIUS,
+            wall_kwargs=_floor_wall_kwargs(),
         )
         _configure_play_obstacle_obs(self.observations.policy)
-        self.events.navigation_path_update = _structured_path_update_event()
-        _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
 
 
 @configclass
@@ -606,37 +625,14 @@ class Go2wHospitalFloorDepthPlayEnvCfg(Go2wNavDepthRLDistillEnvCfg_PLAY):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = HOSPITAL_FLOOR_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_FLOOR_ENV_SPACING
-        wall_count = 0  # terrain walls — no obstacle slots used for walls
-        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
-        self.events.reset_obstacles.params = {
-            **_base_structured_reset_params(),
-            "min_inter_obstacle_dist": 1.05,
-        }
-        self.events.hospital_velocity_resample = None
-        self.events.hospital_group_update = None
-        _apply_mesh_wall_overrides(
+        _apply_structured_play(
             self,
-            corridor_kind=HOSPITAL_FLOOR_CORRIDOR_KIND,
-            leg_length=HOSPITAL_FLOOR_LEG_LENGTH,
-            corridor_width=HOSPITAL_FLOOR_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_FLOOR_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
-            speed_scale=0.8,
-            semantic_local_poses=_hospital_floor_semantic_local_poses(wall_count, HOSPITAL_FLOOR_LEG_LENGTH),
-            queue_groups=_hospital_floor_queue_groups(wall_count),
-            seated_groups=_hospital_floor_seated_groups(wall_count),
-            ramp_asset_name=HOSPITAL_RAMP_ASSET_NAME,
-            ramp_local_pose=HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
-            ramp_b_asset_name=HOSPITAL_RAMP_B_ASSET_NAME,
-            ramp_b_local_pose=HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
-            robot_start_local_xy=HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
+            episode_length_s=HOSPITAL_FLOOR_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_FLOOR_ENV_SPACING,
             min_inter_obstacle_dist=1.05,
-            tile_size=HOSPITAL_FLOOR_ENV_SPACING,
+            goal_done_radius=HOSPITAL_FLOOR_GOAL_DONE_RADIUS,
+            wall_kwargs=_floor_wall_kwargs(),
         )
-        self.events.navigation_path_update = _structured_path_update_event()
-        _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
 
 
 # =============================================================================
@@ -691,7 +687,8 @@ class Go2wHospitalTeacherLCorridorPlayEnvCfg(Go2wHospitalPlayEnvCfg):
 class Go2wHospitalTeacherWardPlayEnvCfg(Go2wHospitalPlayEnvCfg):
     """Hospital-ward play env with hospital-teacher privileged observations.
 
-    Inherits the nav-teacher L-corridor base and re-applies ward geometry on top.
+    Inherits the nav-teacher play base and swaps in ward geometry via
+    ``_structured_play_spec``.
     """
 
     scene: ObstaclePlayTerrainWallSceneCfg = ObstaclePlayTerrainWallSceneCfg(
@@ -699,22 +696,17 @@ class Go2wHospitalTeacherWardPlayEnvCfg(Go2wHospitalPlayEnvCfg):
     )
     observations: NavHospitalTeacherObsCfg = NavHospitalTeacherObsCfg()
 
+    def _structured_play_spec(self) -> dict:
+        return dict(
+            episode_length_s=HOSPITAL_WARD_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_WARD_ENV_SPACING,
+            min_inter_obstacle_dist=1.00,
+            goal_done_radius=HOSPITAL_WARD_GOAL_DONE_RADIUS,
+            wall_kwargs=_ward_wall_kwargs(),
+        )
+
     def __post_init__(self):
         super().__post_init__()
-        _apply_mesh_wall_overrides(
-            self,
-            corridor_kind=HOSPITAL_WARD_CORRIDOR_KIND,
-            leg_length=HOSPITAL_WARD_LEG_LENGTH,
-            corridor_width=HOSPITAL_WARD_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_WARD_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_WARD_DYNAMIC_OBSTACLE_COUNT,
-            speed_scale=0.7,
-            min_inter_obstacle_dist=1.00,
-            tile_size=HOSPITAL_WARD_ENV_SPACING,
-        )
-        self.episode_length_s = HOSPITAL_WARD_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_WARD_ENV_SPACING
-        _set_structured_goal_termination(self, HOSPITAL_WARD_GOAL_DONE_RADIUS)
         _configure_hospital_teacher_play_obs(self.observations.policy)
 
 
@@ -722,8 +714,8 @@ class Go2wHospitalTeacherWardPlayEnvCfg(Go2wHospitalPlayEnvCfg):
 class Go2wHospitalTeacherFloorPlayEnvCfg(Go2wHospitalPlayEnvCfg):
     """Full-floor play env with hospital-teacher privileged observations.
 
-    Inherits the nav-teacher L-corridor base and re-applies full-floor geometry,
-    ramps, semantic labels, and actor overrides on top.
+    Inherits the nav-teacher play base and swaps in full-floor geometry,
+    ramps, semantic labels, and actor overrides via ``_structured_play_spec``.
     """
 
     scene: ObstaclePlayTerrainWallSceneCfg = ObstaclePlayTerrainWallSceneCfg(
@@ -731,31 +723,17 @@ class Go2wHospitalTeacherFloorPlayEnvCfg(Go2wHospitalPlayEnvCfg):
     )
     observations: NavHospitalTeacherObsCfg = NavHospitalTeacherObsCfg()
 
+    def _structured_play_spec(self) -> dict:
+        return dict(
+            episode_length_s=HOSPITAL_FLOOR_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_FLOOR_ENV_SPACING,
+            min_inter_obstacle_dist=1.05,
+            goal_done_radius=HOSPITAL_FLOOR_GOAL_DONE_RADIUS,
+            wall_kwargs=_floor_wall_kwargs(),
+        )
+
     def __post_init__(self):
         super().__post_init__()
-        wall_count = 0
-        _apply_mesh_wall_overrides(
-            self,
-            corridor_kind=HOSPITAL_FLOOR_CORRIDOR_KIND,
-            leg_length=HOSPITAL_FLOOR_LEG_LENGTH,
-            corridor_width=HOSPITAL_FLOOR_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_FLOOR_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
-            speed_scale=0.8,
-            semantic_local_poses=_hospital_floor_semantic_local_poses(wall_count, HOSPITAL_FLOOR_LEG_LENGTH),
-            queue_groups=_hospital_floor_queue_groups(wall_count),
-            seated_groups=_hospital_floor_seated_groups(wall_count),
-            ramp_asset_name=HOSPITAL_RAMP_ASSET_NAME,
-            ramp_local_pose=HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
-            ramp_b_asset_name=HOSPITAL_RAMP_B_ASSET_NAME,
-            ramp_b_local_pose=HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
-            robot_start_local_xy=HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
-            min_inter_obstacle_dist=1.05,
-            tile_size=HOSPITAL_FLOOR_ENV_SPACING,
-        )
-        self.episode_length_s = HOSPITAL_FLOOR_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_FLOOR_ENV_SPACING
-        _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
         _configure_hospital_teacher_play_obs(self.observations.policy)
 
 
@@ -837,37 +815,14 @@ class Go2wHospitalFloorLongHistDepthPlayEnvCfg(Go2wNavDepthLongHistRLDistillEnvC
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = HOSPITAL_FLOOR_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_FLOOR_ENV_SPACING
-        wall_count = 0
-        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
-        self.events.reset_obstacles.params = {
-            **_base_structured_reset_params(),
-            "min_inter_obstacle_dist": 1.05,
-        }
-        self.events.hospital_velocity_resample = None
-        self.events.hospital_group_update = None
-        _apply_mesh_wall_overrides(
+        _apply_structured_play(
             self,
-            corridor_kind=HOSPITAL_FLOOR_CORRIDOR_KIND,
-            leg_length=HOSPITAL_FLOOR_LEG_LENGTH,
-            corridor_width=HOSPITAL_FLOOR_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_FLOOR_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
-            speed_scale=0.8,
-            semantic_local_poses=_hospital_floor_semantic_local_poses(wall_count, HOSPITAL_FLOOR_LEG_LENGTH),
-            queue_groups=_hospital_floor_queue_groups(wall_count),
-            seated_groups=_hospital_floor_seated_groups(wall_count),
-            ramp_asset_name=HOSPITAL_RAMP_ASSET_NAME,
-            ramp_local_pose=HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
-            ramp_b_asset_name=HOSPITAL_RAMP_B_ASSET_NAME,
-            ramp_b_local_pose=HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
-            robot_start_local_xy=HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
+            episode_length_s=HOSPITAL_FLOOR_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_FLOOR_ENV_SPACING,
             min_inter_obstacle_dist=1.05,
-            tile_size=HOSPITAL_FLOOR_ENV_SPACING,
+            goal_done_radius=HOSPITAL_FLOOR_GOAL_DONE_RADIUS,
+            wall_kwargs=_floor_wall_kwargs(),
         )
-        self.events.navigation_path_update = _structured_path_update_event()
-        _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
 
 
 @configclass
@@ -884,37 +839,14 @@ class Go2wHospitalFloorSparseDepthPlayEnvCfg(Go2wNavDepthSparseRLDistillEnvCfg_P
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = HOSPITAL_FLOOR_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_FLOOR_ENV_SPACING
-        wall_count = 0
-        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
-        self.events.reset_obstacles.params = {
-            **_base_structured_reset_params(),
-            "min_inter_obstacle_dist": 1.05,
-        }
-        self.events.hospital_velocity_resample = None
-        self.events.hospital_group_update = None
-        _apply_mesh_wall_overrides(
+        _apply_structured_play(
             self,
-            corridor_kind=HOSPITAL_FLOOR_CORRIDOR_KIND,
-            leg_length=HOSPITAL_FLOOR_LEG_LENGTH,
-            corridor_width=HOSPITAL_FLOOR_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_FLOOR_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
-            speed_scale=0.8,
-            semantic_local_poses=_hospital_floor_semantic_local_poses(wall_count, HOSPITAL_FLOOR_LEG_LENGTH),
-            queue_groups=_hospital_floor_queue_groups(wall_count),
-            seated_groups=_hospital_floor_seated_groups(wall_count),
-            ramp_asset_name=HOSPITAL_RAMP_ASSET_NAME,
-            ramp_local_pose=HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
-            ramp_b_asset_name=HOSPITAL_RAMP_B_ASSET_NAME,
-            ramp_b_local_pose=HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
-            robot_start_local_xy=HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
+            episode_length_s=HOSPITAL_FLOOR_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_FLOOR_ENV_SPACING,
             min_inter_obstacle_dist=1.05,
-            tile_size=HOSPITAL_FLOOR_ENV_SPACING,
+            goal_done_radius=HOSPITAL_FLOOR_GOAL_DONE_RADIUS,
+            wall_kwargs=_floor_wall_kwargs(),
         )
-        self.events.navigation_path_update = _structured_path_update_event()
-        _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
 
 
 @configclass
@@ -932,37 +864,14 @@ class Go2wHospitalFloorMultiCamDepthPlayEnvCfg(Go2wNavDepthMultiCamRLDistillEnvC
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = HOSPITAL_FLOOR_EPISODE_LENGTH_S
-        self.scene.env_spacing = HOSPITAL_FLOOR_ENV_SPACING
-        wall_count = 0
-        self.events.reset_obstacles.func = mdp.reset_structured_astar_corridor
-        self.events.reset_obstacles.params = {
-            **_base_structured_reset_params(),
-            "min_inter_obstacle_dist": 1.05,
-        }
-        self.events.hospital_velocity_resample = None
-        self.events.hospital_group_update = None
-        _apply_mesh_wall_overrides(
+        _apply_structured_play(
             self,
-            corridor_kind=HOSPITAL_FLOOR_CORRIDOR_KIND,
-            leg_length=HOSPITAL_FLOOR_LEG_LENGTH,
-            corridor_width=HOSPITAL_FLOOR_CORRIDOR_WIDTH,
-            wall_thickness=HOSPITAL_FLOOR_WALL_THICKNESS,
-            dynamic_obstacle_count=HOSPITAL_FLOOR_DYNAMIC_OBSTACLE_COUNT,
-            speed_scale=0.8,
-            semantic_local_poses=_hospital_floor_semantic_local_poses(wall_count, HOSPITAL_FLOOR_LEG_LENGTH),
-            queue_groups=_hospital_floor_queue_groups(wall_count),
-            seated_groups=_hospital_floor_seated_groups(wall_count),
-            ramp_asset_name=HOSPITAL_RAMP_ASSET_NAME,
-            ramp_local_pose=HOSPITAL_FLOOR_RAMP_LOCAL_POSE,
-            ramp_b_asset_name=HOSPITAL_RAMP_B_ASSET_NAME,
-            ramp_b_local_pose=HOSPITAL_FLOOR_RAMP_B_LOCAL_POSE,
-            robot_start_local_xy=HOSPITAL_FLOOR_ROBOT_START_LOCAL_XY,
+            episode_length_s=HOSPITAL_FLOOR_EPISODE_LENGTH_S,
+            env_spacing=HOSPITAL_FLOOR_ENV_SPACING,
             min_inter_obstacle_dist=1.05,
-            tile_size=HOSPITAL_FLOOR_ENV_SPACING,
+            goal_done_radius=HOSPITAL_FLOOR_GOAL_DONE_RADIUS,
+            wall_kwargs=_floor_wall_kwargs(),
         )
-        self.events.navigation_path_update = _structured_path_update_event()
-        _set_structured_goal_termination(self, HOSPITAL_FLOOR_GOAL_DONE_RADIUS)
 
 
 # =============================================================================
@@ -1022,6 +931,10 @@ def _configure_maze_eval_env(cfg) -> None:
 
     # Retarget obstacle-aware reward terms to the 20-slot eval set so that
     # priority/active tensors remain consistent with the expanded scene.
+    # Note: this list intentionally differs from
+    # _retarget_nav_rewards_to_play_obstacles (cfg/navigation/env.py) — the
+    # maze-eval reward set has hospital_centerline but no open-path terms.
+    # When adding a new obstacle-aware reward term, update both lists.
     _eval_obs_names = list(HOSPITAL_MAZE_EVAL_OBSTACLE_NAMES)
     for _rname in (
         "nav_lateral_escape",
