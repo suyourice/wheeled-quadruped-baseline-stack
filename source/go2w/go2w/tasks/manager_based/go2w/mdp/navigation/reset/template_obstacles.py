@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import functools
 import math
-import random
 from typing import TYPE_CHECKING
 
 import torch
@@ -334,7 +333,7 @@ def reset_navigation_goals_and_obstacles(
     # random module behavior is preserved.
     import random as _rm
     _rng = _rm.Random(fixed_layout_seed) if fixed_layout_seed is not None else _rm
-    random = _rng  # noqa: F841 — shadows module import; all uses below (incl. closures) pick up _rng
+    random = _rng  # local alias — all `random.*` calls below (incl. closures) use the seeded RNG
 
     n = len(env_ids)
     device = env.device

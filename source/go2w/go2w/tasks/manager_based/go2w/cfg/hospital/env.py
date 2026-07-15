@@ -29,9 +29,6 @@ from ..navigation.env import (
     Go2wNavDepthSparseRLDistillEnvCfg_PLAY,
     Go2wNavDepthMultiCamRLDistillEnvCfg_PLAY,
     Go2wNavTeacherEnvCfg_PLAY,
-    HospitalTeacherSceneCfg,
-    HospitalTeacherDepthSceneCfg,
-    HospitalTeacherMultiCamDepthSceneCfg,
     HospitalTeacherEvalSceneCfg,
     HospitalTeacherDepthEvalSceneCfg,
     HospitalTeacherMultiCamDepthEvalSceneCfg,
@@ -44,11 +41,7 @@ from ..navigation.env import (
     _configure_play_obstacle_obs,
     make_play_obstacle_cfg,
 )
-from ..navigation.observations import (
-    NavHospitalTeacherObsCfg,
-    NavDepthRLDistillLongHistObsCfg,
-    NavDepthRLDistillMultiCamObsCfg,
-)
+from ..navigation.observations import NavHospitalTeacherObsCfg
 from ...mdp.navigation.hospital.terrain import HospitalWallSubTerrainCfg
 from ...mdp.navigation.hospital import events as _hospital_events
 from ...mdp.navigation.hospital import specs as _hospital_specs
@@ -77,8 +70,7 @@ from ...mdp.navigation.hospital.floor import (
 # Hospital play environment constants
 # =============================================================================
 
-# Default hospital corridor layout for play testing.
-# Derived from HOSPITAL_LAYOUT_TEMPLATES["main_corridor"]:
+# Default hospital corridor layout for play testing:
 #   corridor_kind="l_corridor", leg_length=12.0, corridor_width=2.6
 HOSPITAL_PLAY_CORRIDOR_KIND = "l_corridor"
 HOSPITAL_PLAY_LEG_LENGTH = 12.0
@@ -136,26 +128,6 @@ def _apply_hospital_obstacle_asset_overrides(scene, slot_tables: dict[str, objec
                 colors[slot_idx],
             ),
         )
-
-
-def _include_hospital_ramp_in_depth_camera(scene) -> None:
-    """Append ramp prim targets to all depth cameras, preserving existing terrain wall entries."""
-    ramp_targets = [
-        MultiMeshRayCasterCfg.RaycastTargetCfg(
-            prim_expr="{ENV_REGEX_NS}/hospital_ramp",
-            track_mesh_transforms=True,
-            is_shared=True,
-        ),
-        MultiMeshRayCasterCfg.RaycastTargetCfg(
-            prim_expr="{ENV_REGEX_NS}/hospital_ramp_b",
-            track_mesh_transforms=True,
-            is_shared=True,
-        ),
-    ]
-    for cam_attr in ("depth_camera", "depth_camera_left", "depth_camera_right", "depth_camera_rear"):
-        cam = getattr(scene, cam_attr, None)
-        if cam is not None:
-            cam.mesh_prim_paths = list(cam.mesh_prim_paths) + ramp_targets
 
 
 def _hospital_group_registry(wall_count: int) -> list[dict]:

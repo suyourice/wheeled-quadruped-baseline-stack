@@ -535,44 +535,17 @@ class ObstacleEventCfg(EventCfg):
     hospital_velocity_resample: EventTerm | None = None
     hospital_group_update: EventTerm | None = None
 
-    speed_curriculum: EventTerm | None = EventTerm(
-        func=mdp.update_locomotion_curriculum,
-        mode="reset",
-        params={
-            "start_iteration": CURRICULUM_SPEED_START_ITERATION,
-            "warmup_iterations": CURRICULUM_SPEED_WARMUP_ITERATIONS,
-            "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
-            "command_name": "base_velocity",
-            "lin_vel_x_initial": (-1.0, 1.0),
-            "lin_vel_x_final": OBSTACLE_LIN_VEL_X,
-            "lin_vel_y_initial": (-0.3, 0.3),
-            "lin_vel_y_final": OBSTACLE_LIN_VEL_Y,
-            "ang_vel_z_initial": (-0.3, 0.3),
-            "ang_vel_z_final": OBSTACLE_ANG_VEL_Z,
-            "min_survival_steps": 800,
-        },
-    )
+    # Navigation tasks drive goals via the reset event, so the locomotion speed
+    # curriculum is unused here (Go2wNavTeacherEnvCfg.__post_init__ keeps it None).
+    speed_curriculum: EventTerm | None = None
 
+    # Placeholder: func/params are replaced wholesale in every consumer's
+    # __post_init__ (nav teacher → reset_navigation_goals_and_obstacles,
+    # hospital teacher → reset_hospital_maze_training).
     reset_obstacles = EventTerm(
         func=mdp.reset_obstacles_curriculum,
         mode="reset",
-        params={
-            "obstacle_names": OBSTACLE_NAMES,
-            "start_iteration": CURRICULUM_OBSTACLE_START_ITERATION,
-            "warmup_iterations": CURRICULUM_OBSTACLE_WARMUP_ITERATIONS,
-            "steps_per_iteration": CURRICULUM_STEPS_PER_ITERATION,
-            "min_obstacles": 5,
-            "spawn_range_x": OBSTACLE_SPAWN_RANGE["x"],
-            "spawn_range_y": OBSTACLE_SPAWN_RANGE["y"],
-            "obstacle_z": OBSTACLE_Z,
-            "min_spawn_distance_from_robot": OBSTACLE_MIN_SPAWN_DISTANCE_FROM_ROBOT,
-            "min_spawn_distance_from_robot_initial": OBSTACLE_MIN_SPAWN_DISTANCE_INITIAL,
-            "min_inter_obstacle_dist": 0.8,
-            "min_survival_steps": 800,
-            "fixed_obstacle_shape_ids": TRAIN_OBSTACLE_SHAPE_IDS,
-            "fixed_obstacle_widths": TRAIN_OBSTACLE_WIDTHS,
-            "fixed_obstacle_depths": TRAIN_OBSTACLE_DEPTHS,
-        },
+        params={},
     )
 
 
@@ -652,7 +625,6 @@ class Go2wNavTeacherEnvCfg(Go2wEnvCfg):
             self.scene.lidar.update_period = self.decimation * self.sim.dt
 
         # Navigation task: goals are set by the reset event, not velocity commands.
-        self.events.speed_curriculum = None
         self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.0)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)

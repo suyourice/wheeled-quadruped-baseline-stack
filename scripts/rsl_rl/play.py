@@ -2062,7 +2062,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "--output_dir", _out_dir,
         ]
         _plot_cmd.extend(_nav_debug_corridor_plot_args(_base_env, args_cli))
-        print(f"[INFO] Generating nav debug plot ...")
+        print("[INFO] Generating nav debug plot ...")
         sys.stdout.flush()
         result = subprocess.run(_plot_cmd, capture_output=True, text=True, start_new_session=True)
         if result.stdout:
