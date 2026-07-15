@@ -29,7 +29,7 @@ import sys
 # ---------------------------------------------------------------------------
 
 _LLC = "logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt"
-_TEACHER_CKPT = "logs/rsl_rl/go2w_nav_hospital_teacher_rl/2026-07-03_23-18-48/model_1100.pt"
+_TEACHER_CKPT = "logs/rsl_rl/go2w_nav_hospital_teacher_rl/2026-07-02_22-18-37/model_1100.pt"
 
 POLICIES = [
     {
