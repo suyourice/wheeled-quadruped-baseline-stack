@@ -1,15 +1,18 @@
 #!/bin/bash -l
 #SBATCH -A YOUR_ACCOUNT
 #SBATCH -p qgpu
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:5
 #SBATCH --time=12:00:00
 #SBATCH --job-name=go2w_validate
 #SBATCH --output=logs/slurm/validate/%x_%j.out
 
-# NOTE: 4 depth student ablations run in parallel (1 GPU each).
-# Teacher runs sequentially on GPU 0 after the 4 ablations complete.
-# If 5 GPUs are available, change --gres=gpu:5 and uncomment the 5th
-# parallel line below to run all 5 policies simultaneously.
+# NOTE: all 5 policies (4 depth-student ablations + teacher) run fully in
+# parallel, one GPU each, no barrier. Teacher has no depth camera so it
+# finishes its 4-scenario x N-seed sequence well before GPU 0-3, but it
+# gets its own GPU from t=0 instead of running serially afterward — zero
+# idle GPU time. If only 4 GPUs are available, drop back to --gres=gpu:4,
+# remove the "teacher 4" line below, and chain teacher onto one of the
+# ablation GPUs instead (see meluxina/validate_go2w.sh for that pattern).
 
 # Extra args are passed through to run_validation.py, e.g. 3-seed run:
 #   OUT_NAME=validation_$(date +%Y%m%d) sbatch <this script> --seeds 42 43 44 --maze_episodes 100
@@ -60,18 +63,14 @@ _run_policy() {
         "$@"
 }
 
-# Run 4 ablations in parallel (GPUs 0-3)
+# All 5 policies in parallel (GPUs 0-4), no barrier.
 _run_policy 0 baseline "$@" &
 _run_policy 1 longhist "$@" &
 _run_policy 2 sparse   "$@" &
 _run_policy 3 4cam     "$@" &
-# Uncomment and change --gres=gpu:5 above to run teacher in parallel:
-# _run_policy 4 teacher "$@" &
+_run_policy 4 teacher  "$@" &
 
 wait
-
-# Teacher runs sequentially on GPU 0 (reused after ablations finish)
-_run_policy 0 teacher "$@"
 
 # Plot once all 5 policies are done
 KIT_RUNTIME="${XDG_CACHE_HOME:-$HOME/.cache}/go2w_isaacsim/${SLURM_JOB_ID}_plot"

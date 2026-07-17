@@ -61,15 +61,16 @@ _run_policy() {
 
 echo "[validate] Scenario: $SCENARIO  Job: $SLURM_ARRAY_JOB_ID  Array task: $SLURM_ARRAY_TASK_ID"
 
-# 4 depth-student ablations in parallel (GPUs 0-3).
-_run_policy 0 baseline "$@" &
+# All 4 GPUs start at once with no shared barrier. GPU 0 chains baseline
+# then teacher instead of running teacher alone after GPUs 1-3 finish —
+# teacher has no depth camera so it completes noticeably faster than a
+# depth-student ablation, so stacking it after baseline keeps GPU 0's
+# total time close to GPU 1-3's single-ablation time instead of leaving
+# 3 GPUs idle during a separate teacher-only tail.
+( _run_policy 0 baseline "$@" && _run_policy 0 teacher "$@" ) &
 _run_policy 1 longhist "$@" &
 _run_policy 2 sparse   "$@" &
 _run_policy 3 4cam     "$@" &
 wait
-
-# Teacher runs sequentially on GPU 0 after ablations finish.
-# No depth camera → significantly faster; GPU 0 reuse avoids extra node.
-_run_policy 0 teacher "$@"
 
 echo "[validate] Scenario $SCENARIO done."
