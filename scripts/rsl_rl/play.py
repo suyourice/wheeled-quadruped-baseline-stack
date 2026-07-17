@@ -8,7 +8,6 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-import math
 import random
 import sys
 
@@ -23,6 +22,7 @@ from play_common import (  # isort: skip
     format_eval_metrics,
     override_play_obstacle_count,
     override_play_command_path_spawn,
+    preflight_check_obstacle_slots,
     resolve_play_seed,
 )
 
@@ -492,6 +492,27 @@ parser.add_argument(
     help="Navigation play tasks only: aggregate this many completed episodes, then exit. Use 0 for endless play.",
 )
 parser.add_argument(
+    "--hospital_maze_route_steps",
+    "--hospital-maze-route-steps",
+    dest="hospital_maze_route_steps",
+    type=int,
+    nargs=2,
+    metavar=("MIN", "MAX"),
+    default=None,
+    help="Hospital maze eval only: sample final routes with this inclusive junction-step range.",
+)
+parser.add_argument(
+    "--terminate_on_final_goal",
+    "--terminate-on-final-goal",
+    dest="terminate_on_final_goal",
+    action="store_true",
+    help="Hospital maze eval only: end the episode on the first route completion instead of "
+    "resampling a new route (goal_reached_and_resample keeps running by default, matching "
+    "training, so path_progress_mean reflects sustained multi-route exposure). Use this only "
+    "for a single-route success-rate/SPL protocol (e.g. maze_success) — enabling it for the "
+    "long-horizon maze_train/static/dynamic scenarios changes what they measure.",
+)
+parser.add_argument(
     "--stuck_timeout_steps",
     "--stuck-timeout-steps",
     dest="stuck_timeout_steps",
@@ -604,6 +625,7 @@ installed_version = metadata.version("rsl-rl-lib")
 """Rest everything follows."""
 
 from collections import defaultdict
+from datetime import datetime, timezone
 import os
 import subprocess
 import time
@@ -625,7 +647,6 @@ import isaaclab.sim as sim_utils
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.utils.math import quat_from_angle_axis
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
@@ -646,6 +667,7 @@ import go2w.tasks  # noqa: F401
 from go2w.tasks.manager_based.go2w import mdp as go2w_mdp
 from go2w.tasks.manager_based.go2w.cfg.navigation.env import OBSTACLE_SIZE, make_play_obstacle_cfg
 from go2w.tasks.manager_based.go2w.mdp.navigation.hospital.specs import (
+    NAV_GOAL_SUCCESS_POSITION_THRESHOLD,
     NAV_WAYPOINT_COMMAND_MIN_FORWARD_PLAY,
     NAV_WAYPOINT_COMMAND_MAX_LATERAL_PLAY,
     NAV_WAYPOINT_COMMAND_MAX_HEADING_PLAY,
@@ -654,9 +676,7 @@ from go2w.tasks.manager_based.go2w.mdp.navigation.local_planning.obstacle_geomet
     OBSTACLE_SHAPE_CONE,
     OBSTACLE_SHAPE_CUBOID,
     OBSTACLE_SHAPE_CYLINDER,
-    footprint_clearance,
 )
-from go2w.tasks.manager_based.go2w.cfg.observation_layout import POLICY_OBS
 
 from play_nav_debug import (  # isort: skip
     NAV_LIVE_LABEL_INTERVAL, NAV_LIVE_LABEL_SCALE, NAV_LIVE_LABEL_MAX,
@@ -1068,6 +1088,56 @@ def _override_play_episode_length(
     print(f"[INFO] Play episode length: {env_cfg.episode_length_s:.1f} s")
 
 
+def _override_hospital_maze_route_steps(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    args_cli: argparse.Namespace,
+) -> None:
+    """Set an eval-only hospital-maze route range without touching training cfgs."""
+    if args_cli.hospital_maze_route_steps is None:
+        return
+    min_steps, max_steps = args_cli.hospital_maze_route_steps
+    if min_steps < 1 or max_steps < min_steps:
+        raise ValueError("--hospital_maze_route_steps requires 1 <= MIN <= MAX.")
+    reset_obstacles = getattr(getattr(env_cfg, "events", None), "reset_obstacles", None)
+    params = getattr(reset_obstacles, "params", None)
+    if params is None or getattr(reset_obstacles.func, "__name__", "") != "reset_hospital_maze_training":
+        raise ValueError("--hospital_maze_route_steps requires a hospital maze task.")
+    params.update({
+        "min_path_steps_override": min_steps,
+        "max_path_steps_override": max_steps,
+        "long_path_max_steps_override": max_steps,
+        "long_path_probability_override": 0.0,
+    })
+    print(f"[INFO] Hospital maze eval route: {min_steps}-{max_steps} junction steps")
+
+
+def _override_terminate_on_final_goal(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    args_cli: argparse.Namespace,
+) -> None:
+    """Add a single-route-completion termination for the success/SPL protocol.
+
+    Off by default: maze_train/static/dynamic must keep training's
+    uninterrupted-on-goal semantics (goal_reached_and_resample keeps sampling
+    new routes for the full episode) so path_progress_mean measures sustained
+    multi-route exposure. Use --terminate_on_final_goal only for a scenario
+    that is meant to measure single-route success, e.g. maze_success.
+    """
+    if not args_cli.terminate_on_final_goal:
+        return
+    terminations_cfg = getattr(env_cfg, "terminations", None)
+    if terminations_cfg is None:
+        raise ValueError("--terminate_on_final_goal requires a task with a terminations manager.")
+    terminations_cfg.structured_goal_reached = DoneTerm(
+        func=go2w_mdp.navigation_path_final_goal_reached,
+        params={"position_threshold": NAV_GOAL_SUCCESS_POSITION_THRESHOLD},
+    )
+    print(
+        "[INFO] Hospital maze eval: episode terminates on first route completion "
+        f"(position_threshold={NAV_GOAL_SUCCESS_POSITION_THRESHOLD:.2f} m)."
+    )
+
+
 def _override_navigation_play_case(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     args_cli: argparse.Namespace,
@@ -1102,7 +1172,10 @@ def _override_navigation_play_case(
     if not has_nav_override:
         return
     if reset_params is None or "fixed_scenario_template" not in reset_params:
-        raise ValueError("Navigation play overrides require a navigation play task (Nav-Teacher-Go2w-Play-v0 or similar).")
+        raise ValueError(
+            "Navigation play overrides require a navigation play task "
+            "(Nav-ObstacleFlat-Teacher-Go2w-Play-v0 or similar)."
+        )
 
     if effective_scenario is not None:
         reset_params["fixed_scenario_template"] = effective_scenario
@@ -1285,6 +1358,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     del _scene_terrain
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
     _override_play_episode_length(env_cfg, args_cli)
+    _override_hospital_maze_route_steps(env_cfg, args_cli)
+    _override_terminate_on_final_goal(env_cfg, args_cli)
     override_play_obstacle_count(env_cfg, args_cli.num_obstacles)
     override_play_command_path_spawn(
         env_cfg,
@@ -1439,26 +1514,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # Navigation visualization markers — only created for nav tasks.
     _base_env = env.unwrapped
+    preflight_check_obstacle_slots(_base_env)
+    try:
+        _reset_obstacles_cfg = _base_env.event_manager.get_term_cfg("reset_obstacles")
+        _fixed_layout_pairing_supported = "fixed_layout_seed" in (_reset_obstacles_cfg.params or {})
+    except (ValueError, KeyError, AttributeError):
+        _fixed_layout_pairing_supported = False
 
     # SPL = (1/N) Σ sᵢ × lᵢ / max(pᵢ, lᵢ) — initialized from first A* path lengths.
     _spl_enabled, _nav_optimal_len, _nav_actual_len, _goal_reached_term_idx = (
         _init_spl_tracking(_base_env, termination_names)
     )
     _nav_prev_robot_pos: torch.Tensor | None = None
-    _stuck_last_pos: torch.Tensor | None = None
+    # Pre-allocated (not lazily assigned inside the loop) so this tensor's
+    # identity is fixed before inference_mode is ever entered — see the
+    # in-place-mutation note above _update_contact_events for why a rebind
+    # here would poison it as an "inference tensor" and crash the first
+    # in-place write to it from the done-envs reset block.
+    _stuck_last_pos = torch.zeros(env.unwrapped.num_envs, 2)
+    _stuck_last_pos_initialized = False
     _stuck_counter = torch.zeros(env.unwrapped.num_envs, dtype=torch.long)
+    # A stuck reset becomes a time_out on the following step. Keep the
+    # attribution per environment until that termination is observed.
+    _stuck_forced_pending = torch.zeros(env.unwrapped.num_envs, dtype=torch.bool)
     _nav_spl_history: list[float] = []
     _goals_per_episode_history: list[float] = []
     _path_progress_history: list[float] = []
-    _collision_episode_history: list[float] = []
-    _low_collision_episode_history: list[float] = []
+    # Per-episode artifact for analysis beyond aggregate manifests.
+    _episode_metric_records: list[dict[str, object]] = []
 
     # --- Onset-based collision tracking (eval only, requires ContactSensor in scene) ---
     # obstacle_contacts sensor: robot↔obstacle contacts (obstacles float 5cm above ground,
-    # so net_forces only reflects robot hits). Low-obstacle slots identified by center_z < 0.25m.
+    # so net_forces only reflects robot hits). Low slots use the reset-time metadata flag,
+    # not a second center-height heuristic.
     # contact_forces sensor on Robot/base: catches wall hits (base never touches ground normally).
-    _OBSTACLE_CONTACT_THRESHOLD = 1.0   # N — same as training reward threshold
-    _WALL_CONTACT_THRESHOLD     = 0.5   # N — lower than termination (1.0 N) to catch soft grazes
+    _OBSTACLE_CONTACT_ON      = 1.0   # N — event starts above this (training reward threshold)
+    _OBSTACLE_CONTACT_OFF     = 0.5   # N — event ends below this (hysteresis suppresses chatter)
+    _WALL_CONTACT_ON          = 0.5   # N — lower than termination (1.0 N) to catch soft grazes
+    _WALL_CONTACT_OFF         = 0.25  # N
+    _CONTACT_REFRACTORY_STEPS = max(1, round(0.5 / dt))  # merge re-contacts within 0.5 s
     _obs_sensor     = _base_env.scene.sensors.get("obstacle_contacts")
     # Prefer full robot-body sensor (eval scenes); fall back to base-only contact_forces.
     _base_sensor    = (
@@ -1468,15 +1562,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _num_envs_val   = _base_env.num_envs
     _dev             = _base_env.device
 
-    # Precompute low-obstacle mask from scene center_z values.
+    # Read the reset-time top-z classification used by the reward code.  It is
+    # shaped [env, slot], so per-env layouts remain correct too.
     _low_obs_mask: torch.Tensor | None = None
     if _obs_sensor is not None:
         _num_obs_slots = _obs_sensor.data.net_forces_w_history.shape[2]
-        _center_zs = getattr(_base_env, "_go2w_obstacle_center_z", None)
-        if _center_zs is not None and _center_zs.shape[-1] >= _num_obs_slots:
-            _low_obs_mask = (_center_zs[0, :_num_obs_slots] < 0.25).to(_dev)
+        _low_flags = getattr(_base_env, "_go2w_obstacle_low_flag", None)
+        if _low_flags is not None and _low_flags.shape[-1] >= _num_obs_slots:
+            _low_obs_mask = _low_flags[:, :_num_obs_slots].to(device=_dev, dtype=torch.bool)
         else:
-            _low_obs_mask = torch.zeros(_num_obs_slots, dtype=torch.bool, device=_dev)
+            _low_obs_mask = torch.zeros(_num_envs_val, _num_obs_slots, dtype=torch.bool, device=_dev)
 
     # Mask for wall sensor: exclude wheel bodies (*_foot) to avoid ground contact false positives.
     _wall_body_non_wheel_mask: torch.Tensor | None = None
@@ -1487,16 +1582,105 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             device=_dev,
         )
 
-    _obs_contact_prev  = torch.zeros(_num_envs_val, _obs_sensor.data.net_forces_w_history.shape[2] if _obs_sensor is not None else 1, dtype=torch.bool, device=_dev) if _obs_sensor is not None else None
+    _obs_slot_count    = _obs_sensor.data.net_forces_w_history.shape[2] if _obs_sensor is not None else 1
+    _obs_contact_prev  = torch.zeros(_num_envs_val, _obs_slot_count, dtype=torch.bool, device=_dev) if _obs_sensor is not None else None
     _base_contact_prev = torch.zeros(_num_envs_val, dtype=torch.bool, device=_dev)
     _obs_coll_ep       = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
     _low_obs_coll_ep   = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
     _wall_coll_ep      = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+    # Per-event severity tracking: refractory merges micro-bounces into one event,
+    # per-event peak force enables post-hoc graze/collision classification
+    # (all events are dumped to contact_events.csv next to the manifest).
+    _obs_refract       = torch.zeros(_num_envs_val, _obs_slot_count, dtype=torch.long, device=_dev)
+    _obs_event_peak    = torch.zeros(_num_envs_val, _obs_slot_count, device=_dev)
+    _obs_event_is_low  = torch.zeros(_num_envs_val, _obs_slot_count, dtype=torch.bool, device=_dev)
+    _wall_refract      = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+    _wall_event_peak   = torch.zeros(_num_envs_val, device=_dev)
+    _episode_index = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+    _contact_event_records: list[tuple[str, int, int, int, float, int]] = []
     _obs_coll_history:      list[float] = []
     _low_obs_coll_history:  list[float] = []
     _wall_coll_history:     list[float] = []
     # Cumulative navigation distance per env: sum of completed path lengths within the episode.
     _cumul_path_progress = torch.zeros(_num_envs_val, device=_dev)
+
+    def _update_contact_events() -> None:
+        """Consume the current (pre-step) contact-sensor sample.
+
+        ManagerBasedRLEnv resets completed environments inside ``env.step``.
+        Sampling here prevents a terminal reset from being attributed to the
+        newly started episode.  A terminal obstacle termination remains in the
+        separate termination metric even if it occurs between sensor samples.
+        """
+        nonlocal _low_obs_mask, _obs_contact_prev, _base_contact_prev
+        nonlocal _obs_refract, _obs_event_peak, _obs_event_is_low
+        nonlocal _wall_refract, _wall_event_peak, _obs_coll_ep, _low_obs_coll_ep, _wall_coll_ep
+        if _obs_sensor is None:
+            return
+        _low_flags = getattr(_base_env, "_go2w_obstacle_low_flag", None)
+        if _low_flags is not None and _low_flags.shape[-1] >= _num_obs_slots:
+            _low_obs_mask = _low_flags[:, :_num_obs_slots].to(device=_dev, dtype=torch.bool)
+        # All cross-step state tensors below (_obs_refract, _obs_event_peak,
+        # _obs_contact_prev, _wall_refract, _wall_event_peak, _base_contact_prev)
+        # must be mutated in place (.copy_/.sub_/.clamp_/indexed write) rather
+        # than rebound with `=` to a freshly computed tensor. A rebind inside
+        # this inference_mode step would replace the pre-loop tensor object
+        # with a new one tagged as an "inference tensor"; a later in-place
+        # write to it from the done-envs reset block below then raises
+        # "Inplace update to inference tensor outside InferenceMode".
+        _obs_forces = _obs_sensor.data.net_forces_w_history[:, 0]
+        _obs_force_mag = _obs_forces.norm(dim=-1)
+        _obs_refract.sub_(1).clamp_(min=0)
+        _obs_contact_now = (
+            (_obs_contact_prev & (_obs_force_mag > _OBSTACLE_CONTACT_OFF))
+            | (_obs_force_mag > _OBSTACLE_CONTACT_ON)
+        )
+        _obs_onset = _obs_contact_now & ~_obs_contact_prev & (_obs_refract == 0)
+        _obs_coll_ep += _obs_onset.long().sum(dim=-1)
+        if _low_obs_mask is not None:
+            _low_obs_coll_ep += (_obs_onset & _low_obs_mask).long().sum(dim=-1)
+            _obs_event_is_low[_obs_onset] = _low_obs_mask[_obs_onset]
+        _obs_offset = ~_obs_contact_now & _obs_contact_prev
+        _obs_refract[_obs_offset] = _CONTACT_REFRACTORY_STEPS
+        _obs_tracking = _obs_contact_now | (_obs_refract > 0)
+        _obs_event_peak[_obs_tracking] = torch.maximum(_obs_event_peak, _obs_force_mag)[_obs_tracking]
+        _obs_flush = ~_obs_tracking & (_obs_event_peak > 0.0)
+        if _obs_flush.any():
+            for _e, _s in _obs_flush.nonzero(as_tuple=False).tolist():
+                _contact_event_records.append((
+                    "obstacle", _e, int(_episode_index[_e].item()), step_count,
+                    float(_obs_event_peak[_e, _s].item()), int(_obs_event_is_low[_e, _s].item()),
+                ))
+            _obs_event_peak[_obs_flush] = 0.0
+            _obs_event_is_low[_obs_flush] = False
+        _obs_contact_prev.copy_(_obs_contact_now)
+
+        if _base_sensor is None:
+            return
+        _base_forces = _base_sensor.data.net_forces_w_history[:, 0]
+        if _wall_body_non_wheel_mask is not None:
+            _base_forces = _base_forces[:, _wall_body_non_wheel_mask, :]
+        _base_force_mag = _base_forces.norm(dim=-1).max(dim=-1).values
+        _base_contact_now = (
+            (_base_contact_prev & (_base_force_mag > _WALL_CONTACT_OFF))
+            | (_base_force_mag > _WALL_CONTACT_ON)
+        )
+        _wall_refract.sub_(1).clamp_(min=0)
+        _wall_onset = _base_contact_now & ~_base_contact_prev & (_wall_refract == 0) & ~_obs_contact_now.any(dim=-1)
+        _wall_coll_ep += _wall_onset.long()
+        _wall_offset = ~_base_contact_now & _base_contact_prev
+        _wall_refract[_wall_offset] = _CONTACT_REFRACTORY_STEPS
+        _wall_tracking = _base_contact_now | (_wall_refract > 0)
+        _wall_event_peak[_wall_tracking] = torch.maximum(_wall_event_peak, _base_force_mag)[_wall_tracking]
+        _wall_flush = ~_wall_tracking & (_wall_event_peak > 0.0)
+        if _wall_flush.any():
+            for _e in _wall_flush.nonzero(as_tuple=False).squeeze(-1).tolist():
+                _contact_event_records.append((
+                    "wall", _e, int(_episode_index[_e].item()), step_count,
+                    float(_wall_event_peak[_e].item()), 0,
+                ))
+            _wall_event_peak[_wall_flush] = 0.0
+        _base_contact_prev.copy_(_base_contact_now)
 
     (
         _nav_goal_marker, _nav_final_goal_marker, _nav_start_marker, _nav_path_marker,
@@ -1572,10 +1756,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     _signal.signal(_signal.SIGINT, _handle_sigint)
 
+    _run_start_time = time.time()
+    _run_started_at = datetime.now(timezone.utc).isoformat()
     while simulation_app.is_running() and not _play_interrupted:
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            # Read the previous physics step before env.step() can reset a
+            # just-finished environment and contaminate the next episode.
+            _update_contact_events()
             if args_cli.structured_env != "none":
                 if not args_cli.no_astar:
                     go2w_mdp.update_navigation_path_waypoint(
@@ -1644,8 +1833,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Stuck detection: force-reset envs that haven't moved enough in N steps.
         if args_cli.stuck_timeout_steps > 0:
             _cur_stuck_pos = _base_env.scene["robot"].data.root_pos_w[:, :2].cpu()
-            if _stuck_last_pos is None:
-                _stuck_last_pos = _cur_stuck_pos.clone()
+            if not _stuck_last_pos_initialized:
+                _stuck_last_pos.copy_(_cur_stuck_pos)
+                _stuck_last_pos_initialized = True
             else:
                 _disp = (_cur_stuck_pos - _stuck_last_pos).norm(dim=-1)
                 _moved = _disp >= args_cli.stuck_threshold
@@ -1657,6 +1847,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     _stuck_ids = _stuck_mask.nonzero(as_tuple=False).squeeze(-1).to(_base_env.device)
                     _base_env.episode_length_buf[_stuck_ids] = _base_env.max_episode_length - 1
                     _stuck_termination_count += int(_stuck_mask.sum().item())
+                    _stuck_forced_pending[_stuck_mask.cpu()] = True
                     _stuck_counter[_stuck_mask] = 0
                     _stuck_last_pos[_stuck_mask] = _cur_stuck_pos[_stuck_mask]
 
@@ -1694,7 +1885,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
         num_done = int(done_ids.numel())
         if num_done > 0:
-            if args_cli.stuck_timeout_steps > 0 and _stuck_last_pos is not None:
+            if args_cli.stuck_timeout_steps > 0 and _stuck_last_pos_initialized:
                 _done_cpu = done_ids.cpu()
                 _stuck_counter[_done_cpu] = 0
                 _stuck_last_pos[_done_cpu] = _base_env.scene["robot"].data.root_pos_w[:, :2].cpu()[_done_cpu]
@@ -1712,6 +1903,68 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         if done_terms[i, _obstacle_contact_term_idx].item():
                             episode_collision_counts[env_id] += 1
 
+            # Persist one pre-reset row per terminated episode.  The environment
+            # has already reset its scene, so use the snapshots and per-episode
+            # counters maintained above rather than reading reset buffers.
+            for i, env_id_tensor in enumerate(done_ids):
+                _env_i = int(env_id_tensor.item())
+                _stuck_episode = bool(_stuck_forced_pending[_env_i].item())
+                _term_list: list[str] = []
+                if done_terms is not None:
+                    for _term_i, _term_name in enumerate(termination_names):
+                        if bool(done_terms[i, _term_i].item()):
+                            _term_list.append(
+                                "stuck_timeout"
+                                if _term_name == "time_out" and _stuck_episode
+                                else _term_name
+                            )
+                _success = bool(
+                    done_terms is not None
+                    and _goal_reached_term_idx is not None
+                    and bool(done_terms[i, _goal_reached_term_idx].item())
+                )
+                _goals = (
+                    float(_pre_step_goals_reached[env_id_tensor].item()) + float(_success)
+                    if _pre_step_goals_reached is not None else float(_success)
+                )
+                _progress = (
+                    float((_cumul_path_progress[env_id_tensor] + _pre_step_path_progress[env_id_tensor]).item())
+                    if _pre_step_path_progress is not None else None
+                )
+                _optimal = float(_nav_optimal_len[_env_i].item()) if _spl_enabled else None
+                # A structured final-goal termination is route completion even
+                # when the final movement was not reflected in the pre-step
+                # path-progress snapshot.
+                if _success and _progress is not None and _optimal is not None:
+                    _progress = max(_progress, _optimal)
+                _spl_value = None
+                if _spl_enabled and _optimal is not None:
+                    _actual = float(_nav_actual_len[_env_i].item())
+                    _spl_value = float(_success) * _optimal / max(_actual, _optimal) if _actual > 0.0 and _optimal > 0.0 else 0.0
+                _obs_events = int(_obs_coll_ep[_env_i].item()) if _obs_sensor is not None else None
+                _low_obs_events = int(_low_obs_coll_ep[_env_i].item()) if _obs_sensor is not None else None
+                _wall_events = int(_wall_coll_ep[_env_i].item()) if _base_sensor is not None else None
+                _episode_metric_records.append({
+                    "seed": args_cli.seed,
+                    "env": _env_i,
+                    "episode_index": int(_episode_index[_env_i].item()),
+                    "termination": "|".join(_term_list) if _term_list else "unknown",
+                    "success": int(_success),
+                    "steps": int(episode_lengths[env_id_tensor].item()),
+                    "duration_seconds": float(episode_lengths[env_id_tensor].item() * dt),
+                    "goals_reached": _goals,
+                    "path_progress_m": _progress,
+                    "optimal_path_m": _optimal,
+                    "spl": _spl_value,
+                    "obstacle_contact_events": _obs_events,
+                    "low_obstacle_contact_events": _low_obs_events,
+                    "wall_contact_events": _wall_events,
+                    "obstacle_contacts_per_path_progress_m": (
+                        _obs_events / _progress if _obs_events is not None and _progress is not None and _progress > 0.0 else None
+                    ),
+                })
+                _stuck_forced_pending[_env_i] = False
+
             # Print episode summary for the watched nav env before resetting counts.
             _print_nav_episode_log(
                 _base_env, done_ids, args_cli.nav_log_env, last_hlc_cmd, episode_collision_counts
@@ -1719,34 +1972,47 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Reset collision count for episodes that just ended.
             for env_id in done_ids.tolist():
                 episode_collision_counts[env_id] = 0
-            # Record goals reached per episode before reset clears the counter.
-            if hasattr(_base_env, "_go2w_goals_reached_episode"):
-                for env_id in done_ids:
+            # Record goals reached per episode. The in-step reset has already
+            # zeroed the env counter by the time env.step() returns, so read the
+            # snapshot captured before the step instead.
+            if _pre_step_goals_reached is not None:
+                for i, env_id in enumerate(done_ids):
+                    reached_final_goal = (
+                        done_terms is not None
+                        and _goal_reached_term_idx is not None
+                        and bool(done_terms[i, _goal_reached_term_idx].item())
+                    )
                     _goals_per_episode_history.append(
-                        float(_base_env._go2w_goals_reached_episode[env_id].item())
+                        float(_pre_step_goals_reached[env_id].item()) + float(reached_final_goal)
                     )
-            # Record any-collision and low-obstacle-collision flags per episode.
-            if hasattr(_base_env, "_go2w_had_collision_episode"):
-                for env_id in done_ids:
-                    _collision_episode_history.append(
-                        float(_base_env._go2w_had_collision_episode[env_id].item())
-                    )
-            if hasattr(_base_env, "_go2w_had_low_obstacle_collision_episode"):
-                for env_id in done_ids:
-                    _low_collision_episode_history.append(
-                        float(_base_env._go2w_had_low_obstacle_collision_episode[env_id].item())
-                    )
-            # Record onset-based collision counts (obstacle / low-obstacle / wall) per episode.
+            # Record contact-event counts (obstacle / low-obstacle / wall) per episode.
             if _obs_sensor is not None:
                 for env_id in done_ids:
                     _obs_coll_history.append(float(_obs_coll_ep[env_id].item()))
                     _low_obs_coll_history.append(float(_low_obs_coll_ep[env_id].item()))
                     _wall_coll_history.append(float(_wall_coll_ep[env_id].item()))
+                # Flush events still live at episode end, then reset event state.
+                for _e in done_ids.tolist():
+                    for _s in (_obs_event_peak[_e] > 0.0).nonzero(as_tuple=False).squeeze(-1).tolist():
+                        _contact_event_records.append((
+                            "obstacle", _e, int(_episode_index[_e].item()), step_count,
+                            float(_obs_event_peak[_e, _s].item()), int(_obs_event_is_low[_e, _s].item()),
+                        ))
+                    if float(_wall_event_peak[_e].item()) > 0.0:
+                        _contact_event_records.append((
+                            "wall", _e, int(_episode_index[_e].item()), step_count,
+                            float(_wall_event_peak[_e].item()), 0,
+                        ))
                 _obs_coll_ep[done_ids]     = 0
                 _low_obs_coll_ep[done_ids] = 0
                 _wall_coll_ep[done_ids]    = 0
                 _obs_contact_prev[done_ids]  = False
                 _base_contact_prev[done_ids] = False
+                _obs_refract[done_ids]     = 0
+                _wall_refract[done_ids]    = 0
+                _obs_event_peak[done_ids]  = 0.0
+                _obs_event_is_low[done_ids] = False
+                _wall_event_peak[done_ids] = 0.0
             # Record cumulative navigation distance: sum of all completed paths + final partial path.
             if _pre_step_path_progress is not None:
                 for env_id in done_ids:
@@ -1754,17 +2020,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         float((_cumul_path_progress[env_id] + _pre_step_path_progress[env_id]).item())
                     )
                 _cumul_path_progress[done_ids] = 0.0
-            # Refresh low-obstacle mask with center_z values updated by the episode reset.
+            # Refresh the reward's reset-time low-obstacle flags after the reset.
             if _obs_sensor is not None:
-                _czs = getattr(_base_env, "_go2w_obstacle_center_z", None)
-                if _czs is not None and _czs.shape[-1] >= _num_obs_slots:
-                    _low_obs_mask = (_czs[0, :_num_obs_slots] < 0.25).to(_dev)
+                _low_flags = getattr(_base_env, "_go2w_obstacle_low_flag", None)
+                if _low_flags is not None and _low_flags.shape[-1] >= _num_obs_slots:
+                    _low_obs_mask = _low_flags[:, :_num_obs_slots].to(device=_dev, dtype=torch.bool)
             episode_lengths[done_ids] = 0
+            _episode_index[done_ids] += 1
             completed_episodes += num_done
 
-            # Advance layout seed so each episode sees a unique layout (fair cross-ablation comparison).
-            # Only update if the key already exists — some reset functions (e.g. reset_hospital_maze_training,
-            # reset_structured_astar_corridor) don't accept fixed_layout_seed and would crash on **params.
+            # Advance a fixed layout seed only for reset functions that expose
+            # that contract. Hospital maze reset does not currently do so, thus
+            # its policies share evaluation seed distributions but are not
+            # episode-by-episode layout paired.
             if args_cli.seed_per_episode and args_cli.seed is not None:
                 try:
                     _obs_term_cfg = _base_env.event_manager.get_term_cfg("reset_obstacles")
@@ -1801,28 +2069,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
             if _obstacle_label_logging:
                 _print_nav_obstacle_label_log(_base_env, step_count, args_cli.nav_log_env)
-        # Onset-based collision detection: rising-edge (no-contact→contact) per env per slot.
-        if _obs_sensor is not None:
-            _obs_forces = _obs_sensor.data.net_forces_w_history[:, 0]  # [E, N_obs, 3]
-            _obs_force_mag = _obs_forces.norm(dim=-1)                   # [E, N_obs]
-            _obs_contact_now = _obs_force_mag > _OBSTACLE_CONTACT_THRESHOLD
-            _obs_onset = _obs_contact_now & ~_obs_contact_prev           # rising edge
-            _obs_coll_ep     += _obs_onset.any(dim=-1).long()
-            if _low_obs_mask is not None:
-                _low_obs_coll_ep += (_obs_onset & _low_obs_mask).any(dim=-1).long()
-            _obs_contact_prev = _obs_contact_now
-
-            # Wall: non-wheel robot body force with no simultaneous obstacle contact.
-            if _base_sensor is not None:
-                _base_forces = _base_sensor.data.net_forces_w_history[:, 0]  # [E, bodies, 3]
-                if _wall_body_non_wheel_mask is not None:
-                    _base_forces = _base_forces[:, _wall_body_non_wheel_mask, :]
-                _base_force_mag = _base_forces.norm(dim=-1).max(dim=-1).values  # [E]
-                _base_contact_now = _base_force_mag > _WALL_CONTACT_THRESHOLD
-                _wall_onset = (_base_contact_now & ~_base_contact_prev) & ~_obs_contact_now.any(dim=-1)
-                _wall_coll_ep += _wall_onset.long()
-                _base_contact_prev = _base_contact_now
-
         if args_cli.nav_contact_debug:
             _print_nav_contact_debug(_base_env, step_count, args_cli.nav_log_env, last_hlc_cmd)
             if step_count + 1 >= args_cli.nav_contact_debug_steps:
@@ -1868,7 +2114,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         import json as _json
         _tc = dict(termination_counts) if termination_counts else {}
         if _stuck_termination_count > 0:
+            # Stuck-forced resets terminate via time_out; keep the buckets disjoint.
             _tc["stuck_timeout"] = _stuck_termination_count
+            _tc["time_out"] = max(_tc.get("time_out", 0) - _stuck_termination_count, 0)
         _spl_mean = float(sum(_nav_spl_history) / len(_nav_spl_history)) if _nav_spl_history else None
         _avg_ep_len = total_episode_length / max(completed_episodes, 1)
         _success_rate = (
@@ -1882,49 +2130,80 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             float(sum(_path_progress_history) / len(_path_progress_history))
             if _path_progress_history else None
         )
-        _collision_rate = (
-            float(sum(_collision_episode_history) / len(_collision_episode_history))
-            if _collision_episode_history else None
-        )
-        _low_collision_rate = (
-            float(sum(_low_collision_episode_history) / len(_low_collision_episode_history))
-            if _low_collision_episode_history else None
-        )
-        _avg_obs_collisions = (
+        _avg_obs_contacts = (
             float(sum(_obs_coll_history) / len(_obs_coll_history))
             if _obs_coll_history else None
         )
-        _avg_low_obs_collisions = (
+        _avg_low_obs_contacts = (
             float(sum(_low_obs_coll_history) / len(_low_obs_coll_history))
             if _low_obs_coll_history else None
         )
-        _avg_wall_collisions = (
+        _avg_wall_contacts = (
             float(sum(_wall_coll_history) / len(_wall_coll_history))
             if _wall_coll_history else None
         )
+        _total_path_progress = float(sum(_path_progress_history))
+        # This normalizes by route progress, not physical odometry.  It is an
+        # exposure-to-task-progress metric and must not be presented as true
+        # contacts per travelled meter.
+        _obstacle_contacts_per_path_progress_meter = (
+            float(sum(_obs_coll_history) / _total_path_progress)
+            if _obs_coll_history and _total_path_progress > 0.0 else None
+        )
+        _run_finished_at = datetime.now(timezone.utc).isoformat()
         _manifest = {
             "task": args_cli.task,
             "checkpoint": getattr(args_cli, "checkpoint", None),
             "num_envs": args_cli.num_envs,
+            "fixed_layout_pairing": _fixed_layout_pairing_supported,
             "completed_episodes": completed_episodes,
             "steps": step_count,
-            "total_episodes": sum(_tc.values()) if _tc else None,
+            "started_at": _run_started_at,
+            "finished_at": _run_finished_at,
+            "wall_time_seconds": time.time() - _run_start_time,
+            # Termination counts are intentionally multi-label (e.g. contact +
+            # time_out can happen in the same final step); the completed count
+            # is the only episode denominator.
+            "total_episodes": completed_episodes,
             "termination_counts": _tc,
             "success_rate": _success_rate,
             "spl": _spl_mean,
             "avg_episode_length": _avg_ep_len,
             "goals_per_episode": _goals_per_ep_mean,
             "path_progress_mean": _path_progress_mean,
-            "collision_rate": _collision_rate,
-            "low_obstacle_collision_rate": _low_collision_rate,
-            "avg_obstacle_collisions_per_ep": _avg_obs_collisions,
-            "avg_low_obstacle_collisions_per_ep": _avg_low_obs_collisions,
-            "avg_wall_collisions_per_ep": _avg_wall_collisions,
+            "contact_event_definition": {
+                "obstacle_on_force_n": _OBSTACLE_CONTACT_ON,
+                "obstacle_off_force_n": _OBSTACLE_CONTACT_OFF,
+                "wall_on_force_n": _WALL_CONTACT_ON,
+                "wall_off_force_n": _WALL_CONTACT_OFF,
+                "refractory_seconds": _CONTACT_REFRACTORY_STEPS * dt,
+            },
+            "avg_obstacle_contacts_per_ep": _avg_obs_contacts,
+            "avg_low_obstacle_contacts_per_ep": _avg_low_obs_contacts,
+            "avg_wall_contacts_per_ep": _avg_wall_contacts,
+            "obstacle_contacts_per_path_progress_meter": _obstacle_contacts_per_path_progress_meter,
         }
         _manifest_path = os.path.join(_out_dir, "session_manifest.json")
         with open(_manifest_path, "w") as _mf:
             _json.dump(_manifest, _mf, indent=2)
         print(f"[INFO] Session manifest saved: {_manifest_path}")
+        if _episode_metric_records:
+            import csv as _csv
+            _episodes_path = os.path.join(_out_dir, "episode_metrics.csv")
+            with open(_episodes_path, "w", newline="") as _epf:
+                _fieldnames = list(_episode_metric_records[0])
+                _epw = _csv.DictWriter(_epf, fieldnames=_fieldnames)
+                _epw.writeheader()
+                _epw.writerows(_episode_metric_records)
+            print(f"[INFO] Episode metrics saved: {_episodes_path}  ({len(_episode_metric_records)} episodes)")
+        if _contact_event_records:
+            import csv as _csv
+            _events_path = os.path.join(_out_dir, "contact_events.csv")
+            with open(_events_path, "w", newline="") as _ef:
+                _ew = _csv.writer(_ef)
+                _ew.writerow(["kind", "env", "episode_index", "step", "peak_force_n", "is_low_obstacle"])
+                _ew.writerows(_contact_event_records)
+            print(f"[INFO] Contact events saved: {_events_path}  ({len(_contact_event_records)} events)")
 
     # Auto-generate nav debug plot when --play_name is set.
     if _out_dir is not None and _nav_has_goal_markers:

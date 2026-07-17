@@ -423,6 +423,10 @@ def reset_hospital_maze_training(
     obstacle_priorities: tuple | None = None,
     actor_count_override: int | None = None,
     target_spacing_override: float | None = None,
+    min_path_steps_override: int | None = None,
+    max_path_steps_override: int | None = None,
+    long_path_max_steps_override: int | None = None,
+    long_path_probability_override: float | None = None,
 ) -> None:
     """Reset envs into the 5×5 junction-grid maze with actor-only corridor obstacles."""
     if len(env_ids) == 0 or len(obstacle_names) == 0:
@@ -476,7 +480,24 @@ def reset_hospital_maze_training(
         target_spacing = float(target_spacing_override)
 
     _NUM_J = len(MAZE_JUNCTION_NAMES)
-    _MIN_PATH_STEPS = HOSPITAL_TRAIN_MIN_PATH_STEPS
+    _MIN_PATH_STEPS = (
+        HOSPITAL_TRAIN_MIN_PATH_STEPS if min_path_steps_override is None else int(min_path_steps_override)
+    )
+    _MAX_PATH_STEPS = (
+        HOSPITAL_TRAIN_MAX_PATH_STEPS if max_path_steps_override is None else int(max_path_steps_override)
+    )
+    _LONG_PATH_MAX_STEPS = (
+        HOSPITAL_TRAIN_LONG_PATH_MAX_STEPS
+        if long_path_max_steps_override is None else int(long_path_max_steps_override)
+    )
+    _LONG_PATH_PROBABILITY = (
+        HOSPITAL_TRAIN_LONG_PATH_PROBABILITY
+        if long_path_probability_override is None else float(long_path_probability_override)
+    )
+    if _MIN_PATH_STEPS < 1 or _MAX_PATH_STEPS < _MIN_PATH_STEPS:
+        raise ValueError("Hospital maze route override requires 1 <= min_path_steps <= max_path_steps.")
+    if _LONG_PATH_MAX_STEPS < _MAX_PATH_STEPS or not 0.0 <= _LONG_PATH_PROBABILITY <= 1.0:
+        raise ValueError("Invalid hospital maze long-route override.")
     _j_xs = [MAZE_JUNCTIONS[name][0] for name in MAZE_JUNCTION_NAMES]
     _j_ys = [MAZE_JUNCTIONS[name][1] for name in MAZE_JUNCTION_NAMES]
 
@@ -486,9 +507,9 @@ def reset_hospital_maze_training(
             for _li in range(n):
                 _s_i, _e_i = 0, 0
                 max_path_steps = (
-                    HOSPITAL_TRAIN_LONG_PATH_MAX_STEPS
-                    if torch.rand((), device=device).item() < HOSPITAL_TRAIN_LONG_PATH_PROBABILITY
-                    else HOSPITAL_TRAIN_MAX_PATH_STEPS
+                    _LONG_PATH_MAX_STEPS
+                    if torch.rand((), device=device).item() < _LONG_PATH_PROBABILITY
+                    else _MAX_PATH_STEPS
                 )
                 chosen = False
                 for _ in range(80):
@@ -522,9 +543,9 @@ def reset_hospital_maze_training(
             # junction the robot came FROM — exclude it to prevent exact reverse path
             prev_j = e_j if was_rev else s_j
             max_path_steps = (
-                HOSPITAL_TRAIN_LONG_PATH_MAX_STEPS
-                if torch.rand((), device=device).item() < HOSPITAL_TRAIN_LONG_PATH_PROBABILITY
-                else HOSPITAL_TRAIN_MAX_PATH_STEPS
+                _LONG_PATH_MAX_STEPS
+                if torch.rand((), device=device).item() < _LONG_PATH_PROBABILITY
+                else _MAX_PATH_STEPS
             )
             chosen = False
             for _ in range(80):
@@ -809,6 +830,10 @@ def reset_hospital_maze_training(
         obstacle_priorities=obstacle_priorities,
         actor_count_override=actor_count_override,
         target_spacing_override=target_spacing_override,
+        min_path_steps_override=min_path_steps_override,
+        max_path_steps_override=max_path_steps_override,
+        long_path_max_steps_override=long_path_max_steps_override,
+        long_path_probability_override=long_path_probability_override,
     )
     update_navigation_path_waypoint(
         env,

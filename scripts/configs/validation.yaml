@@ -1,0 +1,52 @@
+llc_checkpoint: logs/rsl_rl/go2w_fast_flat/2026-04-29_18-17-48/model_1999.pt
+
+defaults:
+  maze_episodes: 100
+  evaluation_seeds: [42, 43, 44]
+  stuck_timeout: 300
+  num_envs: 1
+  depth_video_steps: 2000
+  # maze_train/static/dynamic keep each task's native 3-5 junction route
+  # distribution AND training's uninterrupted-on-goal termination (episodes
+  # run the full length, resampling a new route on every goal reached) — see
+  # run_validation.py module docstring. maze_success is the only scenario
+  # that terminates on the first route completion (short 2-3 junction route),
+  # which is what makes success rate and SPL meaningful for it and only it.
+  success_route_min_steps: 2
+  success_route_max_steps: 3
+
+policies:
+  - name: teacher
+    checkpoint: logs/rsl_rl/go2w_nav_hospital_teacher_rl/2026-07-02_22-18-37/model_1100.pt
+    tasks:
+      maze_train: Nav-HospitalMaze-Teacher-Eval-TrainDist-Go2w-v0
+      static: Nav-HospitalMaze-Teacher-Eval-Static-Go2w-v0
+      dynamic: Nav-HospitalMaze-Teacher-Eval-Dynamic-Go2w-v0
+
+  - name: baseline
+    checkpoint: logs/rsl_rl/go2w_nav_depth_hospital_distill/2026-07-06_17-47-02/model_599.pt
+    tasks:
+      maze_train: Nav-HospitalMaze-Distill-Depth-Eval-TrainDist-Go2w-v0
+      static: Nav-HospitalMaze-Distill-Depth-Eval-Static-Go2w-v0
+      dynamic: Nav-HospitalMaze-Distill-Depth-Eval-Dynamic-Go2w-v0
+
+  - name: longhist
+    checkpoint: logs/rsl_rl/go2w_nav_depth_hospital_longhist_distill/2026-07-06_17-47-02/model_599.pt
+    tasks:
+      maze_train: Nav-HospitalMaze-Distill-Depth-LongHist-Eval-TrainDist-Go2w-v0
+      static: Nav-HospitalMaze-Distill-Depth-LongHist-Eval-Static-Go2w-v0
+      dynamic: Nav-HospitalMaze-Distill-Depth-LongHist-Eval-Dynamic-Go2w-v0
+
+  - name: sparse
+    checkpoint: logs/rsl_rl/go2w_nav_depth_hospital_sparse_distill/2026-07-06_17-47-04/model_599.pt
+    tasks:
+      maze_train: Nav-HospitalMaze-Distill-Depth-Sparse-Eval-TrainDist-Go2w-v0
+      static: Nav-HospitalMaze-Distill-Depth-Sparse-Eval-Static-Go2w-v0
+      dynamic: Nav-HospitalMaze-Distill-Depth-Sparse-Eval-Dynamic-Go2w-v0
+
+  - name: 4cam
+    checkpoint: logs/rsl_rl/go2w_nav_depth_hospital_multicam_distill/2026-07-06_17-47-03/model_599.pt
+    tasks:
+      maze_train: Nav-HospitalMaze-Distill-Depth-4Cam-Eval-TrainDist-Go2w-v0
+      static: Nav-HospitalMaze-Distill-Depth-4Cam-Eval-Static-Go2w-v0
+      dynamic: Nav-HospitalMaze-Distill-Depth-4Cam-Eval-Dynamic-Go2w-v0

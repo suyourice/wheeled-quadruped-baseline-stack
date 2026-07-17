@@ -882,16 +882,16 @@ class Go2wHospitalFloorMultiCamDepthPlayEnvCfg(Go2wNavDepthMultiCamRLDistillEnvC
 # HOSPITAL_TRAIN_* constants and training env classes are untouched.
 #
 # Task IDs:
-#   Nav-Hospital-Maze-Eval-Teacher-Static-Go2w-v0
-#   Nav-Hospital-Maze-Eval-Teacher-Dynamic-Go2w-v0
-#   Navigation-Depth-Hospital-Maze-Eval-Static-Go2w-v0
-#   Navigation-Depth-Hospital-Maze-Eval-Dynamic-Go2w-v0
-#   Navigation-Depth-Hospital-Maze-Eval-LongHist-Static-Go2w-v0
-#   Navigation-Depth-Hospital-Maze-Eval-LongHist-Dynamic-Go2w-v0
-#   Navigation-Depth-Hospital-Maze-Eval-Sparse-Static-Go2w-v0
-#   Navigation-Depth-Hospital-Maze-Eval-Sparse-Dynamic-Go2w-v0
-#   Navigation-Depth-Hospital-Maze-Eval-4Cam-Static-Go2w-v0
-#   Navigation-Depth-Hospital-Maze-Eval-4Cam-Dynamic-Go2w-v0
+#   Nav-HospitalMaze-Teacher-Eval-Static-Go2w-v0
+#   Nav-HospitalMaze-Teacher-Eval-Dynamic-Go2w-v0
+#   Nav-HospitalMaze-Distill-Depth-Eval-Static-Go2w-v0
+#   Nav-HospitalMaze-Distill-Depth-Eval-Dynamic-Go2w-v0
+#   Nav-HospitalMaze-Distill-Depth-LongHist-Eval-Static-Go2w-v0
+#   Nav-HospitalMaze-Distill-Depth-LongHist-Eval-Dynamic-Go2w-v0
+#   Nav-HospitalMaze-Distill-Depth-Sparse-Eval-Static-Go2w-v0
+#   Nav-HospitalMaze-Distill-Depth-Sparse-Eval-Dynamic-Go2w-v0
+#   Nav-HospitalMaze-Distill-Depth-4Cam-Eval-Static-Go2w-v0
+#   Nav-HospitalMaze-Distill-Depth-4Cam-Eval-Dynamic-Go2w-v0
 # =============================================================================
 
 HOSPITAL_MAZE_EVAL_EPISODE_LENGTH_S = 220.0
@@ -903,9 +903,21 @@ _HOSPITAL_MAZE_EVAL_CURRICULUM_OFFSET = 1100
 def _configure_maze_eval_env(cfg) -> None:
     """Apply eval overrides: 20 obstacle slots, 220 s episodes.
 
-    Teacher policy obs: noise OFF (deterministic eval reference).
-    Student student_state: noise ON (matches training conditions; proprio IMU noise
-        was enabled during distillation and should remain on for realistic eval).
+    Long-horizon scenario: like training, the episode never terminates on goal
+    reached — goal_reached_and_resample keeps sampling new routes for the full
+    220 s so path_progress_mean reflects sustained multi-route exposure, not a
+    single attempt. Callers that need single-route success/SPL semantics (the
+    maze_success protocol) add a termination on top via play.py's
+    --terminate_on_final_goal, not here — adding it unconditionally in this
+    shared function would silently convert maze_static/maze_dynamic into
+    single-route evaluations too.
+
+    Teacher policy obs: training-time noise ON, matching
+        NavHospitalTeacherObsCfg.PolicyCfg (enable_corruption=True during
+        training). A deterministic teacher oracle would be a separate,
+        explicitly labelled diagnostic rather than a fair ablation reference.
+    Student student_state: noise ON (matches training conditions; proprio IMU
+        noise was enabled during distillation and should remain on for realistic eval).
     Student student_depth: noise OFF (per-pixel depth noise is not a valid model
         of real depth camera noise; distillation handles sim-to-real gap).
     """
@@ -925,7 +937,7 @@ def _configure_maze_eval_env(cfg) -> None:
     })
     obs = cfg.observations
     if hasattr(obs, "policy"):
-        obs.policy.enable_corruption = False
+        obs.policy.enable_corruption = True
     if hasattr(obs, "student_depth"):
         obs.student_depth.enable_corruption = False
 
@@ -947,6 +959,27 @@ def _configure_maze_eval_env(cfg) -> None:
         _term = getattr(cfg.rewards, _rname, None)
         if _term is not None and _term.params and "obstacle_names" in _term.params:
             _term.params["obstacle_names"] = _eval_obs_names
+
+    # Retarget privileged obstacle observations to the 20-slot eval set.
+    # Two groups carry this: "policy" for the teacher task (drives its
+    # actions — without this fix the teacher's oracle only tracks the 16
+    # training slots and the 4 extra eval obstacles are invisible to it),
+    # and "teacher" for the depth-student distillation tasks (the privileged
+    # distillation-loss target; unused for action selection at eval/play
+    # time since play.py loads student weights only, but still computed
+    # every step by the observation manager — left at 16 slots it silently
+    # mismatches the 20-slot scene, which the preflight check correctly
+    # treats as a hard error). Output dims are unaffected either way: nav
+    # features are a fixed 16D aggregate and geometry pads/truncates to
+    # num_slots regardless of how many named slots are searched.
+    for _group_name in ("policy", "teacher"):
+        _group = getattr(obs, _group_name, None)
+        if _group is None:
+            continue
+        for _oname in ("obstacle_nav_features", "obstacle_full_geometry"):
+            _oterm = getattr(_group, _oname, None)
+            if _oterm is not None and _oterm.params and "obstacle_names" in _oterm.params:
+                _oterm.params["obstacle_names"] = _eval_obs_names
 
 
 def _add_maze_eval_dynamic_events(cfg) -> None:
@@ -1102,8 +1135,10 @@ def _configure_maze_train_dist_eval_env(cfg) -> None:
 
     Uses the 16-slot training scene without actor_count_override so obstacle
     placement follows the last training phase (max 12 at 2.0 m spacing).
-    Noise policy: same as _configure_maze_eval_env (teacher OFF, student_state ON,
-    student_depth OFF).
+    Long-horizon, uninterrupted-on-goal semantics and noise policy match
+    _configure_maze_eval_env exactly (teacher ON, student_state ON,
+    student_depth OFF) so maze_train is a same-conditions baseline for
+    maze_static/maze_dynamic rather than a separately-configured scenario.
     """
     cfg.scene.num_envs = HOSPITAL_MAZE_EVAL_NUM_ENVS
     cfg.episode_length_s = HOSPITAL_MAZE_EVAL_EPISODE_LENGTH_S
@@ -1112,7 +1147,7 @@ def _configure_maze_train_dist_eval_env(cfg) -> None:
     })
     obs = cfg.observations
     if hasattr(obs, "policy"):
-        obs.policy.enable_corruption = False
+        obs.policy.enable_corruption = True
     if hasattr(obs, "student_depth"):
         obs.student_depth.enable_corruption = False
 

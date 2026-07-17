@@ -3,18 +3,20 @@
 #SBATCH -p gpu
 #SBATCH --qos=default
 #SBATCH --gres=gpu:4
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --job-name=go2w_validate
-#SBATCH --array=0-2
+#SBATCH --array=0-3
 #SBATCH --output=logs/slurm/validate/%x_%A_%a.out
 
 # Array task → scenario mapping.
 # Submit with: sbatch validate_go2w.sh [extra run_validation args]
 # Use submit_validation.sh to also chain a plot job automatically.
 
-SCENARIOS=("maze_train" "maze_static" "maze_dynamic")
+SCENARIOS=("maze_train" "maze_static" "maze_dynamic" "maze_success")
 SCENARIO="${SCENARIOS[$SLURM_ARRAY_TASK_ID]}"
 
+# Extra args are passed through to run_validation.py, e.g. 3-seed run:
+#   OUT_NAME=validation_$(date +%Y%m%d) sbatch <this script> --seeds 42 43 44 --maze_episodes 100
 cd $HOME/go2w
 
 JOB_LOG_DIR="logs/slurm/validate/${SLURM_ARRAY_JOB_ID}"

@@ -79,7 +79,7 @@ def build_teacher_policy(env, obs, agent_cfg, device: str, locomotion_checkpoint
     if "teacher" not in obs:
         raise ValueError(
             "--teacher_steering requires an environment exposing a 'teacher' observation group. "
-            "Use a distillation play task such as Navigation-RL-Distill-Go2w-Play-v0."
+            "Use a distillation play task such as Nav-ObstacleFlat-Distill-Lidar-Go2w-Play-v0."
         )
     if locomotion_checkpoint is None:
         raise ValueError("--teacher_steering requires --locomotion_checkpoint for the frozen LLC.")
@@ -91,6 +91,90 @@ def build_teacher_policy(env, obs, agent_cfg, device: str, locomotion_checkpoint
     teacher.eval()
     load_teacher_locomotion_checkpoint(teacher, locomotion_checkpoint, device)
     return teacher
+
+
+def _iter_obstacle_name_params(cfg_obj, prefix: str):
+    """Yield every manager term whose params explicitly name obstacle slots."""
+    for name, value in vars(cfg_obj).items():
+        if value is None or name.startswith("_"):
+            continue
+        params = getattr(value, "params", None)
+        if isinstance(params, dict):
+            if "obstacle_names" in params:
+                yield f"{prefix}.{name}", params["obstacle_names"]
+            continue
+        if hasattr(value, "__dict__"):  # observation group — one level deeper
+            yield from _iter_obstacle_name_params(value, f"{prefix}.{name}")
+
+
+def preflight_check_cfg_obstacle_slots(cfg, scene_obstacle_names=None) -> int:
+    """Assert exact obstacle-slot coverage for a task configuration.
+
+    This is intentionally usable before an Isaac environment is created.  It
+    catches both a short list and a same-length list with a missing/duplicated
+    slot, which was the teacher-oracle 16-versus-20 failure mode.
+    """
+    import re
+
+    if scene_obstacle_names is None:
+        scene = getattr(cfg, "scene", None)
+        scene_obstacle_names = [
+            name for name in vars(scene).keys()
+            if re.fullmatch(r"obstacle_\d+", name)
+        ]
+    expected = tuple(sorted(scene_obstacle_names, key=lambda name: int(name.rsplit("_", 1)[1])))
+    if not expected:
+        return 0
+
+    mismatches = []
+    expected_set = set(expected)
+    for manager_name in ("observations", "rewards", "events", "terminations"):
+        manager_cfg = getattr(cfg, manager_name, None)
+        if manager_cfg is None:
+            continue
+        for term_path, names in _iter_obstacle_name_params(manager_cfg, manager_name):
+            if not isinstance(names, (list, tuple)):
+                mismatches.append(f"{term_path}: obstacle_names must be a list/tuple, got {type(names).__name__}")
+                continue
+            actual = tuple(names)
+            if len(actual) != len(expected) or set(actual) != expected_set or len(set(actual)) != len(actual):
+                missing = sorted(expected_set - set(actual))
+                extra = sorted(set(actual) - expected_set)
+                duplicate_count = len(actual) - len(set(actual))
+                details = [f"{len(actual)} names vs {len(expected)} scene slots"]
+                if missing:
+                    details.append(f"missing={missing}")
+                if extra:
+                    details.append(f"extra={extra}")
+                if duplicate_count:
+                    details.append(f"duplicates={duplicate_count}")
+                mismatches.append(f"{term_path}: {', '.join(details)}")
+
+    if mismatches:
+        raise RuntimeError(
+            "Obstacle-slot mismatch between scene and manager terms — these terms "
+            "silently ignore part of the scene:\n  " + "\n  ".join(mismatches)
+        )
+    return len(expected)
+
+
+def preflight_check_obstacle_slots(env) -> None:
+    """Run the obstacle-slot preflight against the instantiated scene."""
+    import os
+    import re
+
+    if os.environ.get("GO2W_SKIP_PREFLIGHT") == "1":
+        print("[WARN] Preflight obstacle-slot check skipped (GO2W_SKIP_PREFLIGHT=1).")
+        return
+
+    scene = getattr(env, "scene", None)
+    rigid_objects = getattr(scene, "rigid_objects", None)
+    if not rigid_objects:
+        return
+    scene_names = [name for name in rigid_objects.keys() if re.fullmatch(r"obstacle_\d+", name)]
+    scene_slots = preflight_check_cfg_obstacle_slots(env.cfg, scene_names)
+    if scene_slots:
+        print(f"[INFO] Preflight OK: all obstacle_names terms match {scene_slots} scene slots.")
 
 
 def override_play_obstacle_count(env_cfg, num_obstacles: int | None):
@@ -111,7 +195,7 @@ def override_play_obstacle_count(env_cfg, num_obstacles: int | None):
     if num_obstacles > max_available:
         raise ValueError(
             f"--num_obstacles={num_obstacles} exceeds the play scene capacity ({max_available}). "
-            "Increase PLAY_MAX_OBSTACLES in cfg/navigation/env.py if you need more."
+            "Increase PLAY_MAX_OBSTACLES in mdp/navigation/hospital/specs.py if you need more."
         )
 
     if "start_iteration" in params:
