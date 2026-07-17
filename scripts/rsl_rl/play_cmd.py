@@ -13,30 +13,30 @@ sampler instead.
 
 Usage examples:
     # Forward at 0.5 m/s
-    python scripts/rsl_rl/play_cmd.py --task Flat-Go2w-Play-v0 --cmd_vx 0.5
+    python scripts/rsl_rl/play_cmd.py --task Loco-Flat-Go2w-Play-v0 --cmd_vx 0.5
 
     # Lateral slide
-    python scripts/rsl_rl/play_cmd.py --task Flat-Go2w-Play-v0 --cmd_vy 0.3
+    python scripts/rsl_rl/play_cmd.py --task Loco-Flat-Go2w-Play-v0 --cmd_vy 0.3
 
     # Spin in place
-    python scripts/rsl_rl/play_cmd.py --task Flat-Go2w-Play-v0 --cmd_wz 1.0
+    python scripts/rsl_rl/play_cmd.py --task Loco-Flat-Go2w-Play-v0 --cmd_wz 1.0
 
     # Diagonal + yaw
-    python scripts/rsl_rl/play_cmd.py --task Flat-Go2w-Play-v0 --cmd_vx 0.5 --cmd_vy 0.3 --cmd_wz 0.5
+    python scripts/rsl_rl/play_cmd.py --task Loco-Flat-Go2w-Play-v0 --cmd_vx 0.5 --cmd_vy 0.3 --cmd_wz 0.5
 
     # Stand still
-    python scripts/rsl_rl/play_cmd.py --task Flat-Go2w-Play-v0
+    python scripts/rsl_rl/play_cmd.py --task Loco-Flat-Go2w-Play-v0
 
     # Evaluate the RL navigation teacher
     python scripts/rsl_rl/play_cmd.py \
-        --task Nav-Teacher-Go2w-Play-v0 \
+        --task Nav-ObstacleFlat-Teacher-Go2w-Play-v0 \
         --checkpoint <path> \
         --cmd_vx 1.0 \
         --num_obstacles 5
 
     # Evaluate the LiDAR distillation student
     python scripts/rsl_rl/play_cmd.py \
-        --task Navigation-RL-Distill-Go2w-Play-v0 \
+        --task Nav-ObstacleFlat-Distill-Lidar-Go2w-Play-v0 \
         --checkpoint <path> \
         --num_obstacles 5
 """

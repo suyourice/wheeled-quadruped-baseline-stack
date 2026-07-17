@@ -20,7 +20,7 @@ from checkpoint_utils import apply_hospital_curriculum_offset, configure_frozen_
 from play_common import TeeStream  # isort: skip
 
 parser = argparse.ArgumentParser(description="Play a hospital teacher checkpoint.")
-parser.add_argument("--task", type=str, default="Nav-Hospital-Teacher-Go2w-v0")
+parser.add_argument("--task", type=str, default="Nav-HospitalMaze-Teacher-Go2w-v0")
 parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point")
 parser.add_argument("--checkpoint", type=str, default=None)
 parser.add_argument("--locomotion_checkpoint", type=str, required=True)
@@ -121,9 +121,7 @@ from hospital_markers import (  # isort: skip
 from play_nav_debug import (  # isort: skip
     NAV_LIVE_LABEL_INTERVAL,
     NAV_LIVE_LABEL_SCALE,
-    NAV_LIVE_LABEL_MAX,
     _LiveObstacleLabelDrawer,
-    _get_hospital_live_annotations,
     _print_nav_obstacle_label_log,
 )
 

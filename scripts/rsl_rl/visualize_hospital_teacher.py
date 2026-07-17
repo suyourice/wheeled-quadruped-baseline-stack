@@ -5,7 +5,7 @@
 
 """Visual sanity check for the hospital-teacher training layout.
 
-This script creates the real ``Nav-Hospital-Teacher-Go2w-v0`` environment, forces
+This script creates the real ``Nav-HospitalMaze-Teacher-Go2w-v0`` environment, forces
 one curriculum phase/layout, and overlays start/current-goal/final-goal/path
 markers.  It is intentionally separate from train.py so the training task can
 stay lean.
@@ -19,7 +19,7 @@ import math
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Visualize the hospital teacher training environment.")
-parser.add_argument("--task", type=str, default="Nav-Hospital-Teacher-Go2w-v0")
+parser.add_argument("--task", type=str, default="Nav-HospitalMaze-Teacher-Go2w-v0")
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--env_index", type=int, default=0, help="Environment index used for path/console diagnostics.")
 parser.add_argument(

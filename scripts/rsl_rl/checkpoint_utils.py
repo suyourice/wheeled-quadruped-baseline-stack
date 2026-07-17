@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Shared checkpoint utilities used by train.py, play.py, and play_cmd.py."""
+"""Shared checkpoint utilities for the rsl_rl scripts."""
 
 from __future__ import annotations
 

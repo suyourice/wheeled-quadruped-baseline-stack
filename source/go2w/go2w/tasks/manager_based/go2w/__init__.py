@@ -3,16 +3,26 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+"""Register Go2w tasks under the unified task-ID grammar.
+IDs start with Loco or Nav, followed by the training scene and policy.
+Training scenes are Flat, ObstacleFlat, or HospitalMaze.
+Optional LCorridor, Ward, or Hospital tokens select a play venue.
+TrainLidar marks HospitalMaze teacher play with the training LiDAR layout.
+Play marks rollout tasks; Eval-* marks TrainDist, Static, or Dynamic evaluation.
+Every registration includes Go2w and ends in v0.
+"""
+
 import gymnasium as gym
 
 from . import agents
 
 # =============================================================================
-# Baseline locomotion (PPO, proprioception only)
+# [1] LLC locomotion (Loco-*)
 # =============================================================================
 
+# Train the legacy locomotion baseline on a flat scene.
 gym.register(
-    id="Flat-Go2w-v0",
+    id="Loco-Flat-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -21,8 +31,9 @@ gym.register(
     },
 )
 
+# Play the legacy locomotion baseline on its flat scene.
 gym.register(
-    id="Flat-Go2w-Play-v0",
+    id="Loco-Flat-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -31,12 +42,9 @@ gym.register(
     },
 )
 
-# =============================================================================
-# 2 m/s flat pre-training (obstacle-env compatible, for checkpoint transfer)
-# =============================================================================
-
+# Train the FastFlat LLC on a flat scene, producing frozen LLC model_1999.
 gym.register(
-    id="Fast-Flat-2m-Go2w-v0",
+    id="Loco-FastFlat-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -45,8 +53,9 @@ gym.register(
     },
 )
 
+# Play frozen LLC model_1999 on its FastFlat scene.
 gym.register(
-    id="Fast-Flat-2m-Go2w-Play-v0",
+    id="Loco-FastFlat-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -56,11 +65,12 @@ gym.register(
 )
 
 # =============================================================================
-# RL navigation teacher (PPO, proprio + obstacle positions)
+# [2] ObstacleFlat navigation: train and play
 # =============================================================================
 
+# Train the legacy privileged teacher in the ObstacleFlat scene.
 gym.register(
-    id="Nav-Teacher-Go2w-v0",
+    id="Nav-ObstacleFlat-Teacher-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -69,8 +79,9 @@ gym.register(
     },
 )
 
+# Play the legacy privileged teacher in the ObstacleFlat scene.
 gym.register(
-    id="Nav-Teacher-Go2w-Play-v0",
+    id="Nav-ObstacleFlat-Teacher-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -79,12 +90,9 @@ gym.register(
     },
 )
 
-# =============================================================================
-# RL navigation distillation (teacher privileged + obstacle, student LiDAR)
-# =============================================================================
-
+# Distill the legacy LiDAR student from a privileged teacher in ObstacleFlat.
 gym.register(
-    id="Navigation-RL-Distill-Go2w-v0",
+    id="Nav-ObstacleFlat-Distill-Lidar-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -93,8 +101,9 @@ gym.register(
     },
 )
 
+# Play the legacy LiDAR student in the ObstacleFlat scene.
 gym.register(
-    id="Navigation-RL-Distill-Go2w-Play-v0",
+    id="Nav-ObstacleFlat-Distill-Lidar-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -103,12 +112,9 @@ gym.register(
     },
 )
 
-# =============================================================================
-# RL navigation distillation (teacher privileged + obstacle, student depth camera)
-# =============================================================================
-
+# Distill the legacy baseline depth student in the ObstacleFlat scene.
 gym.register(
-    id="Navigation-Depth-Distill-Go2w-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -117,8 +123,9 @@ gym.register(
     },
 )
 
+# Play the legacy baseline depth student in the ObstacleFlat scene.
 gym.register(
-    id="Navigation-Depth-Distill-Go2w-Play-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -127,151 +134,9 @@ gym.register(
     },
 )
 
-# =============================================================================
-# Hospital play environment (test Nav Teacher in hospital-style corridors)
-# =============================================================================
-
+# Distill the legacy LongHist depth student in the ObstacleFlat scene.
 gym.register(
-    id="Nav-Teacher-Hospital-Go2w-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalPlayEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Nav-Teacher-Hospital-Floor-Go2w-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorPlayEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Nav-Hospital-Teacher-Go2w-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wHospitalTeacherEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Nav-Hospital-Teacher-Go2w-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherPlayEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Navigation-Depth-Distill-Hospital-Go2w-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalDepthPlayEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Navigation-Depth-Distill-Hospital-Ward-Go2w-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalWardDepthPlayEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Navigation-Depth-Distill-Hospital-Floor-Go2w-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorDepthPlayEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
-    },
-)
-
-# =============================================================================
-# Hospital Teacher structured corridor play environments (v0)
-# =============================================================================
-
-gym.register(
-    id="Nav-Hospital-Teacher-LCorridor-Go2w-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherLCorridorPlayEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Nav-Hospital-Teacher-Ward-Go2w-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherWardPlayEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Nav-Hospital-Teacher-Floor-Go2w-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherFloorPlayEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
-    },
-)
-
-# Hospital Teacher structured corridor play (v1 training lidar).
-gym.register(
-    id="Nav-Hospital-Teacher-LCorridor-Go2w-Play-v1",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherLCorridorPlayEnvCfgV1",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Nav-Hospital-Teacher-Ward-Go2w-Play-v1",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherWardPlayEnvCfgV1",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
-    },
-)
-
-gym.register(
-    id="Nav-Hospital-Teacher-Floor-Go2w-Play-v1",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherFloorPlayEnvCfgV1",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
-    },
-)
-
-# =============================================================================
-# Depth student ablation experiments
-# =============================================================================
-
-gym.register(
-    id="Navigation-Depth-Distill-LongHist-Go2w-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-LongHist-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -280,8 +145,9 @@ gym.register(
     },
 )
 
+# Play the legacy LongHist depth student in the ObstacleFlat scene.
 gym.register(
-    id="Navigation-Depth-Distill-LongHist-Go2w-Play-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-LongHist-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -290,8 +156,9 @@ gym.register(
     },
 )
 
+# Distill the legacy Sparse depth student in the ObstacleFlat scene.
 gym.register(
-    id="Navigation-Depth-Distill-Sparse-Go2w-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-Sparse-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -300,8 +167,9 @@ gym.register(
     },
 )
 
+# Play the legacy Sparse depth student in the ObstacleFlat scene.
 gym.register(
-    id="Navigation-Depth-Distill-Sparse-Go2w-Play-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-Sparse-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -310,8 +178,9 @@ gym.register(
     },
 )
 
+# Distill the legacy 4Cam depth student in the ObstacleFlat scene.
 gym.register(
-    id="Navigation-Depth-Distill-4Cam-Go2w-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-4Cam-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -320,8 +189,9 @@ gym.register(
     },
 )
 
+# Play the legacy 4Cam depth student in the ObstacleFlat scene.
 gym.register(
-    id="Navigation-Depth-Distill-4Cam-Go2w-Play-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-4Cam-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -331,11 +201,67 @@ gym.register(
 )
 
 # =============================================================================
-# Depth student ablation hospital floor play environments
+# [3] ObstacleFlat policies played in hospital venues
 # =============================================================================
 
+# Play the ObstacleFlat teacher in a hospital L-corridor venue.
 gym.register(
-    id="Navigation-Depth-Distill-Hospital-Floor-LongHist-Go2w-Play-v0",
+    id="Nav-ObstacleFlat-Teacher-LCorridor-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
+    },
+)
+
+# Play the ObstacleFlat teacher in the full hospital venue.
+gym.register(
+    id="Nav-ObstacleFlat-Teacher-Hospital-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavTeacherRunnerCfg",
+    },
+)
+
+# Play the ObstacleFlat baseline depth student in a hospital L-corridor venue.
+gym.register(
+    id="Nav-ObstacleFlat-Distill-Depth-LCorridor-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalDepthPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
+    },
+)
+
+# Play the ObstacleFlat baseline depth student in a hospital ward venue.
+gym.register(
+    id="Nav-ObstacleFlat-Distill-Depth-Ward-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalWardDepthPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
+    },
+)
+
+# Play the ObstacleFlat depth policy or student model_599 in the full hospital venue.
+gym.register(
+    id="Nav-ObstacleFlat-Distill-Depth-Hospital-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalFloorDepthPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavDepthRLDistillRunnerCfg",
+    },
+)
+
+# Play LongHist student model_599 in the full hospital venue.
+gym.register(
+    id="Nav-ObstacleFlat-Distill-Depth-LongHist-Hospital-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -344,8 +270,9 @@ gym.register(
     },
 )
 
+# Play Sparse student model_599 in the full hospital venue.
 gym.register(
-    id="Navigation-Depth-Distill-Hospital-Floor-Sparse-Go2w-Play-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-Sparse-Hospital-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -354,8 +281,9 @@ gym.register(
     },
 )
 
+# Play 4Cam student model_599 in the full hospital venue.
 gym.register(
-    id="Navigation-Depth-Distill-Hospital-Floor-4Cam-Go2w-Play-v0",
+    id="Nav-ObstacleFlat-Distill-Depth-4Cam-Hospital-Go2w-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -365,11 +293,104 @@ gym.register(
 )
 
 # =============================================================================
-# Hospital Maze Depth Distillation
+# [4] HospitalMaze teacher: train and play, including TrainLidar variants
 # =============================================================================
 
+# Train the HospitalMaze teacher with frozen LLC model_1999, producing teacher model_1100.
 gym.register(
-    id="Navigation-Depth-Hospital-Distill-Go2w-v0",
+    id="Nav-HospitalMaze-Teacher-Go2w-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.navigation.env:Go2wHospitalTeacherEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+# Play teacher model_1100 in its HospitalMaze training scene.
+gym.register(
+    id="Nav-HospitalMaze-Teacher-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+# Play the HospitalMaze teacher with the legacy play LiDAR in an L-corridor venue.
+gym.register(
+    id="Nav-HospitalMaze-Teacher-LCorridor-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherLCorridorPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+# Play the HospitalMaze teacher with the legacy play LiDAR in a ward venue.
+gym.register(
+    id="Nav-HospitalMaze-Teacher-Ward-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherWardPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+# Play the HospitalMaze teacher with the legacy play LiDAR in the full hospital venue.
+gym.register(
+    id="Nav-HospitalMaze-Teacher-Hospital-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherFloorPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+# Play teacher model_1100 with TrainLidar in an L-corridor venue.
+gym.register(
+    id="Nav-HospitalMaze-Teacher-TrainLidar-LCorridor-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherLCorridorPlayEnvCfgV1",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+# Play teacher model_1100 with TrainLidar in a ward venue.
+gym.register(
+    id="Nav-HospitalMaze-Teacher-TrainLidar-Ward-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherWardPlayEnvCfgV1",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+# Play teacher model_1100 with TrainLidar in the full hospital venue.
+gym.register(
+    id="Nav-HospitalMaze-Teacher-TrainLidar-Hospital-Go2w-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cfg.hospital.env:Go2wHospitalTeacherFloorPlayEnvCfgV1",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_obstacle_cfg:NavHospitalTeacherRunnerCfg",
+    },
+)
+
+# =============================================================================
+# [5] HospitalMaze depth distillation
+# =============================================================================
+
+# Distill the baseline depth student from teacher model_1100 in HospitalMaze, producing model_599.
+gym.register(
+    id="Nav-HospitalMaze-Distill-Depth-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -378,8 +399,9 @@ gym.register(
     },
 )
 
+# Distill the LongHist depth student from teacher model_1100 in HospitalMaze, producing model_599.
 gym.register(
-    id="Navigation-Depth-Hospital-Distill-LongHist-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-LongHist-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -388,8 +410,9 @@ gym.register(
     },
 )
 
+# Distill the Sparse depth student from teacher model_1100 in HospitalMaze, producing model_599.
 gym.register(
-    id="Navigation-Depth-Hospital-Distill-Sparse-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-Sparse-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -398,8 +421,9 @@ gym.register(
     },
 )
 
+# Distill the 4Cam depth student from teacher model_1100 in HospitalMaze, producing model_599.
 gym.register(
-    id="Navigation-Depth-Hospital-Distill-4Cam-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-4Cam-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -409,11 +433,12 @@ gym.register(
 )
 
 # =============================================================================
-# Hospital Maze Eval (20 obstacles, 220 s, static + dynamic, 5 policies)
+# [6] Evaluation suite (Eval-*)
 # =============================================================================
 
+# Evaluate teacher model_1100 on the static HospitalMaze suite.
 gym.register(
-    id="Nav-Hospital-Maze-Eval-Teacher-Static-Go2w-v0",
+    id="Nav-HospitalMaze-Teacher-Eval-Static-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -422,8 +447,9 @@ gym.register(
     },
 )
 
+# Evaluate teacher model_1100 on the dynamic HospitalMaze suite.
 gym.register(
-    id="Nav-Hospital-Maze-Eval-Teacher-Dynamic-Go2w-v0",
+    id="Nav-HospitalMaze-Teacher-Eval-Dynamic-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -432,8 +458,9 @@ gym.register(
     },
 )
 
+# Evaluate baseline student model_599 on the static HospitalMaze suite.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-Static-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-Eval-Static-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -442,8 +469,9 @@ gym.register(
     },
 )
 
+# Evaluate baseline student model_599 on the dynamic HospitalMaze suite.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-Dynamic-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-Eval-Dynamic-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -452,8 +480,9 @@ gym.register(
     },
 )
 
+# Evaluate LongHist student model_599 on the static HospitalMaze suite.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-LongHist-Static-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-LongHist-Eval-Static-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -462,8 +491,9 @@ gym.register(
     },
 )
 
+# Evaluate LongHist student model_599 on the dynamic HospitalMaze suite.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-LongHist-Dynamic-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-LongHist-Eval-Dynamic-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -472,8 +502,9 @@ gym.register(
     },
 )
 
+# Evaluate Sparse student model_599 on the static HospitalMaze suite.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-Sparse-Static-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-Sparse-Eval-Static-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -482,8 +513,9 @@ gym.register(
     },
 )
 
+# Evaluate Sparse student model_599 on the dynamic HospitalMaze suite.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-Sparse-Dynamic-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-Sparse-Eval-Dynamic-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -492,8 +524,9 @@ gym.register(
     },
 )
 
+# Evaluate 4Cam student model_599 on the static HospitalMaze suite.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-4Cam-Static-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-4Cam-Eval-Static-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -502,8 +535,9 @@ gym.register(
     },
 )
 
+# Evaluate 4Cam student model_599 on the dynamic HospitalMaze suite.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-4Cam-Dynamic-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-4Cam-Eval-Dynamic-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -514,8 +548,9 @@ gym.register(
 
 # Training-distribution maze eval (16-slot scene, last curriculum phase, max 12 obstacles)
 
+# Evaluate teacher model_1100 on the HospitalMaze training distribution.
 gym.register(
-    id="Nav-Hospital-Maze-Eval-Teacher-TrainDist-Go2w-v0",
+    id="Nav-HospitalMaze-Teacher-Eval-TrainDist-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -524,8 +559,9 @@ gym.register(
     },
 )
 
+# Evaluate baseline student model_599 on the HospitalMaze training distribution.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-TrainDist-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-Eval-TrainDist-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -534,8 +570,9 @@ gym.register(
     },
 )
 
+# Evaluate LongHist student model_599 on the HospitalMaze training distribution.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-LongHist-TrainDist-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-LongHist-Eval-TrainDist-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -544,8 +581,9 @@ gym.register(
     },
 )
 
+# Evaluate Sparse student model_599 on the HospitalMaze training distribution.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-Sparse-TrainDist-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-Sparse-Eval-TrainDist-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -554,8 +592,9 @@ gym.register(
     },
 )
 
+# Evaluate 4Cam student model_599 on the HospitalMaze training distribution.
 gym.register(
-    id="Navigation-Depth-Hospital-Maze-Eval-4Cam-TrainDist-Go2w-v0",
+    id="Nav-HospitalMaze-Distill-Depth-4Cam-Eval-TrainDist-Go2w-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={

@@ -17,27 +17,22 @@ Training flow:
   3. Distill teacher into depth student:
        student obs = state(15D) + depth history stack from a head-mounted D456-like camera
 
-  train.py --task Nav-Teacher-Go2w-v0 --locomotion_checkpoint <fast-flat-ckpt>
-  train.py --task Navigation-RL-Distill-Go2w-v0 --teacher_checkpoint <teacher-ckpt> --locomotion_checkpoint <fast-flat-ckpt>
-  train.py --task Navigation-Depth-Distill-Go2w-v0 --teacher_checkpoint <teacher-ckpt> --locomotion_checkpoint <fast-flat-ckpt>
+  train.py --task Nav-ObstacleFlat-Teacher-Go2w-v0 --locomotion_checkpoint <fast-flat-ckpt>
+  train.py --task Nav-ObstacleFlat-Distill-Lidar-Go2w-v0 --teacher_checkpoint <teacher-ckpt> --locomotion_checkpoint <fast-flat-ckpt>
+  train.py --task Nav-ObstacleFlat-Distill-Depth-Go2w-v0 --teacher_checkpoint <teacher-ckpt> --locomotion_checkpoint <fast-flat-ckpt>
 """
 
-import math
 import os
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCameraCfg, MultiMeshRayCasterCfg
 from isaaclab.sensors.ray_caster import patterns
 from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.utils import configclass
 
 from ... import mdp
-from ...mdp.navigation.hospital import events as _hospital_events
-from ...mdp.navigation.hospital import specs as _hospital_specs
 from ...mdp.navigation.hospital.specs import *  # noqa: F401, F403
 from ...mdp.navigation.hospital.floor import (
     make_hospital_ramp_cfg as _make_hospital_ramp_cfg,

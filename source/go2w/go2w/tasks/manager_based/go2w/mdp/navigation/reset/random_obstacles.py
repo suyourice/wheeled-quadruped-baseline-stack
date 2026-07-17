@@ -15,19 +15,12 @@ import torch
 from ...common.curriculum import _curriculum_progress
 from ...common.orientation import (
     quat_yaw_wxyz,
-    yaw_pitch_roll_to_quat_wxyz,
-    yaw_pitch_to_quat_wxyz,
     yaw_to_quat_wxyz,
 )
 from ..local_planning.obstacle_geometry import set_obstacle_metadata
 from ..global_planning.corridors import (
     nearest_polyline_tangent_local,
     project_polyline_corridor_local,
-)
-from ..scenarios import (
-    NAV_RANDOM_FALLBACK_SCENARIO_ID as _NAV_RANDOM_FALLBACK_SCENARIO_ID,
-    NAV_SCENARIO_CODES as _NAV_SCENARIO_CODES,
-    NAV_SCENARIO_NAMES as _NAV_SCENARIO_NAMES,
 )
 from ..goals import ensure_navigation_goal_buffers
 
