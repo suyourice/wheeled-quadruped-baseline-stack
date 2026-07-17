@@ -27,17 +27,31 @@ module load Apptainer
 
 OUT_NAME="${OUT_NAME:-validation_${SLURM_ARRAY_JOB_ID}}"
 
+_kit_runtime_dir() {
+    echo "${XDG_CACHE_HOME:-$HOME/.cache}/go2w_isaacsim/${SLURM_ARRAY_JOB_ID}_${SCENARIO}_gpu${1}"
+}
+
+# Pre-create every GPU's cache tree sequentially, before any apptainer exec
+# starts. mkdir -p tolerates concurrent EEXIST fine, but the earlier failure
+# ("mount hook function failure" on a per-GPU cache dir) showed up only
+# under the 4-way-parallel launch, so remove any possible race with the
+# directory-creation step entirely rather than trust it's not a factor.
+for _gpu_id in 0 1 2 3; do
+    _kr="$(_kit_runtime_dir "$_gpu_id")"
+    mkdir -p \
+        "$_kr/cache" \
+        "$_kr/data_documents/Kit/apps/Isaac-Sim/scripts/new_stage"
+    [[ -s "$_kr/user.config.json" ]] || printf '%s\n' '{}' > "$_kr/user.config.json"
+done
+mkdir -p "$HOME/go2w/Documents/Kit/shared"
+
 _run_policy() {
     local gpu_id=$1
     local policy=$2
     shift 2
 
-    local KIT_RUNTIME="${XDG_CACHE_HOME:-$HOME/.cache}/go2w_isaacsim/${SLURM_ARRAY_JOB_ID}_${SCENARIO}_gpu${gpu_id}"
-    mkdir -p \
-        "$KIT_RUNTIME/cache" \
-        "$KIT_RUNTIME/data_documents/Kit/apps/Isaac-Sim/scripts/new_stage" \
-        "$HOME/go2w/Documents/Kit/shared"
-    [[ -s "$KIT_RUNTIME/user.config.json" ]] || printf '%s\n' '{}' > "$KIT_RUNTIME/user.config.json"
+    local KIT_RUNTIME
+    KIT_RUNTIME="$(_kit_runtime_dir "$gpu_id")"
 
     apptainer exec --nv \
         --bind $HOME:$HOME \
