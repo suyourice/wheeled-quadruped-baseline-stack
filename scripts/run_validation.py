@@ -19,7 +19,7 @@ Key options:
     --config PATH         Validation YAML (default: scripts/configs/validation.yaml)
     --out_name NAME       Sub-directory under logs/nav_play/ (default: validation_<timestamp>)
     --ablation NAME       Run only one policy (teacher/baseline/longhist/sparse/4cam); default: all
-    --maze_episodes N     Episodes per policy per scenario (default: 100)
+    --maze_episodes N     Completion-order-independent trajectories per policy/scenario (default: 100)
     --seed N              Run only this seed; otherwise YAML evaluation_seeds are used.
     --stuck_timeout N     Steps without movement before forced reset (default: 300)
     --num_envs N          Parallel envs per run (default: 1)
@@ -185,7 +185,9 @@ def main():
     parser.add_argument("--out_name", type=str, default=None,
                         help="Output sub-dir under logs/nav_play/ (default: validation_<timestamp>)")
     parser.add_argument("--maze_episodes", type=int, default=None,
-                        help="Episodes per policy per scenario (default: 100)")
+                        help="Trajectories per policy per scenario (default: 100). Each admitted "
+                             "trajectory is run to its own terminal event; completion order cannot "
+                             "truncate survivors.")
     parser.add_argument("--maze_route_steps", type=int, nargs=2, default=None, metavar=("MIN", "MAX"),
                         help="Override the hospital-maze route range for every selected scenario. "
                              "By default, train/static/dynamic retain their task-native route distribution; "
@@ -221,6 +223,10 @@ def main():
     for key in ("maze_episodes", "stuck_timeout", "num_envs", "depth_video_steps"):
         if getattr(args, key) is None:
             setattr(args, key, config_defaults[key])
+    if args.maze_episodes <= 0:
+        parser.error("--maze_episodes must be positive.")
+    if args.num_envs <= 0:
+        parser.error("--num_envs must be positive.")
     if args.locomotion_checkpoint is None:
         args.locomotion_checkpoint = llc_checkpoint
     if args.maze_route_steps is not None and (
@@ -254,7 +260,8 @@ def main():
     print(f"[run_validation] Output base: {out_base}")
     print(f"[run_validation] Policies: {[p['name'] for p in policies]}")
     print(f"[run_validation] Scenarios: {run_scenarios}")
-    print(f"[run_validation] Episodes per scenario: {args.maze_episodes}")
+    effective_num_envs = min(args.num_envs, args.maze_episodes)
+    print(f"[run_validation] Trajectories per scenario: {args.maze_episodes}")
     if args.maze_route_steps is not None:
         print(f"[run_validation] Route override (all scenarios): {args.maze_route_steps[0]}-{args.maze_route_steps[1]}")
     else:
@@ -269,7 +276,7 @@ def main():
     multi_seed = len(run_seeds) > 1
     print(f"[run_validation] Seeds: {run_seeds} (per-episode increment enabled)")
     print(f"[run_validation] Stuck timeout: {args.stuck_timeout} steps")
-    print(f"[run_validation] Num envs: {args.num_envs}")
+    print(f"[run_validation] Num envs: {effective_num_envs} (requested {args.num_envs})")
 
     _SCENARIO_TASK_KEY = {
         "maze_train":   "maze_train_task",
@@ -313,7 +320,7 @@ def main():
                     episodes=args.maze_episodes,
                     seed=seed,
                     stuck_timeout=args.stuck_timeout,
-                    num_envs=args.num_envs,
+                    num_envs=effective_num_envs,
                     locomotion_checkpoint=args.locomotion_checkpoint,
                     depth_video_steps=args.depth_video_steps,
                     maze_route_steps=route_steps,

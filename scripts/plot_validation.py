@@ -137,14 +137,27 @@ def plot_bars(data, out_path, scenarios):
         print("[plot_validation] matplotlib not available — skipping plot", file=sys.stderr)
         return
 
-    plot_metrics = [
-        "goals_per_episode",
-        "path_progress_mean",
-        "obstacle_contacts_per_path_progress_meter",
-        "avg_low_obstacle_contacts_per_ep",
-        "stuck_timeout_frac",
-    ]
-    fixed_ylim_metrics = {"stuck_timeout_frac"}
+    # maze_success is intentionally a separate, short-route protocol.  Its
+    # primary outcomes are terminal success and SPL, unlike the long-horizon
+    # scenarios where all routes are deliberately non-terminal.
+    if scenarios == ["maze_success"]:
+        plot_metrics = [
+            "success_rate",
+            "spl",
+            "obstacle_contacts_per_path_progress_meter",
+            "avg_low_obstacle_contacts_per_ep",
+            "stuck_timeout_frac",
+        ]
+        fixed_ylim_metrics = {"success_rate", "spl", "stuck_timeout_frac"}
+    else:
+        plot_metrics = [
+            "goals_per_episode",
+            "path_progress_mean",
+            "obstacle_contacts_per_path_progress_meter",
+            "avg_low_obstacle_contacts_per_ep",
+            "stuck_timeout_frac",
+        ]
+        fixed_ylim_metrics = {"stuck_timeout_frac"}
     n_metrics = len(plot_metrics)
     n_policies = len(POLICY_NAMES)
     bar_width = 0.18
@@ -376,6 +389,10 @@ def main():
                         "scenarios against the same base_dir, since they measure different things "
                         "(single-route success vs. sustained multi-route progress) and must not "
                         "share axes or overwrite each other's files.")
+    parser.add_argument("--allow_legacy_completion_order", action="store_true",
+                        help="Plot manifests produced before the completion-order-independent cohort "
+                             "protocol. Their per-episode averages may be right-censored; use only "
+                             "for historical diagnostics, never for final comparisons.")
     args = parser.parse_args()
     if "maze_success" in args.scenarios and len(args.scenarios) > 1 and not args.out_prefix:
         parser.error(
@@ -403,9 +420,13 @@ def main():
     per_seed_data = {}
     episode_rows = []
     contact_rows = []
+    legacy_manifests = []
     for scenario in args.scenarios:
         for policy in POLICY_NAMES:
             manifests = [load_manifest(run_dir, scenario, policy) for run_dir in run_dirs]
+            for run_dir, manifest in zip(run_dirs, manifests, strict=True):
+                if manifest is not None and manifest.get("evaluation_protocol") != "completion_order_independent_cohort":
+                    legacy_manifests.append(os.path.join(run_dir, f"{scenario}_{policy}", "session_manifest.json"))
             per_seed_data[(scenario, policy)] = manifests
             per_seed = [extract_metrics(manifest) for manifest in manifests]
             mean, std = aggregate_metrics(per_seed)
@@ -427,6 +448,18 @@ def main():
                 run_path = os.path.join(run_dir, f"{scenario}_{policy}")
                 episode_rows.extend(_load_csv_rows(os.path.join(run_path, "episode_metrics.csv"), **labels))
                 contact_rows.extend(_load_csv_rows(os.path.join(run_path, "contact_events.csv"), **labels))
+
+    if legacy_manifests:
+        message = (
+            "Found manifests without the completion-order-independent cohort protocol. "
+            "They can omit long-running trajectories when parallel envs finish early: "
+            + ", ".join(legacy_manifests[:3])
+        )
+        if len(legacy_manifests) > 3:
+            message += f" (+{len(legacy_manifests) - 3} more)"
+        if not args.allow_legacy_completion_order:
+            parser.error(message + "; rerun evaluation or pass --allow_legacy_completion_order for diagnostics only.")
+        print(f"[plot_validation] WARNING: {message}", file=sys.stderr)
 
     write_csv(rows, multi_seed, os.path.join(base_dir, f"{args.out_prefix}summary.csv"))
 

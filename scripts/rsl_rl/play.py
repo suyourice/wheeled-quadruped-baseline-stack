@@ -489,7 +489,11 @@ parser.add_argument(
     dest="nav_eval_episodes",
     type=int,
     default=0,
-    help="Navigation play tasks only: aggregate this many completed episodes, then exit. Use 0 for endless play.",
+    help=(
+        "Navigation play tasks only: evaluate exactly this many trajectories, then exit. "
+        "The evaluator admits only N trajectories and waits for each to terminate, so parallel "
+        "auto-resets cannot truncate long-running samples. Use 0 for endless play."
+    ),
 )
 parser.add_argument(
     "--hospital_maze_route_steps",
@@ -1597,6 +1601,39 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _wall_refract      = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
     _wall_event_peak   = torch.zeros(_num_envs_val, device=_dev)
     _episode_index = torch.zeros(_num_envs_val, dtype=torch.long, device=_dev)
+
+    # Evaluation cohort scheduler.  ManagerBasedRLEnv auto-resets an env as
+    # soon as it terminates, so stopping on the *global* first N completions
+    # silently dropped the still-running (usually longer-lived) trajectories.
+    # Instead, admit exactly N episode instances, ignore any automatic reset
+    # beyond that cohort, and stop only after every admitted instance has a
+    # terminal row.  This keeps the normal per-episode timeout semantics while
+    # making the collected sample independent of completion order.
+    _eval_requested = max(int(args_cli.nav_eval_episodes), 0)
+    _eval_cohort_enabled = _eval_requested > 0
+    _eval_active = torch.zeros(_num_envs_val, dtype=torch.bool, device=_dev)
+    _eval_target_episode_index = torch.full(
+        (_num_envs_val,), -1, dtype=torch.long, device=_dev
+    )
+    _eval_started = min(_eval_requested, _num_envs_val)
+    if _eval_cohort_enabled and _eval_started > 0:
+        _eval_active[:_eval_started] = True
+        _eval_target_episode_index[:_eval_started] = 0
+        print(
+            "[PLAY-EVAL] Cohort protocol: "
+            f"{_eval_requested} trajectories; {_eval_started} admitted initially; "
+            "each admitted trajectory is recorded at its own terminal event."
+        )
+
+    def _is_eval_sample(env_id: int) -> bool:
+        """Whether the current episode of ``env_id`` belongs to the eval cohort."""
+        if not _eval_cohort_enabled:
+            return True
+        return bool(
+            _eval_active[env_id].item()
+            and _episode_index[env_id].item() == _eval_target_episode_index[env_id].item()
+        )
+
     _contact_event_records: list[tuple[str, int, int, int, float, int]] = []
     _obs_coll_history:      list[float] = []
     _low_obs_coll_history:  list[float] = []
@@ -1647,10 +1684,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _obs_flush = ~_obs_tracking & (_obs_event_peak > 0.0)
         if _obs_flush.any():
             for _e, _s in _obs_flush.nonzero(as_tuple=False).tolist():
-                _contact_event_records.append((
-                    "obstacle", _e, int(_episode_index[_e].item()), step_count,
-                    float(_obs_event_peak[_e, _s].item()), int(_obs_event_is_low[_e, _s].item()),
-                ))
+                if _is_eval_sample(_e):
+                    _contact_event_records.append((
+                        "obstacle", _e, int(_episode_index[_e].item()), step_count,
+                        float(_obs_event_peak[_e, _s].item()), int(_obs_event_is_low[_e, _s].item()),
+                    ))
             _obs_event_peak[_obs_flush] = 0.0
             _obs_event_is_low[_obs_flush] = False
         _obs_contact_prev.copy_(_obs_contact_now)
@@ -1675,10 +1713,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _wall_flush = ~_wall_tracking & (_wall_event_peak > 0.0)
         if _wall_flush.any():
             for _e in _wall_flush.nonzero(as_tuple=False).squeeze(-1).tolist():
-                _contact_event_records.append((
-                    "wall", _e, int(_episode_index[_e].item()), step_count,
-                    float(_wall_event_peak[_e].item()), 0,
-                ))
+                if _is_eval_sample(_e):
+                    _contact_event_records.append((
+                        "wall", _e, int(_episode_index[_e].item()), step_count,
+                        float(_wall_event_peak[_e].item()), 0,
+                    ))
             _wall_event_peak[_wall_flush] = 0.0
         _base_contact_prev.copy_(_base_contact_now)
 
@@ -1846,7 +1885,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if _stuck_mask.any():
                     _stuck_ids = _stuck_mask.nonzero(as_tuple=False).squeeze(-1).to(_base_env.device)
                     _base_env.episode_length_buf[_stuck_ids] = _base_env.max_episode_length - 1
-                    _stuck_termination_count += int(_stuck_mask.sum().item())
                     _stuck_forced_pending[_stuck_mask.cpu()] = True
                     _stuck_counter[_stuck_mask] = 0
                     _stuck_last_pos[_stuck_mask] = _cur_stuck_pos[_stuck_mask]
@@ -1885,18 +1923,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
         num_done = int(done_ids.numel())
         if num_done > 0:
+            _tracked_done = [_is_eval_sample(int(env_id.item())) for env_id in done_ids]
+            _tracked_done_count = sum(_tracked_done)
             if args_cli.stuck_timeout_steps > 0 and _stuck_last_pos_initialized:
                 _done_cpu = done_ids.cpu()
                 _stuck_counter[_done_cpu] = 0
                 _stuck_last_pos[_done_cpu] = _base_env.scene["robot"].data.root_pos_w[:, :2].cpu()[_done_cpu]
-            total_episode_length += float(episode_lengths[done_ids].sum().item())
+            if _tracked_done_count:
+                total_episode_length += sum(
+                    float(episode_lengths[env_id].item())
+                    for env_id, tracked in zip(done_ids, _tracked_done, strict=True) if tracked
+                )
             done_terms = (
                 termination_manager._last_episode_dones[done_ids] if termination_manager is not None else None
             )
             if done_terms is not None and done_terms.numel() > 0:
-                multi_term_episodes += int((done_terms.sum(dim=1) > 1).sum().item())
-                for idx, term_name in enumerate(termination_names):
-                    termination_counts[term_name] += int(done_terms[:, idx].sum().item())
+                for i, tracked in enumerate(_tracked_done):
+                    if not tracked:
+                        continue
+                    multi_term_episodes += int(done_terms[i].sum().item() > 1)
+                    for idx, term_name in enumerate(termination_names):
+                        termination_counts[term_name] += int(done_terms[i, idx].item())
                 # Track per-env obstacle collision terminations for episode log.
                 if _obstacle_contact_term_idx is not None:
                     for i, env_id in enumerate(done_ids.tolist()):
@@ -1909,6 +1956,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             for i, env_id_tensor in enumerate(done_ids):
                 _env_i = int(env_id_tensor.item())
                 _stuck_episode = bool(_stuck_forced_pending[_env_i].item())
+                if not _tracked_done[i]:
+                    _stuck_forced_pending[_env_i] = False
+                    continue
                 _term_list: list[str] = []
                 if done_terms is not None:
                     for _term_i, _term_name in enumerate(termination_names):
@@ -1963,6 +2013,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         _obs_events / _progress if _obs_events is not None and _progress is not None and _progress > 0.0 else None
                     ),
                 })
+                if _stuck_episode:
+                    _stuck_termination_count += 1
                 _stuck_forced_pending[_env_i] = False
 
             # Print episode summary for the watched nav env before resetting counts.
@@ -1977,6 +2029,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # snapshot captured before the step instead.
             if _pre_step_goals_reached is not None:
                 for i, env_id in enumerate(done_ids):
+                    if not _tracked_done[i]:
+                        continue
                     reached_final_goal = (
                         done_terms is not None
                         and _goal_reached_term_idx is not None
@@ -1987,22 +2041,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     )
             # Record contact-event counts (obstacle / low-obstacle / wall) per episode.
             if _obs_sensor is not None:
-                for env_id in done_ids:
+                for env_id, tracked in zip(done_ids, _tracked_done, strict=True):
+                    if not tracked:
+                        continue
                     _obs_coll_history.append(float(_obs_coll_ep[env_id].item()))
                     _low_obs_coll_history.append(float(_low_obs_coll_ep[env_id].item()))
                     _wall_coll_history.append(float(_wall_coll_ep[env_id].item()))
                 # Flush events still live at episode end, then reset event state.
                 for _e in done_ids.tolist():
-                    for _s in (_obs_event_peak[_e] > 0.0).nonzero(as_tuple=False).squeeze(-1).tolist():
-                        _contact_event_records.append((
-                            "obstacle", _e, int(_episode_index[_e].item()), step_count,
-                            float(_obs_event_peak[_e, _s].item()), int(_obs_event_is_low[_e, _s].item()),
-                        ))
-                    if float(_wall_event_peak[_e].item()) > 0.0:
-                        _contact_event_records.append((
-                            "wall", _e, int(_episode_index[_e].item()), step_count,
-                            float(_wall_event_peak[_e].item()), 0,
-                        ))
+                    if _is_eval_sample(_e):
+                        for _s in (_obs_event_peak[_e] > 0.0).nonzero(as_tuple=False).squeeze(-1).tolist():
+                            _contact_event_records.append((
+                                "obstacle", _e, int(_episode_index[_e].item()), step_count,
+                                float(_obs_event_peak[_e, _s].item()), int(_obs_event_is_low[_e, _s].item()),
+                            ))
+                        if float(_wall_event_peak[_e].item()) > 0.0:
+                            _contact_event_records.append((
+                                "wall", _e, int(_episode_index[_e].item()), step_count,
+                                float(_wall_event_peak[_e].item()), 0,
+                            ))
                 _obs_coll_ep[done_ids]     = 0
                 _low_obs_coll_ep[done_ids] = 0
                 _wall_coll_ep[done_ids]    = 0
@@ -2015,7 +2072,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 _wall_event_peak[done_ids] = 0.0
             # Record cumulative navigation distance: sum of all completed paths + final partial path.
             if _pre_step_path_progress is not None:
-                for env_id in done_ids:
+                for env_id, tracked in zip(done_ids, _tracked_done, strict=True):
+                    if not tracked:
+                        continue
                     _path_progress_history.append(
                         float((_cumul_path_progress[env_id] + _pre_step_path_progress[env_id]).item())
                     )
@@ -2027,7 +2086,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     _low_obs_mask = _low_flags[:, :_num_obs_slots].to(device=_dev, dtype=torch.bool)
             episode_lengths[done_ids] = 0
             _episode_index[done_ids] += 1
-            completed_episodes += num_done
+            completed_episodes += _tracked_done_count
+
+            # Admit a replacement only for an episode that was in the cohort.
+            # Envs reset automatically; episodes beyond the requested cohort
+            # remain live in the simulator but are deliberately ignored.
+            if _eval_cohort_enabled:
+                for env_id, tracked in zip(done_ids.tolist(), _tracked_done, strict=True):
+                    if not tracked:
+                        continue
+                    if _eval_started < _eval_requested:
+                        _eval_active[env_id] = True
+                        _eval_target_episode_index[env_id] = _episode_index[env_id]
+                        _eval_started += 1
+                    else:
+                        _eval_active[env_id] = False
+                        _eval_target_episode_index[env_id] = -1
 
             # Advance a fixed layout seed only for reset functions that expose
             # that contract. Hospital maze reset does not currently do so, thus
@@ -2044,6 +2118,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # SPL: record contribution for each completed episode then reset trackers.
             if _spl_enabled and done_terms is not None and _goal_reached_term_idx is not None:
                 for i, env_id_tensor in enumerate(done_ids):
+                    if not _tracked_done[i]:
+                        continue
                     ei = int(env_id_tensor.item())
                     success = bool(done_terms[i, _goal_reached_term_idx].item())
                     actual = float(_nav_actual_len[ei].item())
@@ -2157,6 +2233,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "num_envs": args_cli.num_envs,
             "fixed_layout_pairing": _fixed_layout_pairing_supported,
             "completed_episodes": completed_episodes,
+            "evaluation_protocol": (
+                "completion_order_independent_cohort" if _eval_cohort_enabled else "continuous_play"
+            ),
+            "requested_episodes": _eval_requested if _eval_cohort_enabled else None,
+            "started_episodes": _eval_started if _eval_cohort_enabled else None,
+            "incomplete_cohort_episodes": (
+                max(_eval_started - completed_episodes, 0) if _eval_cohort_enabled else None
+            ),
             "steps": step_count,
             "started_at": _run_started_at,
             "finished_at": _run_finished_at,
