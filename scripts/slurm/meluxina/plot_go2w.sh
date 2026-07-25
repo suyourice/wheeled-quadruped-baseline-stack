@@ -1,9 +1,9 @@
 #!/bin/bash -l
 #SBATCH -A YOUR_ACCOUNT
-#SBATCH -p gpu
+#SBATCH -p cpu
 #SBATCH --qos=default
-#SBATCH --gres=gpu:1
-#SBATCH --time=00:30:00
+#SBATCH --cpus-per-task=4
+#SBATCH --time=04:00:00
 #SBATCH --job-name=go2w_plot
 #SBATCH --output=logs/slurm/validate/%x_%j.out
 
@@ -26,7 +26,7 @@ mkdir -p \
 # share a chart's axes or a summary.csv's rows — plot_validation.py enforces
 # this via --out_prefix. Plot each group separately, same as run_validation.py's
 # own internal auto-plot logic.
-apptainer exec --nv \
+apptainer exec \
     --bind $HOME:$HOME \
     --bind "$KIT_RUNTIME/cache:/isaac-sim/kit/cache" \
     --bind "$KIT_RUNTIME/data_documents:/isaac-sim/kit/data/documents" \
@@ -39,7 +39,7 @@ apptainer exec --nv \
     "logs/nav_play/$OUT_NAME" \
     --scenarios maze_train maze_static maze_dynamic
 
-apptainer exec --nv \
+apptainer exec \
     --bind $HOME:$HOME \
     --bind "$KIT_RUNTIME/cache:/isaac-sim/kit/cache" \
     --bind "$KIT_RUNTIME/data_documents:/isaac-sim/kit/data/documents" \

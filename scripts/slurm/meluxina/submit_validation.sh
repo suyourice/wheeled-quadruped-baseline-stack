@@ -6,14 +6,15 @@
 #
 # Example:
 #   bash scripts/slurm/meluxina/submit_validation.sh v1_model1100
-#   bash scripts/slurm/meluxina/submit_validation.sh v1_model1100 --maze_episodes 100
+#   bash scripts/slurm/meluxina/submit_validation.sh v1_model1100 --seeds 42 43 44 --maze_episodes 200
 #
 # What it does:
-#   1. Submits a 4-task array job (maze_train / maze_static / maze_dynamic /
-#      maze_success).  The first three retain the long progress protocol;
-#      maze_success is the additional short-route success/SPL protocol.
-#      Each task uses 4 GPUs: 4 ablations in parallel, then teacher sequentially.
-#      All 4 tasks run simultaneously → 16 GPUs total, 4× faster than sequential.
+#   1. Submits a single 4-task array job (maze_train / maze_static /
+#      maze_dynamic / maze_success). Each task requests 1 node (4 GPUs):
+#      4 ablations run in parallel per GPU, then teacher sequentially on
+#      GPU 0. All 4 array tasks can run concurrently if allocation allows
+#      (verified: 1 node/task is sufficient — the script never touches a
+#      second node, so requesting 2 nodes/task was pure waste).
 #   2. Submits a plot job with --dependency=afterok on the array job.
 #      Runs plot_validation.py once all 4 scenarios complete.
 #

@@ -2,6 +2,7 @@
 #SBATCH -A YOUR_ACCOUNT
 #SBATCH -p gpu
 #SBATCH --qos=default
+#SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --time=08:00:00
 #SBATCH --job-name=go2w_validate
@@ -69,7 +70,7 @@ _run_policy() {
         --scenario "$SCENARIO" \
         --out_name "$OUT_NAME" \
         --skip_plot \
-        --num_envs 48 \
+        --num_envs 224 \
         "$@"
 }
 
