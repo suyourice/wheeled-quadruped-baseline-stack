@@ -272,3 +272,33 @@ def override_play_command_path_spawn(
         f"count={count}, forward={forward_range}, lateral={lateral_range}, min_speed={min_speed:.2f}"
         f"{reference_note}"
     )
+
+
+def select_episode_progress(
+    raw_progress: float | None,
+    optimal_path_length: float | None,
+    is_success: bool,
+) -> float | None:
+    """
+    Select the final progress value for an episode.
+
+    For successful episodes, clamp raw progress to optimal path length.
+    For non-successful episodes, return raw progress unchanged.
+    If raw_progress is None, return None.
+
+    Args:
+        raw_progress: Cumulative path progress in metres (or None if unavailable).
+        optimal_path_length: A* reference optimal path length in metres (or None if unavailable).
+        is_success: Whether the episode reached the goal.
+
+    Returns:
+        Final clamped progress value for use in episode metrics and history.
+        Returns None if raw_progress is None.
+    """
+    if raw_progress is None:
+        return None
+
+    if is_success and optimal_path_length is not None:
+        return max(raw_progress, optimal_path_length)
+
+    return raw_progress

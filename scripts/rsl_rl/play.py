@@ -24,6 +24,7 @@ from play_common import (  # isort: skip
     override_play_command_path_spawn,
     preflight_check_obstacle_slots,
     resolve_play_seed,
+    select_episode_progress,
 )
 
 DEFAULT_DYNAMIC_OBSTACLE_SPEED_RANGE = (0.25, 0.70)
@@ -1953,6 +1954,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Persist one pre-reset row per terminated episode.  The environment
             # has already reset its scene, so use the snapshots and per-episode
             # counters maintained above rather than reading reset buffers.
+            _episode_progress_for_history: dict[int, float] = {}
             for i, env_id_tensor in enumerate(done_ids):
                 _env_i = int(env_id_tensor.item())
                 _stuck_episode = bool(_stuck_forced_pending[_env_i].item())
@@ -1982,11 +1984,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     if _pre_step_path_progress is not None else None
                 )
                 _optimal = float(_nav_optimal_len[_env_i].item()) if _spl_enabled else None
-                # A structured final-goal termination is route completion even
-                # when the final movement was not reflected in the pre-step
-                # path-progress snapshot.
-                if _success and _progress is not None and _optimal is not None:
-                    _progress = max(_progress, _optimal)
+                _final_progress = select_episode_progress(_progress, _optimal, _success)
+                if _final_progress is not None:
+                    _episode_progress_for_history[_env_i] = _final_progress
                 _spl_value = None
                 if _spl_enabled and _optimal is not None:
                     _actual = float(_nav_actual_len[_env_i].item())
@@ -2075,8 +2075,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 for env_id, tracked in zip(done_ids, _tracked_done, strict=True):
                     if not tracked:
                         continue
+                    _env_i = int(env_id.item())
+                    _raw_progress = float(
+                        (_cumul_path_progress[env_id] + _pre_step_path_progress[env_id]).item()
+                    )
                     _path_progress_history.append(
-                        float((_cumul_path_progress[env_id] + _pre_step_path_progress[env_id]).item())
+                        _episode_progress_for_history.get(_env_i, _raw_progress)
                     )
                 _cumul_path_progress[done_ids] = 0.0
             # Refresh the reward's reset-time low-obstacle flags after the reset.
